@@ -1,0 +1,62 @@
+{
+  "name": "durabl",
+  "version": "0.1.0",
+  "description": "A small, durable, Mongo-backed job queue — atomic claim, retries, visibility-timeout leases, dedupe keys, and change-stream push.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jordan Baker (https://github.com/hexsprite)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hexsprite/durabl.git"
+  },
+  "homepage": "https://github.com/hexsprite/durabl#readme",
+  "bugs": {
+    "url": "https://github.com/hexsprite/durabl/issues"
+  },
+  "keywords": [
+    "job-queue",
+    "queue",
+    "mongodb",
+    "durable",
+    "background-jobs",
+    "worker",
+    "change-streams",
+    "task-queue"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "mongodb": ">=6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "mongodb": "^6.21.0",
+    "mongodb-memory-server": "^10.1.4",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
