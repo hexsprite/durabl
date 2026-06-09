@@ -5,3 +5,6 @@ dist/
 coverage/
 .mongodb-binaries/
 *.tgz
+
+# npm pack artifacts
+*.tgz
