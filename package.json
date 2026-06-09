@@ -1,6 +1,6 @@
 {
   "name": "durabl",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A small, durable, Mongo-backed job queue — atomic claim, retries, visibility-timeout leases, dedupe keys, and change-stream push.",
   "license": "MIT",
   "author": "Jordan Baker (https://github.com/hexsprite)",
