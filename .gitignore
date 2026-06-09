@@ -8,3 +8,7 @@ coverage/
 
 # npm pack artifacts
 *.tgz
+
+# bun (local-only; npm is the package manager of record)
+bun.lock
+bun.lockb
