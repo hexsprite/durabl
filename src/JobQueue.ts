@@ -124,25 +124,43 @@ export class JobQueue {
   /**
    * Claim next job and process it if available.
    * Wraps backend calls in try/catch to prevent processor death on transient errors.
+   *
+   * The concurrency slot is reserved *synchronously* (incrementing
+   * `activeCount` before the `await backend.claimNext`) and rolled back if no
+   * job is claimed. Reserving before yielding is load-bearing: `claimNext`
+   * yields, so two concurrent callers (e.g. a burst of push notifications)
+   * would otherwise both pass a check-then-await gate and both claim distinct
+   * jobs, overshooting the cap on this instance. The atomic per-job claim only
+   * stops two workers taking the *same* job — it can't bound one instance's
+   * own concurrency.
+   *
+   * @returns `true` if a job was claimed and handed to `processJob`.
    */
-  private async claimAndProcess(state: ProcessorState): Promise<void> {
-    if (state.activeCount >= state.config.concurrency) return
+  private async claimAndProcess(state: ProcessorState): Promise<boolean> {
+    if (state.activeCount >= state.config.concurrency) return false
 
+    // Reserve the slot now, before any await, so concurrent callers see it.
+    state.activeCount++
     try {
       const job = await this.backend.claimNext(state.type)
-      if (!job) return
-
-      // Reset backoff on successful claim
+      if (!job) {
+        state.activeCount--
+        return false
+      }
+      // Reset backoff on successful claim. processJob's finally releases the
+      // slot we reserved above.
       state.backoffMs = 0
-      state.activeCount++
       void this.processJob(state, job)
+      return true
     } catch (err) {
+      state.activeCount--
       // Log error and apply exponential backoff
       this.log.error({ err, type: state.type }, 'error claiming next job')
       state.backoffMs = Math.min(
         MAX_BACKOFF_MS,
         Math.max(MIN_BACKOFF_MS, state.backoffMs * 2 || MIN_BACKOFF_MS),
       )
+      return false
     }
   }
 
@@ -196,24 +214,13 @@ export class JobQueue {
       const waitTime = state.backoffMs || state.config.pollInterval
       await this.sleep(waitTime)
 
-      // Try to fill up to concurrency limit
-      try {
-        while (state.activeCount < state.config.concurrency && state.running) {
-          const job = await this.backend.claimNext(state.type)
-          if (!job) break
-
-          // Reset backoff on successful claim
-          state.backoffMs = 0
-          state.activeCount++
-          void this.processJob(state, job)
-        }
-      } catch (err) {
-        // Log error and apply exponential backoff
-        this.log.error({ err, type: state.type }, 'processor loop error')
-        state.backoffMs = Math.min(
-          MAX_BACKOFF_MS,
-          Math.max(MIN_BACKOFF_MS, state.backoffMs * 2 || MIN_BACKOFF_MS),
-        )
+      // Fill up to the concurrency limit. claimAndProcess reserves slots
+      // synchronously and returns false once there's no job (or the cap is
+      // reached, or a claim errored — it sets backoff in that case), so this
+      // shares one race-free claim path with push/enqueue-driven pickup.
+      while (state.running && !this.isShuttingDown) {
+        const claimed = await this.claimAndProcess(state)
+        if (!claimed) break
       }
     }
   }
