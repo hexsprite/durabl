@@ -15,6 +15,26 @@ export type JobStatus = 'pending' | 'active' | 'completed' | 'failed'
 export type DedupeScope = 'pending' | 'pending+active'
 
 /**
+ * Retry spacing strategy.
+ * - 'exponential' (default): exponential growth with full jitter.
+ * - 'fixed': constant delay every retry.
+ */
+export type BackoffStrategy = 'exponential' | 'fixed'
+
+/**
+ * Serializable backoff configuration persisted on a job document so the retry
+ * path can compute delays without the original enqueue call in scope.
+ */
+export interface BackoffConfig {
+  /** Strategy. Default: 'exponential'. */
+  backoff?: BackoffStrategy
+  /** Base delay in ms (also the floor for exponential). Default: 1000. */
+  backoffDelay?: number
+  /** Maximum delay in ms (cap). Default: 60000. */
+  backoffMaxDelay?: number
+}
+
+/**
  * Job document structure (public view).
  */
 export interface Job<T = unknown> {
@@ -71,7 +91,7 @@ export type JobHandler<T> = (job: Job<T>, ctx: JobContext) => Promise<void>
 /**
  * Options for enqueue() and claimOrEnqueue()
  */
-export interface EnqueueOptions {
+export interface EnqueueOptions extends BackoffConfig {
   /** Lower number = higher priority. Default: 0 */
   priority?: number
   /** Milliseconds to delay before job becomes claimable. Default: 0 */
@@ -117,6 +137,9 @@ export interface JobDoc<T = unknown> {
   maxAttempts: number
   dedupeKey?: string
   dedupeScope?: DedupeScope
+  backoff?: BackoffStrategy
+  backoffDelay?: number
+  backoffMaxDelay?: number
   runAt: Date
   createdAt: Date
   claimedAt?: Date

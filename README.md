@@ -21,7 +21,7 @@ I stole the good ideas (pluggable backends from Django's task framework, the ded
 
 - **Atomic claim.** `findOneAndUpdate` on pending, due jobs sorted by priority. The MongoDB equivalent of `SELECT ... FOR UPDATE SKIP LOCKED`: two workers never claim the same job.
 - **Visibility-timeout leases.** A claimed job is leased, not removed. Handlers heartbeat to extend the lease, and a reaper returns jobs from dead workers to `pending`.
-- **Retries with attempt caps.** Failed jobs go back to `pending` until `maxAttempts`, then land in a terminal `failed` state. `failFatal()` skips retries for unrecoverable errors.
+- **Retries with attempt caps and backoff.** Failed jobs go back to `pending` with a jittered backoff delay until `maxAttempts`, then land in a terminal `failed` state. `failFatal()` skips retries for unrecoverable errors.
 - **Delayed and prioritized scheduling.** `runAt` delays a job; lower `priority` numbers run first.
 - **Dedupe keys, two scopes.** `pending+active` blocks any duplicate. `pending` allows one pending behind one active, which gives you single-flight coalescing: run now, queue at most one more.
 - **Push/poll hybrid.** Rides MongoDB change streams for sub-100ms pickup, with a reconnect catch-up sentinel so jobs that land during a stream blip aren't missed. Degrades cleanly to polling when change streams are off or unavailable.
@@ -143,6 +143,12 @@ interface EnqueueOptions {
   maxAttempts?: number    // default 3
   dedupeKey?: string
   dedupeScope?: 'pending' | 'pending+active' // default 'pending+active'
+  // Retry backoff — spaces failed attempts so a fast-failing handler can't
+  // burn every attempt in milliseconds, and an outage doesn't become an
+  // instant-retry storm.
+  backoff?: 'exponential' | 'fixed' // default 'exponential' (full jitter)
+  backoffDelay?: number   // base/floor ms. default 1000
+  backoffMaxDelay?: number // cap ms. default 60000
 }
 
 interface ProcessorConfig {

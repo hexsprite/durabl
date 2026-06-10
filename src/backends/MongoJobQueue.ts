@@ -15,6 +15,7 @@ import {
   type QueueStats,
 } from '../types'
 
+import { retryBackoffMs } from './backoff'
 import type { IJobQueueBackend } from './IJobQueueBackend'
 import { MongoChangeStreamWatcher } from './MongoChangeStreamWatcher'
 import { createJobIndexes } from './mongoJobIndexes'
@@ -127,6 +128,9 @@ export class MongoJobQueue implements IJobQueueBackend {
       maxAttempts: options.maxAttempts ?? 3,
       dedupeKey: options.dedupeKey,
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
+      backoff: options.backoff,
+      backoffDelay: options.backoffDelay,
+      backoffMaxDelay: options.backoffMaxDelay,
       runAt,
       createdAt: now,
       logs: [],
@@ -168,6 +172,9 @@ export class MongoJobQueue implements IJobQueueBackend {
       maxAttempts: options.maxAttempts ?? 3,
       dedupeKey: options.dedupeKey,
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
+      backoff: options.backoff,
+      backoffDelay: options.backoffDelay,
+      backoffMaxDelay: options.backoffMaxDelay,
       runAt: now,
       createdAt: now,
       claimedAt: now,
@@ -225,10 +232,14 @@ export class MongoJobQueue implements IJobQueueBackend {
         },
       )
     } else {
+      // Space the retry: push runAt into the future by a jittered backoff so
+      // a fast-failing handler can't burn every attempt in milliseconds and a
+      // downstream outage doesn't become an instant-retry storm.
+      const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
       await this.collection.updateOne(
         { _id: jobId },
         {
-          $set: { status: 'pending' as JobStatus, failReason: reason },
+          $set: { status: 'pending' as JobStatus, failReason: reason, runAt },
           $push: {
             logs: { timestamp: now, message: `Attempt failed: ${reason}` },
           },
@@ -270,6 +281,24 @@ export class MongoJobQueue implements IJobQueueBackend {
     )
   }
 
+  /**
+   * Extend the lease on many running jobs in a single write.
+   *
+   * Equivalent to calling {@link heartbeat} for each id, but collapses N
+   * `updateOne` calls into one `updateMany` so periodic keepalive write load
+   * is independent of per-instance concurrency. Only `active` jobs are
+   * touched — completed/failed/pending docs are left alone.
+   *
+   * @param jobIds Ids of jobs currently running on this instance.
+   */
+  async batchHeartbeat(jobIds: string[]): Promise<void> {
+    if (jobIds.length === 0) return
+    await this.collection.updateMany(
+      { _id: { $in: jobIds }, status: 'active' },
+      { $set: { claimedAt: new Date() } },
+    )
+  }
+
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
     const doc = (await this.collection.findOne(query)) as JobDoc<T> | null
     return doc ? jobDocToJob(doc) : null
@@ -288,17 +317,69 @@ export class MongoJobQueue implements IJobQueueBackend {
     return { pending, active, completed, failed }
   }
 
-  /** Recover stuck jobs past visibility timeout. Returns count reset. */
+  /**
+   * Recover stuck jobs whose lease has expired (still `active` but
+   * `claimedAt` older than the visibility timeout — the worker died or
+   * wedged without heartbeating).
+   *
+   * Each stuck job is routed through the same retry/terminal decision as
+   * {@link fail}, NOT blanket-reset to `pending`:
+   *
+   * - Retries remain (`attempt < maxAttempts`) → back to `pending` with
+   *   `runAt` pushed into the future by a jittered backoff. Without the
+   *   backoff a handler that wedges the worker would stall → be recovered →
+   *   re-claimed → wedge again *immediately*, pegging CPU/Mongo every
+   *   visibility window (hot retry loop). The future `runAt` breaks the loop.
+   * - Retries exhausted (`attempt >= maxAttempts`) → terminal `failed`.
+   *   The old code resurrected these forever because it never checked the
+   *   cap.
+   *
+   * Recovery does not bump `attempt` — the subsequent re-claim does that, so
+   * the count stays accurate.
+   *
+   * @returns Number of stuck jobs handled (re-queued + failed).
+   */
   async recoverStuckJobs(visibilityTimeoutMs = 300000): Promise<number> {
     const cutoff = new Date(Date.now() - visibilityTimeoutMs)
-    const result = await this.collection.updateMany(
-      { status: 'active', claimedAt: { $lt: cutoff } },
-      {
-        $set: { status: 'pending' as JobStatus },
-        $push: { logs: { timestamp: new Date(), message: 'Recovered' } },
-      },
-    )
-    return result.modifiedCount
+    const cursor = this.collection.find({
+      status: 'active',
+      claimedAt: { $lt: cutoff },
+    })
+
+    let handled = 0
+    for await (const job of cursor) {
+      const now = new Date()
+      const exhausted = job.attempt >= job.maxAttempts
+
+      if (exhausted) {
+        await this.collection.updateOne(
+          { _id: job._id, status: 'active' },
+          {
+            $set: {
+              status: 'failed' as JobStatus,
+              failReason: 'Stalled — retries exhausted',
+              failedAt: now,
+            },
+            $push: {
+              logs: { timestamp: now, message: 'Stalled — retries exhausted' },
+            },
+          },
+        )
+      } else {
+        const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
+        await this.collection.updateOne(
+          { _id: job._id, status: 'active' },
+          {
+            $set: { status: 'pending' as JobStatus, runAt },
+            $push: {
+              logs: { timestamp: now, message: 'Recovered (stalled)' },
+            },
+          },
+        )
+      }
+      handled++
+    }
+    return handled
   }
 
   /** Clean up old completed/failed jobs. Default: 7 days. Returns count removed. */

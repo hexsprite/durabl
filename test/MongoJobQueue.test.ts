@@ -178,6 +178,42 @@ describe('MongoJobQueue', () => {
       expect(updated!.status).toBe('failed')
       expect(updated!.failReason).toBe('error')
     })
+
+    // Regression (du-0so): the retry branch left runAt unchanged, so a failed
+    // job was instantly re-claimable. A fast-failing handler then burned all
+    // attempts in milliseconds and a downstream outage became an instant-retry
+    // storm. Retry must push runAt into the future (backoff).
+    it('delays the retry — runAt is in the future, not immediately claimable', async () => {
+      const jobId = await backend.enqueue('job', {}, { maxAttempts: 3 })
+      const job = await backend.claimNext('job')
+
+      const before = Date.now()
+      await backend.fail(job!.id, 'transient')
+
+      const updated = await collection.findOne({ _id: jobId! })
+      expect(updated!.status).toBe('pending')
+      expect(updated!.runAt.getTime()).toBeGreaterThan(before)
+      // claimNext only takes runAt <= now, so it stays unclaimed.
+      expect(await backend.claimNext('job')).toBeNull()
+    })
+
+    it('honors a fixed backoff delay on retry', async () => {
+      const jobId = await backend.enqueue(
+        'job',
+        {},
+        { maxAttempts: 3, backoff: 'fixed', backoffDelay: 5000 },
+      )
+      const job = await backend.claimNext('job')
+
+      const before = Date.now()
+      await backend.fail(job!.id, 'transient')
+
+      const updated = await collection.findOne({ _id: jobId! })
+      const delayMs = updated!.runAt.getTime() - before
+      // Fixed 5s, allow scheduling slack.
+      expect(delayMs).toBeGreaterThanOrEqual(4900)
+      expect(delayMs).toBeLessThanOrEqual(6000)
+    })
   })
 
   describe('failFatal()', () => {
@@ -233,6 +269,124 @@ describe('MongoJobQueue', () => {
       expect(recovered).toBe(1)
       const updated = await collection.findOne({ _id: job!.id })
       expect(updated!.status).toBe('pending')
+    })
+
+    // Regression (du-5ws): a handler that wedges the worker stalls, gets
+    // recovered, re-claimed, wedges again... If recovery re-queues with no
+    // backoff, the job is immediately claimable again -> hot retry loop that
+    // pegs CPU/Mongo every visibility window. Recovery must push runAt into
+    // the future so the job cannot be re-claimed instantly.
+    it('schedules recovered job in the future (backoff), not immediately claimable', async () => {
+      await backend.enqueue('job', {}, { maxAttempts: 5 })
+      const job = await backend.claimNext('job')
+      await collection.updateOne(
+        { _id: job!.id },
+        { $set: { claimedAt: new Date(Date.now() - 400000) } },
+      )
+
+      const before = Date.now()
+      await backend.recoverStuckJobs(300000)
+
+      const updated = await collection.findOne({ _id: job!.id })
+      expect(updated!.status).toBe('pending')
+      // runAt pushed past now: not immediately re-claimable.
+      expect(updated!.runAt.getTime()).toBeGreaterThan(before)
+      // And claimNext (which only takes runAt <= now) returns nothing yet.
+      const reclaimed = await backend.claimNext('job')
+      expect(reclaimed).toBeNull()
+    })
+
+    // Regression (du-5ws): the original updateMany blindly set every stuck
+    // active job back to 'pending' with no maxAttempts check. A job that has
+    // exhausted its retries but stalls (e.g. wedged on the final attempt) was
+    // resurrected forever instead of being failed. Past the cap it must go
+    // terminal.
+    it('fails a stalled job that has exhausted its attempts instead of re-queuing', async () => {
+      await backend.enqueue('job', {}, { maxAttempts: 2 })
+      const job = await backend.claimNext('job') // attempt -> 1
+      // Simulate it already being on its final attempt and then stalling.
+      await collection.updateOne(
+        { _id: job!.id },
+        {
+          $set: {
+            attempt: 2,
+            claimedAt: new Date(Date.now() - 400000),
+          },
+        },
+      )
+
+      const handled = await backend.recoverStuckJobs(300000)
+
+      expect(handled).toBe(1)
+      const updated = await collection.findOne({ _id: job!.id })
+      expect(updated!.status).toBe('failed')
+      expect(updated!.failedAt).toBeInstanceOf(Date)
+      expect(updated!.failReason).toMatch(/stall/i)
+    })
+
+    it('does not increment attempt unboundedly on recovery', async () => {
+      // Recovery itself must not bump attempt — the re-claim does that.
+      await backend.enqueue('job', {}, { maxAttempts: 5 })
+      const job = await backend.claimNext('job') // attempt -> 1
+      await collection.updateOne(
+        { _id: job!.id },
+        { $set: { claimedAt: new Date(Date.now() - 400000) } },
+      )
+
+      await backend.recoverStuckJobs(300000)
+
+      const updated = await collection.findOne({ _id: job!.id })
+      expect(updated!.attempt).toBe(1)
+    })
+  })
+
+  describe('batchHeartbeat()', () => {
+    // du-g3t: keep N running jobs alive with ONE updateMany instead of N
+    // updateOne calls, so heartbeat write load is independent of concurrency.
+    it('extends claimedAt for all given running jobs in a single write', async () => {
+      const ids: string[] = []
+      for (let i = 0; i < 3; i++) {
+        await backend.enqueue('job', { i })
+        const job = await backend.claimNext<{ i: number }>('job')
+        ids.push(job!.id)
+      }
+
+      // Backdate all claimedAt timestamps.
+      const stale = new Date(Date.now() - 200000)
+      await collection.updateMany(
+        { _id: { $in: ids } },
+        { $set: { claimedAt: stale } },
+      )
+
+      const before = Date.now()
+      await backend.batchHeartbeat(ids)
+
+      for (const id of ids) {
+        const doc = await collection.findOne({ _id: id })
+        expect(doc!.claimedAt!.getTime()).toBeGreaterThanOrEqual(before)
+      }
+    })
+
+    it('only touches active jobs, never completed/failed ones', async () => {
+      await backend.enqueue('job', {})
+      const active = await backend.claimNext('job')
+      await backend.enqueue('job2', {})
+      const done = await backend.claimNext('job2')
+      await backend.complete(done!.id)
+      const completedAt = (await collection.findOne({ _id: done!.id }))!
+        .completedAt
+
+      await backend.batchHeartbeat([active!.id, done!.id])
+
+      const doneDoc = await collection.findOne({ _id: done!.id })
+      // Completed job untouched: still completed, claimedAt not refreshed past
+      // completion.
+      expect(doneDoc!.status).toBe('completed')
+      expect(doneDoc!.completedAt).toEqual(completedAt)
+    })
+
+    it('is a no-op for an empty id list', async () => {
+      await expect(backend.batchHeartbeat([])).resolves.toBeUndefined()
     })
   })
 
