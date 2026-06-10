@@ -12,3 +12,9 @@ coverage/
 # bun (local-only; npm is the package manager of record)
 bun.lock
 bun.lockb
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
