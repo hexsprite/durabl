@@ -30,6 +30,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
+    },
+    "./eslint": {
+      "types": "./dist/eslint/index.d.ts",
+      "import": "./dist/eslint/index.mjs",
+      "require": "./dist/eslint/index.js"
     }
   },
   "files": [
@@ -48,10 +53,24 @@
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
-    "mongodb": ">=6.0.0"
+    "mongodb": ">=6.0.0",
+    "@typescript-eslint/utils": ">=8.0.0",
+    "eslint": ">=9.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@typescript-eslint/utils": {
+      "optional": true
+    },
+    "eslint": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@typescript-eslint/parser": "^8.61.1",
+    "@typescript-eslint/rule-tester": "^8.61.1",
+    "@typescript-eslint/utils": "^8.61.1",
+    "eslint": "^9.39.4",
     "mongodb": "^6.21.0",
     "mongodb-memory-server": "^10.1.4",
     "tsup": "^8.3.5",

@@ -1,12 +1,14 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  entry: ['src/index.ts'],
+  // Core entry + the opt-in ESLint plugin (durabl/eslint), emitted separately so
+  // core consumers never pull the lint toolchain.
+  entry: ['src/index.ts', 'src/eslint/index.ts'],
   format: ['esm', 'cjs'],
   dts: true,
   clean: true,
   sourcemap: true,
   target: 'node18',
-  // mongodb is a peer dependency — never bundle it.
-  external: ['mongodb'],
+  // Peer / optional-peer deps — never bundle them.
+  external: ['mongodb', 'eslint', '@typescript-eslint/utils'],
 })
