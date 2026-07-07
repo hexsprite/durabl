@@ -230,7 +230,10 @@ interface StepRecord {
   ts: Date
 }
 
-type AppendStepResult = 'appended' | 'already-recorded' | 'lease-lost'
+type AppendStepResult =
+  | { status: 'appended' }
+  | { status: 'already-recorded'; existing: StepRecord } // carries the stored record
+  | { status: 'lease-lost' }
 type CompleteClaimedResult = 'completed' | 'lease-lost'
 type HeartbeatClaimedResult = 'heartbeated' | 'lease-lost'
 ```

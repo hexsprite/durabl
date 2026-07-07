@@ -84,6 +84,19 @@ await backend.startup() // throws if the server isn't a replica set
 
 When push is active, `JobQueue` bumps its default poll interval to 60s and leans on the stream for latency, keeping the poll loop only as a safety net for dropped events and crash recovery.
 
+### Reaper (stuck-job recovery)
+
+A claimed job is a lease, not a delete — if a worker dies mid-job, the reaper returns the job to `pending` (or terminal `failed` once attempts are exhausted) after its visibility timeout expires. Start it on one process:
+
+```typescript
+const queue = new JobQueue(backend, logger, { visibilityTimeoutMs: 300000 })
+queue.startReaper() // sweeps every 60s; queue.startReaper(intervalMs) to tune
+```
+
+`startReaper()` always sweeps with the queue's configured `visibilityTimeoutMs`, which is the single source of truth: the `Orchestrator` sizes its heartbeats from the same value, so the lease window a handler maintains and the window the reaper enforces can never drift apart. The timer is `unref`'d and stops on `shutdown()` (or `stopReaper()`).
+
+`backend.recoverStuckJobs(visibilityTimeoutMs)` remains public for manual/one-off sweeps and tests, but don't schedule it yourself with a hand-passed value — if it disagrees with the queue's, jobs get reaped out from under live workers (or dead workers hold leases too long).
+
 ### Inline execution with coalescing
 
 For the "run it now, but never run two at once, and coalesce a burst into at most one follow-up" pattern (this replaced a 300-line distributed lock in Focuster), use `claimOrEnqueue` with `dedupeScope: 'pending'`:
@@ -134,6 +147,8 @@ class JobQueue {
   process<T>(type, handler, config?): void
   getStats(type?): Promise<QueueStats>
   startup(): Promise<void>
+  startReaper(intervalMs?): void   // sweep with the queue's visibilityTimeoutMs
+  stopReaper(): void
   shutdown(timeoutMs?): Promise<void>
 }
 
@@ -159,6 +174,79 @@ interface ProcessorConfig {
 
 The handler receives a `JobContext` with `complete()`, `fail(reason)`, `failFatal(reason)`, `log(message)`, and `heartbeat()`.
 
+## Durable orchestration (step-level resume)
+
+Job-level durability retries a crashed handler **from the top**. For multi-step side-effect flows (billing, provisioning) that's a double-charge waiting to happen. The opt-in `Orchestrator` adds DBOS-style **step-level** durability: completed steps are journaled on the job document and *skipped* on resume, so a crash re-runs only the unfinished tail.
+
+It's a thin layer over `JobQueue` — an orchestrator is just a job type. The atomic-claim primitive is untouched. Requires a journal-capable backend (`MongoJobQueue`, or the in-memory test backends).
+
+```typescript
+import { Orchestrator, NonRetryable } from 'durabl'
+
+const orch = new Orchestrator(queue) // queue's backend must be journal-capable
+
+orch.define<{ userId: string }>('restart-trial', async (job, octx) => {
+  const { userId } = job.data
+
+  // Each octx.step runs once, is journaled, and returns the cached result on resume.
+  const existing = await octx.step('load-sub', () => getCurrentSubscription(userId))
+  if (existing && !isExpired(existing.status)) {
+    throw new NonRetryable(`bad state: ${existing.status}`) // terminal, no retry
+  }
+
+  // Idempotency key is passed INTO the step fn. Default is jobId-scoped; override
+  // at the call site for an entity-scoped key (a *different* job for the same user
+  // must not mint a 2nd customer).
+  const customerId = await octx.step(
+    'ensure-customer',
+    ({ idempotencyKey }) => ensureStripeCustomer(userId, { idempotencyKey }),
+    { idempotencyKey: `${userId}:customer` },
+  )
+
+  const sub = await octx.step('create-sub', ({ idempotencyKey }) =>
+    stripe.createSubscription(customerId, { plan: 'basic', idempotencyKey }),
+  )
+
+  octx.log(`restarted trial with subscription ${sub.id}`)
+})
+
+// Enqueue is unchanged — the entity-scoped dedupeKey collapses double-clicks first.
+await queue.enqueue('restart-trial', { userId }, { dedupeKey: `restart-trial:${userId}` })
+```
+
+`OrchestratorContext`:
+
+```typescript
+interface OrchestratorContext {
+  // Memoized, journaled step. Idempotency key passed in; override via opts.
+  step<R>(name, fn: (keys, signal: AbortSignal) => Promise<R>, opts?: {
+    idempotencyKey?: string
+    timeoutMs?: number   // per-step liveness cap; default = visibilityTimeoutMs
+  }): Promise<R>
+
+  // Both backed by ONE journaled bootstrap record ({ startedAt, seed }), captured
+  // lazily on the run's first use and read back on resume.
+  now(): number          // frozen at the FIRST attempt's start (not enqueue time); identical on every resume
+  uuid(label: string): string  // derived from the journaled seed + label; stable across resume (NOT for secrets)
+  log(message: string): void
+  // Escape hatch; auto-heartbeat already runs. 'lease-lost' means another
+  // worker reclaimed the job — the run signal aborts and the next step() throws.
+  heartbeat(): Promise<'heartbeated' | 'lease-lost'>
+  // Run-level abort: fires on lease loss or maxDurationMs breach. step()
+  // refuses to start once aborted; thread it into long non-step work.
+  signal: AbortSignal
+}
+```
+
+Guarantees and limits worth knowing:
+
+- **At-least-once steps, not exactly-once.** A crash in the window between a step fn returning and its journal append committing re-runs that step. Close it on dangerous steps with the provided idempotency key (Stripe et al. dedupe on it) or a `dedupeKey` on enqueue.
+- **Determinism on the control path.** Only `await` `octx.*` (or `Promise.all`/`allSettled` over steps) in the orchestrator body; do live reads / `Date.now()` / randomness *inside* a step. The optional `durabl/eslint` rule enforces this; the divergence detector (a changed step name at a journaled seq → fatal `NondeterminismError`) is the runtime backstop.
+- **Auto-managed lease.** The wrapper heartbeats on a self-scheduling loop sized to the queue's reaper timeout (`visibilityTimeoutMs`, the single source of truth). `stepTimeoutMs` and `maxDurationMs` keep a hung step from heartbeating forever. When a heartbeat comes back `'lease-lost'` (the job was reclaimed) the loop stops and `octx.signal` aborts — the orphaned body throws at its next `step()` boundary instead of firing side effects.
+- **Journal lives on the job doc**, sharing Mongo's 16MB budget with `logs[]`. Return ids/refs, not whole payloads; an oversized journal fails with a clear `JournalTooLarge`. Treat journaled results as sensitive (don't journal secrets).
+
+Full design and rationale: [`docs/orchestrator-spec.md`](docs/orchestrator-spec.md).
+
 ## Running the tests
 
 ```bash
@@ -176,7 +264,7 @@ The change-stream suite self-skips if `MONGO_URL` points at a standalone (non-re
 
 ## What this is not
 
-- Not a workflow engine. No step-level checkpointing or replay. If a handler crashes halfway, the whole job retries from the top.
+- Not a workflow engine by default — base `JobQueue` handlers retry from the top. Step-level resume is available as the opt-in [`Orchestrator`](#durable-orchestration-step-level-resume) layer (journaled steps, skipped on resume), but there are no timers, signals, or fan-out combinators yet (deferred — see the spec).
 - Not multi-datastore. MongoDB only, for now. The backend interface would accommodate a Postgres implementation (`FOR UPDATE SKIP LOCKED` maps cleanly), and that may land later.
 - Not battle-tested as a standalone package. The *queue* has years of production behind it; the *npm package* does not. File issues.
 
