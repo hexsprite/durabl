@@ -185,6 +185,42 @@ describe('ImmediateBackend', () => {
       // Should return null since there's a pending job
       expect(handle).toBeNull()
     })
+
+    // Regression: the claimOrEnqueue handle called complete/fail WITHOUT the
+    // minted claim token, so a stale handle whose job had been reclaimed by
+    // another worker (new token) would still clobber it — unlike
+    // MongoJobQueue.createHandle, which fences on the token.
+    it('a stale handle is a fenced no-op after the job is reclaimed', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+      // Send the job back to pending (its token is still live here), then let
+      // another worker reclaim it — claimNext mints a fresh token.
+      await handle!.fail('lease expired') // maxAttempts default 3 → pending
+      const reclaimed = await backend.claimNext('job')
+      expect(reclaimed).not.toBeNull()
+
+      // The original handle holds the OLD token → complete must not apply.
+      await handle!.complete()
+      const job = await backend.findOne({ type: 'job' })
+      expect(job!.status).toBe('active') // still owned by the new worker
+    })
+  })
+
+  describe('completeClaimed() dedupe release', () => {
+    // Regression: completeClaimed never freed the dedupe key enqueue() reserved,
+    // so a key consumed by an orchestrator-style completion blocked every future
+    // enqueue with that key forever.
+    it('frees the reserved dedupe key so a later enqueue with that key is not blocked', async () => {
+      backend.registerHandler('flow', async (job) => {
+        // Orchestrator-style completion (not ctx.complete): fence + finalize.
+        await backend.completeClaimed(job.id, job.claimToken!)
+      })
+
+      const first = await backend.enqueue('flow', {}, { dedupeKey: 'k1' })
+      expect(first).not.toBeNull()
+
+      const second = await backend.enqueue('flow', {}, { dedupeKey: 'k1' })
+      expect(second).not.toBeNull() // key released on completion, not stuck
+    })
   })
 
   describe('claimNext()', () => {
@@ -208,6 +244,18 @@ describe('ImmediateBackend', () => {
 
       // Since job was already claimed during enqueue, this returns null
       expect(claimed).toBeNull()
+    })
+  })
+
+  describe('findOne()', () => {
+    it('does not expose the live fencing claimToken', async () => {
+      // ImmediateBackend mints a claimToken on enqueue (jobs run inline); the
+      // general read view must not leak it — only the claim path may see it.
+      const id = await backend.enqueue('tokJob', { n: 1 })
+      const found = await backend.findOne({ type: 'tokJob' })
+      expect(found).not.toBeNull()
+      expect(found!.id).toBe(id)
+      expect(found!.claimToken).toBeUndefined()
     })
   })
 

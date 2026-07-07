@@ -158,6 +158,21 @@ describe('MongoJobQueue', () => {
     })
   })
 
+  describe('findOne()', () => {
+    it('does not expose the live fencing claimToken (claim path only)', async () => {
+      // The claim path must see the token (processJob fences writes with it)…
+      const jobId = await backend.enqueue('job', {})
+      const claimed = await backend.claimNext('job')
+      expect(claimed!.claimToken).toEqual(expect.any(String))
+
+      // …but the general read view must not leak it: any findOne caller could
+      // otherwise forge lease-fenced writes against the live owner's job.
+      const found = await backend.findOne({ _id: jobId })
+      expect(found).not.toBeNull()
+      expect(found!.claimToken).toBeUndefined()
+    })
+  })
+
   describe('fail()', () => {
     it('returns job to pending if attempts remain', async () => {
       const jobId = await backend.enqueue('job', {}, { maxAttempts: 3 })

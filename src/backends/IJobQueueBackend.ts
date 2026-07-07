@@ -6,9 +6,30 @@
  * ImmediateBackend (integration tests)
  */
 
-import type { EnqueueOptions, Job, JobHandle, QueueStats } from '../types'
+import type {
+  AppendStepResult,
+  CompleteClaimedResult,
+  EnqueueOptions,
+  HeartbeatClaimedResult,
+  Job,
+  JobHandle,
+  LifecycleWriteResult,
+  QueueStats,
+  StepRecord,
+} from '../types'
 
 export interface IJobQueueBackend {
+  /**
+   * True for backends that execute enqueued jobs *inline* through their own
+   * handler registry (see `ImmediateBackend.registerHandler`) instead of the
+   * {@link JobQueue.process} poll loop. An {@link Orchestrator} registers its
+   * durable wrapper via `queue.process()`, which such a backend never invokes —
+   * so an orchestration would silently sit `active` forever. `JobQueue` reads
+   * this flag to refuse orchestration construction against an inline backend.
+   * Detect-by-presence (absent/false = processor-driven, orchestration-capable).
+   */
+  readonly executesInline?: boolean
+
   /**
    * Add a job to the queue.
    * @returns Job ID if created, null if dedupe prevented creation
@@ -39,18 +60,37 @@ export interface IJobQueueBackend {
 
   /**
    * Mark job as successfully completed.
+   *
+   * When `claimToken` is provided the write is lease-fenced: it only applies
+   * if the job is still `active` under that token. A miss returns
+   * `'lease-lost'` and modifies nothing — a zombie worker can never clobber a
+   * job reclaimed by another worker.
    */
-  complete(jobId: string): Promise<void>
+  complete(jobId: string, claimToken?: string): Promise<LifecycleWriteResult>
 
   /**
    * Mark job as failed. Will retry if attempts remain.
+   *
+   * When `claimToken` is provided the write is lease-fenced (see
+   * {@link complete}); a miss returns `'lease-lost'` and modifies nothing.
    */
-  fail(jobId: string, reason: string): Promise<void>
+  fail(
+    jobId: string,
+    reason: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult>
 
   /**
    * Mark job as permanently failed. No retry.
+   *
+   * When `claimToken` is provided the write is lease-fenced (see
+   * {@link complete}); a miss returns `'lease-lost'` and modifies nothing.
    */
-  failFatal(jobId: string, reason: string): Promise<void>
+  failFatal(
+    jobId: string,
+    reason: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult>
 
   /**
    * Add a log entry to the job.
@@ -91,6 +131,21 @@ export interface IJobQueueBackend {
   resetStorage(): Promise<void>
 
   /**
+   * Reaper sweep: route `active` jobs whose lease expired (claimed longer ago
+   * than `visibilityTimeoutMs`) back to `pending`, or to terminal `failed`
+   * when attempts are exhausted. Optional — test backends may omit it.
+   *
+   * Prefer driving this via {@link JobQueue.startReaper}, which passes the
+   * queue's configured `visibilityTimeoutMs` — the single source of truth the
+   * Orchestrator also sizes heartbeats from. Passing a custom value directly
+   * is for tests/manual ops only; a value that disagrees with the queue's
+   * breaks the heartbeat/lease contract (§7.1).
+   *
+   * @returns Number of stuck jobs handled (re-queued + failed).
+   */
+  recoverStuckJobs?(visibilityTimeoutMs?: number): Promise<number>
+
+  /**
    * Subscribe to a push-style notification when a new pending job becomes
    * available. Backends that support real-time notifications (e.g. MongoDB
    * change streams) invoke the listener with the job type shortly after the
@@ -126,4 +181,47 @@ export interface IJobQueueBackend {
    * @returns An unsubscribe function, or `null` if push is not active.
    */
   onJobAvailable?(listener: (type: string) => void): (() => void) | null
+
+  // ---------------------------------------------------------------------------
+  // Durable-orchestration journal capability (optional). Detect-by-presence,
+  // mirroring `onJobAvailable?`. A backend either implements all four or none;
+  // `JobQueue` asserts the capability before an `Orchestrator` uses it.
+  // §3.5/§3.6.
+  // ---------------------------------------------------------------------------
+
+  /** Read the step journal for a job, normalized to ascending `seq`. */
+  readSteps?(jobId: string): Promise<StepRecord[]>
+
+  /**
+   * Lease-fenced, idempotent conditional append of one step record. Also bumps
+   * `claimedAt` (a free lease extension between steps, §7.4). An
+   * `already-recorded` result carries the existing record so callers need no
+   * follow-up journal read. §3.6.
+   */
+  appendStep?(
+    jobId: string,
+    claimToken: string,
+    record: StepRecord,
+  ): Promise<AppendStepResult>
+
+  /**
+   * Lease-fenced final completion (claim-token-only). §3.6.
+   *
+   * Matches `active` OR `failed` under the same token: the reaper may mark an
+   * attempt-exhausted job `failed` without clearing its token, and if that
+   * worker then finishes every step the completed work must not be lost —
+   * the run flips to `completed` (clearing `failReason`). A genuinely
+   * reclaimed job carries a DIFFERENT token, so it still returns
+   * `'lease-lost'`.
+   */
+  completeClaimed?(
+    jobId: string,
+    claimToken: string,
+  ): Promise<CompleteClaimedResult>
+
+  /** Lease-fenced heartbeat (claim-token-only). §7. */
+  heartbeatClaimed?(
+    jobId: string,
+    claimToken: string,
+  ): Promise<HeartbeatClaimedResult>
 }

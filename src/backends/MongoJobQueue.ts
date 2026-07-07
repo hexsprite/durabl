@@ -4,15 +4,27 @@ import { randomUUID } from 'node:crypto'
 import type { Collection, Db } from 'mongodb'
 
 import { defaultLogger, type Logger } from '../logger'
+import { JournalTooLarge, NondeterminismError } from '../journal/errors'
 import {
+  approxRecordBytes,
+  DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+  guardAppend,
+  sortBySeq,
+} from '../journal/serialize'
+import {
+  type AppendStepResult,
+  type CompleteClaimedResult,
   type DedupeScope,
   type EnqueueOptions,
+  type HeartbeatClaimedResult,
   type Job,
   type JobDoc,
   jobDocToJob,
   type JobHandle,
   type JobStatus,
+  type LifecycleWriteResult,
   type QueueStats,
+  type StepRecord,
 } from '../types'
 
 import { retryBackoffMs } from './backoff'
@@ -32,15 +44,42 @@ export interface MongoJobQueueOptions {
   useChangeStreams?: boolean
   /** Injectable logger. Default: console. */
   logger?: Logger
+  /**
+   * Soft cap (bytes) on the cumulative step journal + logs before `appendStep`
+   * throws `JournalTooLarge`. Default: 8MB (well under Mongo's 16MB cap). §8.1.
+   */
+  journalSoftLimitBytes?: number
 }
 
 type JobAvailableListener = (type: string) => void
+
+/**
+ * Does this driver/server error mean "the resulting document exceeds the BSON
+ * size cap"? Matched robustly across server/driver versions. Observed in the
+ * wild (mongod 7.x via node driver): `MongoServerError` code 10334 with
+ * message "BSONObj size: <n> is invalid. Size must be between 0 and
+ * 16793600(16MB)". Other versions use codeName `BSONObjectTooLarge`,
+ * "Resulting document after update is larger than 16777216", or the
+ * client-side "object to insert too large".
+ */
+function isBsonTooLargeError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  const { code, codeName } = err as { code?: unknown; codeName?: unknown }
+  return (
+    code === 10334 ||
+    codeName === 'BSONObjectTooLarge' ||
+    /BSONObjectTooLarge|BSONObj size:.*is invalid|object to insert too large|larger than (?:the )?maximum size|Resulting document after update is larger/i.test(
+      err.message,
+    )
+  )
+}
 
 export class MongoJobQueue implements IJobQueueBackend {
   private db: Db
   private collection: Collection<JobDoc>
   private useChangeStreams: boolean
   private logger: Logger
+  private journalSoftLimitBytes: number
   private watcher: MongoChangeStreamWatcher | null = null
   /** Buffer listeners subscribed before startup() so they get attached. */
   private pendingListeners: Set<JobAvailableListener> = new Set()
@@ -53,6 +92,8 @@ export class MongoJobQueue implements IJobQueueBackend {
       options.collectionName ?? 'jobs',
     )
     this.useChangeStreams = options.useChangeStreams ?? false
+    this.journalSoftLimitBytes =
+      options.journalSoftLimitBytes ?? DEFAULT_JOURNAL_SOFT_LIMIT_BYTES
     this.logger = (options.logger ?? defaultLogger).child({
       category: 'MongoJobQueue',
     })
@@ -134,6 +175,7 @@ export class MongoJobQueue implements IJobQueueBackend {
       runAt,
       createdAt: now,
       logs: [],
+      journalBytes: 0,
     }
 
     try {
@@ -178,12 +220,14 @@ export class MongoJobQueue implements IJobQueueBackend {
       runAt: now,
       createdAt: now,
       claimedAt: now,
+      claimToken: randomUUID(),
       logs: [],
+      journalBytes: 0,
     }
 
     try {
       await this.collection.insertOne(doc as JobDoc)
-      return this.createHandle(doc._id, data)
+      return this.createHandle(doc._id, data, doc.claimToken)
     } catch (err) {
       if (this.isDuplicateKeyError(err)) return null
       throw err
@@ -195,81 +239,121 @@ export class MongoJobQueue implements IJobQueueBackend {
     const doc = await this.collection.findOneAndUpdate(
       { type, status: 'pending', runAt: { $lte: now } },
       {
-        $set: { status: 'active' as JobStatus, claimedAt: now },
+        // Mint a fresh per-claim lease nonce. All orchestration fencing keys on
+        // this, not on `attempt` (R8) — an admin/manual re-activation that does
+        // not bump `attempt` would otherwise silently break the fence.
+        $set: {
+          status: 'active' as JobStatus,
+          claimedAt: now,
+          claimToken: randomUUID(),
+        },
         $inc: { attempt: 1 },
       },
       { sort: { priority: 1, runAt: 1 }, returnDocument: 'after' },
     )
-    return doc ? jobDocToJob(doc as JobDoc<T>) : null
+    // includeClaimToken: the claim path is the one reader allowed to see the
+    // live fencing token (processJob fences lifecycle writes with it).
+    return doc ? jobDocToJob(doc as JobDoc<T>, true) : null
   }
 
-  async complete(jobId: string): Promise<void> {
-    await this.collection.updateOne(
-      { _id: jobId },
+  /**
+   * `$push` + `$inc` fragment for one log entry. Every log write bumps
+   * `journalBytes` so the §8.1 running total stays exact for the size guard.
+   */
+  private logWrite(
+    message: string,
+    timestamp = new Date(),
+  ): Record<string, unknown> {
+    const entry = { timestamp, message }
+    return {
+      $push: { logs: entry },
+      $inc: { journalBytes: approxRecordBytes(entry) },
+    }
+  }
+
+  /** Lifecycle filter: fenced (`active` + matching token) when a token is
+   * given, plain `_id` lookup otherwise. */
+  private lifecycleFilter(
+    jobId: string,
+    claimToken?: string,
+  ): Record<string, unknown> {
+    return claimToken
+      ? { _id: jobId, status: 'active' as JobStatus, claimToken }
+      : { _id: jobId }
+  }
+
+  async complete(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
+    const res = await this.collection.updateOne(
+      this.lifecycleFilter(jobId, claimToken),
       {
         $set: { status: 'completed' as JobStatus, completedAt: new Date() },
       },
     )
+    return claimToken && res.matchedCount !== 1 ? 'lease-lost' : 'applied'
   }
 
-  async fail(jobId: string, reason: string): Promise<void> {
-    const job = await this.collection.findOne({ _id: jobId })
-    if (!job) return
+  async fail(
+    jobId: string,
+    reason: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
+    const filter = this.lifecycleFilter(jobId, claimToken)
+    const job = await this.collection.findOne(filter)
+    if (!job) return claimToken ? 'lease-lost' : 'applied'
 
     const now = new Date()
     const exhausted = job.attempt >= job.maxAttempts
 
+    let matchedCount: number
     if (exhausted) {
-      await this.collection.updateOne(
-        { _id: jobId },
-        {
-          $set: {
-            status: 'failed' as JobStatus,
-            failReason: reason,
-            failedAt: now,
-          },
-          $push: { logs: { timestamp: now, message: `Failed: ${reason}` } },
+      const res = await this.collection.updateOne(filter, {
+        $set: {
+          status: 'failed' as JobStatus,
+          failReason: reason,
+          failedAt: now,
         },
-      )
+        ...this.logWrite(`Failed: ${reason}`, now),
+      })
+      matchedCount = res.matchedCount
     } else {
       // Space the retry: push runAt into the future by a jittered backoff so
       // a fast-failing handler can't burn every attempt in milliseconds and a
       // downstream outage doesn't become an instant-retry storm.
       const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
-      await this.collection.updateOne(
-        { _id: jobId },
-        {
-          $set: { status: 'pending' as JobStatus, failReason: reason, runAt },
-          $push: {
-            logs: { timestamp: now, message: `Attempt failed: ${reason}` },
-          },
-        },
-      )
+      const res = await this.collection.updateOne(filter, {
+        $set: { status: 'pending' as JobStatus, failReason: reason, runAt },
+        ...this.logWrite(`Attempt failed: ${reason}`, now),
+      })
+      matchedCount = res.matchedCount
     }
+    return claimToken && matchedCount !== 1 ? 'lease-lost' : 'applied'
   }
 
-  async failFatal(jobId: string, reason: string): Promise<void> {
+  async failFatal(
+    jobId: string,
+    reason: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
     const now = new Date()
-    await this.collection.updateOne(
-      { _id: jobId },
+    const res = await this.collection.updateOne(
+      this.lifecycleFilter(jobId, claimToken),
       {
         $set: {
           status: 'failed' as JobStatus,
           failReason: reason,
           failedAt: now,
         },
-        $push: { logs: { timestamp: now, message: `Fatal: ${reason}` } },
+        ...this.logWrite(`Fatal: ${reason}`, now),
       },
     )
+    return claimToken && res.matchedCount !== 1 ? 'lease-lost' : 'applied'
   }
 
   async log(jobId: string, message: string): Promise<void> {
-    await this.collection.updateOne(
-      { _id: jobId },
-      {
-        $push: { logs: { timestamp: new Date(), message } },
-      },
-    )
+    await this.collection.updateOne({ _id: jobId }, this.logWrite(message))
   }
 
   async heartbeat(jobId: string): Promise<void> {
@@ -299,8 +383,165 @@ export class MongoJobQueue implements IJobQueueBackend {
     )
   }
 
+  // --- Durable-orchestration journal capability (§3.6) ----------------------
+
+  async readSteps(jobId: string): Promise<StepRecord[]> {
+    const doc = await this.collection.findOne(
+      { _id: jobId },
+      { projection: { steps: 1 } },
+    )
+    // Normalize to ascending seq — physical $push order is not execution order
+    // under concurrent fan-out (§3.6).
+    return sortBySeq(doc?.steps ?? [])
+  }
+
+  /**
+   * Lease-fenced, idempotent conditional append. The write filters on
+   * `{ status: 'active', claimToken, 'steps.seq': { $ne } }` so it is atomic and
+   * a stale worker cannot append. Also bumps `claimedAt` (free lease extension,
+   * §7.4). Serialization + cumulative-size guards run before the write so the
+   * journal is never corrupted and the 16MB cap surfaces as a clear error.
+   */
+  async appendStep(
+    jobId: string,
+    claimToken: string,
+    record: StepRecord,
+  ): Promise<AppendStepResult> {
+    // Pre-read is O(1) on the wire: only the lease fields, the running
+    // journalBytes total, and (via $elemMatch) the single same-seq step for
+    // idempotency/divergence classification — never the full steps/logs arrays.
+    const doc = await this.collection.findOne(
+      { _id: jobId },
+      {
+        projection: {
+          status: 1,
+          claimToken: 1,
+          journalBytes: 1,
+          steps: { $elemMatch: { seq: record.seq } },
+        },
+      },
+    )
+    if (!doc || doc.status !== 'active' || doc.claimToken !== claimToken) {
+      return { status: 'lease-lost' }
+    }
+    const existing = doc.steps?.[0]
+    if (existing) return this.classifyExistingStep(jobId, existing, record)
+
+    // Throws NonSerializableStepResult / JournalTooLarge before the write.
+    const incomingBytes = guardAppend(
+      record,
+      doc.journalBytes ?? 0,
+      this.journalSoftLimitBytes,
+    )
+
+    let res
+    try {
+      res = await this.collection.updateOne(
+        {
+          _id: jobId,
+          status: 'active',
+          claimToken,
+          'steps.seq': { $ne: record.seq },
+        },
+        {
+          $push: { steps: record },
+          $set: { claimedAt: new Date() },
+          $inc: { journalBytes: incomingBytes },
+        },
+      )
+    } catch (err) {
+      // The soft cap above checks a PRE-write snapshot, so concurrent fan-out
+      // appends sharing one claim token can each pass it and still blow Mongo's
+      // 16MB document cap at write time. Surface the documented typed error
+      // (§8.1) instead of a raw MongoServerError.
+      if (isBsonTooLargeError(err)) {
+        throw new JournalTooLarge(
+          record.name,
+          (doc.journalBytes ?? 0) + incomingBytes,
+        )
+      }
+      throw err
+    }
+    if (res.modifiedCount === 1) return { status: 'appended' }
+
+    // No write: either the lease was lost in the window or a concurrent append
+    // landed this seq first. Re-read to classify precisely.
+    const after = await this.collection.findOne(
+      { _id: jobId },
+      {
+        projection: {
+          status: 1,
+          claimToken: 1,
+          steps: { $elemMatch: { seq: record.seq } },
+        },
+      },
+    )
+    if (!after || after.status !== 'active' || after.claimToken !== claimToken) {
+      return { status: 'lease-lost' }
+    }
+    const dup = after.steps?.[0]
+    if (dup) return this.classifyExistingStep(jobId, dup, record)
+    return { status: 'lease-lost' }
+  }
+
+  private classifyExistingStep(
+    jobId: string,
+    existing: StepRecord,
+    record: StepRecord,
+  ): AppendStepResult {
+    if (existing.name !== record.name) {
+      throw new NondeterminismError(
+        jobId,
+        record.seq,
+        existing.name,
+        record.name,
+      )
+    }
+    return { status: 'already-recorded', existing }
+  }
+
+  /**
+   * Matches `active` OR `failed` under the same token — NOT active-only. The
+   * reaper marks an attempt-exhausted job `failed` without clearing its
+   * claimToken; if that worker then finishes every step, completed work must
+   * flip the job to `completed` (clearing `failReason`) rather than be lost.
+   * A genuinely reclaimed job holds a DIFFERENT token → still `'lease-lost'`.
+   */
+  async completeClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<CompleteClaimedResult> {
+    const res = await this.collection.updateOne(
+      {
+        _id: jobId,
+        claimToken,
+        status: { $in: ['active', 'failed'] satisfies JobStatus[] },
+      },
+      {
+        $set: { status: 'completed' as JobStatus, completedAt: new Date() },
+        $unset: { failReason: '', failedAt: '' },
+      },
+    )
+    return res.matchedCount === 1 ? 'completed' : 'lease-lost'
+  }
+
+  async heartbeatClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<HeartbeatClaimedResult> {
+    const res = await this.collection.updateOne(
+      { _id: jobId, status: 'active', claimToken },
+      { $set: { claimedAt: new Date() } },
+    )
+    // matchedCount, not modifiedCount: a same-millisecond claimedAt write is a
+    // no-op modification but the lease is still held.
+    return res.matchedCount === 1 ? 'heartbeated' : 'lease-lost'
+  }
+
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
     const doc = (await this.collection.findOne(query)) as JobDoc<T> | null
+    // General read view: the live fencing claimToken is deliberately NOT
+    // exposed here — only the claim path (claimNext) may see it.
     return doc ? jobDocToJob(doc) : null
   }
 
@@ -337,6 +578,12 @@ export class MongoJobQueue implements IJobQueueBackend {
    * Recovery does not bump `attempt` — the subsequent re-claim does that, so
    * the count stays accurate.
    *
+   * Prefer driving this via `JobQueue.startReaper()`, which schedules it with
+   * the queue's configured `visibilityTimeoutMs` — the single source of truth
+   * the Orchestrator also sizes heartbeats from (§7.1). Passing a custom
+   * value here is for tests/manual ops only; a value that disagrees with the
+   * queue's breaks the heartbeat/lease contract.
+   *
    * @returns Number of stuck jobs handled (re-queued + failed).
    */
   async recoverStuckJobs(visibilityTimeoutMs = 300000): Promise<number> {
@@ -360,9 +607,7 @@ export class MongoJobQueue implements IJobQueueBackend {
               failReason: 'Stalled — retries exhausted',
               failedAt: now,
             },
-            $push: {
-              logs: { timestamp: now, message: 'Stalled — retries exhausted' },
-            },
+            ...this.logWrite('Stalled — retries exhausted', now),
           },
         )
       } else {
@@ -371,9 +616,7 @@ export class MongoJobQueue implements IJobQueueBackend {
           { _id: job._id, status: 'active' },
           {
             $set: { status: 'pending' as JobStatus, runAt },
-            $push: {
-              logs: { timestamp: now, message: 'Recovered (stalled)' },
-            },
+            ...this.logWrite('Recovered (stalled)', now),
           },
         )
       }
@@ -400,12 +643,20 @@ export class MongoJobQueue implements IJobQueueBackend {
     await this.collection.deleteMany({})
   }
 
-  private createHandle<T>(jobId: string, data: T): JobHandle<T> {
+  private createHandle<T>(
+    jobId: string,
+    data: T,
+    claimToken?: string,
+  ): JobHandle<T> {
     return {
       id: jobId,
       data,
-      complete: () => this.complete(jobId),
-      fail: (reason: string) => this.fail(jobId, reason),
+      complete: async () => {
+        await this.complete(jobId, claimToken)
+      },
+      fail: async (reason: string) => {
+        await this.fail(jobId, reason, claimToken)
+      },
       log: (msg: string) => {
         void this.log(jobId, msg)
       },

@@ -1,19 +1,48 @@
 /* eslint-disable max-lines */
 /** Executes job handlers synchronously when enqueued. For integration tests. */
+import { randomUUID } from 'node:crypto'
+
+import {
+  appendStepInMemory,
+  completeClaimedInMemory,
+  heartbeatClaimedInMemory,
+  type JournalableJob,
+} from '../journal/inMemory'
+import {
+  approxRecordBytes,
+  DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+  sortBySeq,
+} from '../journal/serialize'
 import type {
+  AppendStepResult,
+  CompleteClaimedResult,
   EnqueueOptions,
+  HeartbeatClaimedResult,
   Job,
   JobContext,
   JobHandle,
   JobHandler,
+  LifecycleWriteResult,
   QueueStats,
+  StepRecord,
 } from '../types'
 
 import type { IJobQueueBackend } from './IJobQueueBackend'
 
+/** Internal job record: public {@link Job} plus the off-public step journal
+ *  and its running byte total. Structurally satisfies {@link JournalableJob}. */
+type ImmediateJob<T = unknown> = Job<T> & {
+  steps: StepRecord[]
+  journalBytes: number
+}
+
 export class ImmediateBackend implements IJobQueueBackend {
+  /** Inline backend: runs handlers on enqueue, never via the queue poll loop.
+   *  Signals `JobQueue` to refuse orchestrations (which need `process()`). */
+  readonly executesInline = true
+
   private handlers: Map<string, JobHandler<unknown>> = new Map()
-  private jobs: Map<string, Job> = new Map()
+  private jobs: Map<string, ImmediateJob> = new Map()
   private idCounter = 0
   private activeDedupeKeys: Set<string> = new Set()
 
@@ -34,6 +63,17 @@ export class ImmediateBackend implements IJobQueueBackend {
     return `${dedupeScope}:${dedupeKey}`
   }
 
+  /** Free a job's dedupe reservation. `enqueue` reserves the key up front, so
+   *  every terminal transition must release it or the key blocks all future
+   *  enqueues forever. The inline `createContext` path frees it directly; the
+   *  orchestrator completion path (`completeClaimed`) must do the same. */
+  private releaseDedupeKey(job: Job): void {
+    if (!job.dedupeKey || !job.dedupeScope) return
+    this.activeDedupeKeys.delete(
+      this.getDedupeSetKey(job.dedupeKey, job.dedupeScope),
+    )
+  }
+
   async enqueue(
     type: string,
     data: unknown,
@@ -51,7 +91,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     }
 
     const jobId = this.generateId()
-    const job: Job = {
+    const job: ImmediateJob = {
       id: jobId,
       type,
       data,
@@ -64,6 +104,9 @@ export class ImmediateBackend implements IJobQueueBackend {
       runAt: new Date(),
       createdAt: new Date(),
       claimedAt: new Date(),
+      claimToken: randomUUID(),
+      steps: [],
+      journalBytes: 0,
     }
 
     this.jobs.set(jobId, job)
@@ -80,7 +123,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     const handler = this.handlers.get(job.type)
     if (!handler) return
 
-    const ctx = this.createContext(job.id, dedupeKey, dedupeScope)
+    const ctx = this.createContext(job.id, dedupeKey, dedupeScope, job.claimToken)
     try {
       await handler(job, ctx)
     } catch (err) {
@@ -123,7 +166,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     }
 
     const jobId = this.generateId()
-    const job: Job<T> = {
+    const job: ImmediateJob<T> = {
       id: jobId,
       type,
       data,
@@ -136,19 +179,27 @@ export class ImmediateBackend implements IJobQueueBackend {
       runAt: new Date(),
       createdAt: new Date(),
       claimedAt: new Date(),
+      claimToken: randomUUID(),
+      steps: [],
+      journalBytes: 0,
     }
 
     this.jobs.set(jobId, job)
+
+    // Fence the handle with the claim token minted above, mirroring
+    // MongoJobQueue.createHandle: a stale handle whose job was reclaimed by
+    // another worker (new token) becomes a no-op instead of clobbering it.
+    const { claimToken } = job
 
     // Return handle for caller to execute inline
     return {
       id: jobId,
       data,
       complete: async () => {
-        await this.complete(jobId)
+        await this.complete(jobId, claimToken)
       },
       fail: async (reason: string) => {
-        await this.fail(jobId, reason)
+        await this.fail(jobId, reason, claimToken)
       },
       log: (message: string) => {
         void this.log(jobId, message)
@@ -162,6 +213,7 @@ export class ImmediateBackend implements IJobQueueBackend {
         job.status = 'active'
         job.attempt++
         job.claimedAt = new Date()
+        job.claimToken = randomUUID()
         return job as Job<T>
       }
     }
@@ -172,10 +224,11 @@ export class ImmediateBackend implements IJobQueueBackend {
     jobId: string,
     dedupeKey: string | undefined,
     dedupeScope: 'pending' | 'pending+active',
+    claimToken?: string,
   ): JobContext {
     return {
       complete: async () => {
-        await this.complete(jobId)
+        await this.complete(jobId, claimToken)
         if (dedupeKey) {
           this.activeDedupeKeys.delete(
             this.getDedupeSetKey(dedupeKey, dedupeScope),
@@ -183,7 +236,7 @@ export class ImmediateBackend implements IJobQueueBackend {
         }
       },
       fail: async (reason: string) => {
-        await this.fail(jobId, reason)
+        await this.fail(jobId, reason, claimToken)
         if (dedupeKey) {
           this.activeDedupeKeys.delete(
             this.getDedupeSetKey(dedupeKey, dedupeScope),
@@ -191,7 +244,7 @@ export class ImmediateBackend implements IJobQueueBackend {
         }
       },
       failFatal: async (reason: string) => {
-        await this.failFatal(jobId, reason)
+        await this.failFatal(jobId, reason, claimToken)
         if (dedupeKey) {
           this.activeDedupeKeys.delete(
             this.getDedupeSetKey(dedupeKey, dedupeScope),
@@ -207,16 +260,33 @@ export class ImmediateBackend implements IJobQueueBackend {
     }
   }
 
-  async complete(jobId: string): Promise<void> {
+  /** Fence check mirroring Mongo's fenced lifecycle filter: with a token the
+   * write only applies to an `active` job still holding that token. */
+  private fenceMiss(job: Job | undefined, claimToken?: string): boolean {
+    if (!claimToken) return false
+    return !job || job.status !== 'active' || job.claimToken !== claimToken
+  }
+
+  async complete(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
     const job = this.jobs.get(jobId)
+    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
     if (job) {
       job.status = 'completed'
       job.completedAt = new Date()
     }
+    return 'applied'
   }
 
-  async fail(jobId: string, reason: string): Promise<void> {
+  async fail(
+    jobId: string,
+    reason: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
     const job = this.jobs.get(jobId)
+    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
     if (job) {
       job.failReason = reason
       if (job.attempt >= job.maxAttempts) {
@@ -226,19 +296,32 @@ export class ImmediateBackend implements IJobQueueBackend {
         job.status = 'pending' // Back to pending for retry
       }
     }
+    return 'applied'
   }
 
-  async failFatal(jobId: string, reason: string): Promise<void> {
+  async failFatal(
+    jobId: string,
+    reason: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
     const job = this.jobs.get(jobId)
+    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
     if (job) {
       job.status = 'failed'
       job.failReason = reason
       job.failedAt = new Date()
     }
+    return 'applied'
   }
 
-  async log(_jobId: string, _message: string): Promise<void> {
-    // Could store logs if needed, for now no-op
+  async log(jobId: string, message: string): Promise<void> {
+    // Log text isn't stored, but its size still counts against the shared
+    // journal budget (§8.1) — mirror Mongo's per-entry accounting so the
+    // size guard has the same fidelity here.
+    const job = this.jobs.get(jobId)
+    if (job) {
+      job.journalBytes += approxRecordBytes({ timestamp: new Date(), message })
+    }
   }
 
   async heartbeat(jobId: string): Promise<void> {
@@ -248,9 +331,75 @@ export class ImmediateBackend implements IJobQueueBackend {
     }
   }
 
+  // --- Durable-orchestration journal capability (in-memory) -----------------
+
+  /** The stored job IS the journal view — the helpers mutate `steps` and
+   *  `journalBytes` in place, so no adapter copy is allowed here. */
+  private journalView(jobId: string): JournalableJob | undefined {
+    return this.jobs.get(jobId)
+  }
+
+  async readSteps(jobId: string): Promise<StepRecord[]> {
+    const job = this.jobs.get(jobId)
+    return job ? sortBySeq(job.steps) : []
+  }
+
+  async appendStep(
+    jobId: string,
+    claimToken: string,
+    record: StepRecord,
+  ): Promise<AppendStepResult> {
+    return appendStepInMemory(
+      this.journalView(jobId),
+      claimToken,
+      record,
+      DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+    )
+  }
+
+  async completeClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<CompleteClaimedResult> {
+    return completeClaimedInMemory(this.journalView(jobId), claimToken, () => {
+      const job = this.jobs.get(jobId)
+      if (job) {
+        job.status = 'completed'
+        job.completedAt = new Date()
+        // A reaper-failed-but-actually-complete run flips back — clear the
+        // stale failure markers, mirroring MongoJobQueue.completeClaimed.
+        delete job.failReason
+        delete job.failedAt
+        // enqueue() reserved the dedupe key; completion must free it or a
+        // later enqueue with that key is blocked forever.
+        this.releaseDedupeKey(job)
+      }
+    })
+  }
+
+  async heartbeatClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<HeartbeatClaimedResult> {
+    return heartbeatClaimedInMemory(this.journalView(jobId), claimToken, () => {
+      const job = this.jobs.get(jobId)
+      if (job) job.claimedAt = new Date()
+    })
+  }
+
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
     for (const job of this.jobs.values()) {
-      if (this.matchesQuery(job, query)) return job as Job<T>
+      if (this.matchesQuery(job, query)) {
+        // General read view: strip the live fencing claimToken (and internal
+        // journal fields) — only the claim path may see the token.
+        const {
+          claimToken: _claimToken,
+          steps: _steps,
+          journalBytes: _journalBytes,
+          ...publicView
+        } = job
+        return publicView as Job<T>
+      }
     }
     return null
   }

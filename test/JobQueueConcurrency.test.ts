@@ -2,7 +2,13 @@ import { describe, expect, it } from 'vitest'
 
 import type { IJobQueueBackend } from '../src/backends/IJobQueueBackend'
 import { JobQueue } from '../src/JobQueue'
-import type { Job, JobHandle, JobStatus, QueueStats } from '../src/types'
+import type {
+  Job,
+  JobHandle,
+  JobStatus,
+  LifecycleWriteResult,
+  QueueStats,
+} from '../src/types'
 
 /**
  * Minimal push-capable backend used to exercise the JobQueue concurrency
@@ -53,9 +59,15 @@ class MiniBackend implements IJobQueueBackend {
     job.attempt++
     return job as Job<T>
   }
-  async complete(): Promise<void> {}
-  async fail(): Promise<void> {}
-  async failFatal(): Promise<void> {}
+  async complete(): Promise<LifecycleWriteResult> {
+    return 'applied'
+  }
+  async fail(): Promise<LifecycleWriteResult> {
+    return 'applied'
+  }
+  async failFatal(): Promise<LifecycleWriteResult> {
+    return 'applied'
+  }
   async log(): Promise<void> {}
   async heartbeat(): Promise<void> {}
   async findOne<T>(): Promise<Job<T> | null> {

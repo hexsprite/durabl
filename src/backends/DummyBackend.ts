@@ -6,12 +6,29 @@
  * Use to verify job creation, dedupe behavior, and arguments.
  */
 
+import { randomUUID } from 'node:crypto'
+
+import {
+  appendStepInMemory,
+  completeClaimedInMemory,
+  heartbeatClaimedInMemory,
+} from '../journal/inMemory'
+import {
+  approxRecordBytes,
+  DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+  sortBySeq,
+} from '../journal/serialize'
 import type {
+  AppendStepResult,
+  CompleteClaimedResult,
   EnqueueOptions,
+  HeartbeatClaimedResult,
   Job,
   JobHandle,
   JobStatus,
+  LifecycleWriteResult,
   QueueStats,
+  StepRecord,
 } from '../types'
 
 import type { IJobQueueBackend } from './IJobQueueBackend'
@@ -28,6 +45,10 @@ interface RecordedJob<T = unknown> {
   dedupeScope?: 'pending' | 'pending+active'
   createdAt: Date
   logs: string[]
+  claimToken?: string
+  steps: StepRecord[]
+  /** Running approximate byte size of steps + logs (mirrors Mongo's field). */
+  journalBytes: number
 }
 
 /**
@@ -47,6 +68,9 @@ interface RecordedJob<T = unknown> {
 export class DummyBackend implements IJobQueueBackend {
   /** All recorded jobs */
   jobs: RecordedJob[] = []
+
+  /** `visibilityTimeoutMs` value of every `recoverStuckJobs()` call, in order. */
+  recoverStuckJobsCalls: (number | undefined)[] = []
 
   /** Counter for generating IDs */
   private idCounter = 0
@@ -105,6 +129,8 @@ export class DummyBackend implements IJobQueueBackend {
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
       createdAt: new Date(),
       logs: [],
+      steps: [],
+      journalBytes: 0,
     }
 
     this.jobs.push(job)
@@ -142,17 +168,27 @@ export class DummyBackend implements IJobQueueBackend {
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
       createdAt: new Date(),
       logs: [],
+      claimToken: randomUUID(),
+      steps: [],
+      journalBytes: 0,
     }
 
     this.jobs.push(job)
+
+    // Fence the handle with the token minted above, mirroring
+    // MongoJobQueue.createHandle: once the job is reclaimed (new token), a
+    // stale handle's complete/fail is a no-op and cannot clobber the new owner.
+    const { claimToken } = job
 
     return {
       id: job.id,
       data,
       complete: async () => {
+        if (this.fenceMiss(job, claimToken)) return
         job.status = 'completed'
       },
       fail: async (reason: string) => {
+        if (this.fenceMiss(job, claimToken)) return
         job.status = 'failed'
         job.logs.push(`Failed: ${reason}`)
       },
@@ -168,6 +204,7 @@ export class DummyBackend implements IJobQueueBackend {
 
     job.status = 'active'
     job.attempt++
+    job.claimToken = randomUUID()
 
     return {
       id: job.id,
@@ -181,18 +218,39 @@ export class DummyBackend implements IJobQueueBackend {
       dedupeScope: job.dedupeScope,
       runAt: job.createdAt,
       createdAt: job.createdAt,
+      claimToken: job.claimToken,
     }
   }
 
-  async complete(jobId: string): Promise<void> {
+  /** Fence check mirroring Mongo's fenced lifecycle filter: with a token the
+   * write only applies to an `active` job still holding that token. */
+  private fenceMiss(
+    job: RecordedJob | undefined,
+    claimToken?: string,
+  ): boolean {
+    if (!claimToken) return false
+    return !job || job.status !== 'active' || job.claimToken !== claimToken
+  }
+
+  async complete(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
     const job = this.jobs.find((j) => j.id === jobId)
+    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
     if (job) {
       job.status = 'completed'
     }
+    return 'applied'
   }
 
-  async fail(jobId: string, reason: string): Promise<void> {
+  async fail(
+    jobId: string,
+    reason: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
     const job = this.jobs.find((j) => j.id === jobId)
+    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
     if (job) {
       job.logs.push(`Failed: ${reason}`)
       if (job.attempt >= job.maxAttempts) {
@@ -201,25 +259,84 @@ export class DummyBackend implements IJobQueueBackend {
         job.status = 'pending' // Back to pending for retry
       }
     }
+    return 'applied'
   }
 
-  async failFatal(jobId: string, reason: string): Promise<void> {
+  async failFatal(
+    jobId: string,
+    reason: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
     const job = this.jobs.find((j) => j.id === jobId)
+    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
     if (job) {
       job.status = 'failed'
       job.logs.push(`Fatal: ${reason}`)
     }
+    return 'applied'
   }
 
   async log(jobId: string, message: string): Promise<void> {
     const job = this.jobs.find((j) => j.id === jobId)
     if (job) {
       job.logs.push(message)
+      // Logs share the journal size budget (§8.1) — keep the total current.
+      // Count the full {timestamp, message} entry that MongoJobQueue.logWrite
+      // and ImmediateBackend.log persist, not the bare string, so the guard's
+      // running total has the same fidelity across all three backends.
+      job.journalBytes += approxRecordBytes({ timestamp: new Date(), message })
     }
   }
 
   async heartbeat(_jobId: string): Promise<void> {
     // No-op for dummy backend
+  }
+
+  /** Records the call (for reaper wiring assertions); recovers nothing. */
+  async recoverStuckJobs(visibilityTimeoutMs?: number): Promise<number> {
+    this.recoverStuckJobsCalls.push(visibilityTimeoutMs)
+    return 0
+  }
+
+  // --- Durable-orchestration journal capability (in-memory) -----------------
+
+  async readSteps(jobId: string): Promise<StepRecord[]> {
+    const job = this.jobs.find((j) => j.id === jobId)
+    return job ? sortBySeq(job.steps) : []
+  }
+
+  async appendStep(
+    jobId: string,
+    claimToken: string,
+    record: StepRecord,
+  ): Promise<AppendStepResult> {
+    const job = this.jobs.find((j) => j.id === jobId)
+    return appendStepInMemory(
+      job,
+      claimToken,
+      record,
+      DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+    )
+  }
+
+  async completeClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<CompleteClaimedResult> {
+    const job = this.jobs.find((j) => j.id === jobId)
+    return completeClaimedInMemory(job, claimToken, () => {
+      if (job) job.status = 'completed'
+    })
+  }
+
+  async heartbeatClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<HeartbeatClaimedResult> {
+    const job = this.jobs.find((j) => j.id === jobId)
+    return heartbeatClaimedInMemory(job, claimToken, () => {
+      /* no claimedAt tracked on dummy jobs */
+    })
   }
 
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
@@ -295,6 +412,7 @@ export class DummyBackend implements IJobQueueBackend {
   reset(): void {
     this.jobs = []
     this.idCounter = 0
+    this.recoverStuckJobsCalls = []
   }
 
   /**

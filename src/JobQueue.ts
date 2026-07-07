@@ -2,14 +2,19 @@
 import { defaultLogger, type Logger } from './logger'
 
 import type { IJobQueueBackend } from './backends/IJobQueueBackend'
+import { OrchestrationUnsupportedError } from './journal/errors'
 import type {
+  AppendStepResult,
+  CompleteClaimedResult,
   EnqueueOptions,
+  HeartbeatClaimedResult,
   Job,
   JobContext,
   JobHandle,
   JobHandler,
   ProcessorConfig,
   QueueStats,
+  StepRecord,
 } from './types'
 
 interface ProcessorState {
@@ -27,6 +32,22 @@ const MAX_BACKOFF_MS = 60000
 const DEFAULT_POLL_INTERVAL_MS = 5000
 /** Safety-net poll interval when backend pushes new-job notifications. */
 const PUSH_POLL_INTERVAL_MS = 60000
+/** Default reaper visibility timeout. */
+const DEFAULT_VISIBILITY_TIMEOUT_MS = 300000
+/** Default cadence for the built-in reaper timer ({@link JobQueue.startReaper}). */
+const DEFAULT_REAPER_INTERVAL_MS = 60000
+
+/** Options for the {@link JobQueue} constructor. */
+export interface JobQueueOptions {
+  /**
+   * The reaper visibility timeout (ms) this queue is operated with. Single
+   * source of truth (§7.1): the {@link Orchestrator} reads it to size the
+   * heartbeat, and {@link JobQueue.startReaper} passes it to the backend's
+   * `recoverStuckJobs()` — configure it here, nowhere else.
+   * Must be a positive finite number. Default: 300000.
+   */
+  visibilityTimeoutMs?: number
+}
 
 export class JobQueue {
   private backend: IJobQueueBackend
@@ -34,10 +55,29 @@ export class JobQueue {
   private processors: Map<string, ProcessorState> = new Map()
   private isShuttingDown = false
   private unsubscribePush: (() => void) | null = null
+  private reaperTimer: ReturnType<typeof setInterval> | null = null
+  /** Reaper visibility timeout this queue is operated with (§7.1). */
+  readonly visibilityTimeoutMs: number
 
-  constructor(backend: IJobQueueBackend, logger: Logger = defaultLogger) {
+  constructor(
+    backend: IJobQueueBackend,
+    logger: Logger = defaultLogger,
+    options: JobQueueOptions = {},
+  ) {
     this.backend = backend
     this.log = logger.child({ category: 'JobQueue' })
+    this.visibilityTimeoutMs =
+      options.visibilityTimeoutMs ?? DEFAULT_VISIBILITY_TIMEOUT_MS
+    // A zero/negative window would make the reaper reclaim every active job
+    // instantly and the Orchestrator size its heartbeat to setTimeout(0).
+    if (
+      !Number.isFinite(this.visibilityTimeoutMs) ||
+      this.visibilityTimeoutMs <= 0
+    ) {
+      throw new Error(
+        `visibilityTimeoutMs must be a positive finite number of milliseconds, got ${this.visibilityTimeoutMs}`,
+      )
+    }
     // A backend may implement onJobAvailable but return null when push is
     // currently disabled (MongoJobQueue w/ change streams flag off). Only
     // treat it as push-capable when we get a live unsubscribe back.
@@ -169,14 +209,138 @@ export class JobQueue {
     return this.backend.getStats(type)
   }
 
+  // --- Durable-orchestration journal passthroughs (§3.5) --------------------
+  // Thin delegations so an Orchestrator depends only on JobQueue and never
+  // reaches around it to the backend. Each throws OrchestrationUnsupportedError
+  // if the backend lacks the capability.
+
+  /** Throw if the backend cannot host durable orchestrations — either because
+   * it executes jobs inline (bypassing the `process()` loop the wrapper needs)
+   * or because it lacks one of the four journal methods. The
+   * {@link Orchestrator} constructor calls this. */
+  assertJournalCapable(): void {
+    // An inline backend runs its own handler registry on enqueue and never
+    // drives queue.process() processors, so an orchestration wrapper would
+    // never execute — the job would sit 'active' forever. Fail loud instead.
+    if (this.backend.executesInline) {
+      throw new OrchestrationUnsupportedError(
+        'executesInline',
+        'backend executes jobs inline on enqueue and never runs queue.process() ' +
+          'processors, so it cannot host durable orchestrations — use DummyBackend ' +
+          'for orchestration unit tests',
+      )
+    }
+    if (typeof this.backend.readSteps !== 'function') {
+      throw new OrchestrationUnsupportedError('readSteps')
+    }
+    if (typeof this.backend.appendStep !== 'function') {
+      throw new OrchestrationUnsupportedError('appendStep')
+    }
+    if (typeof this.backend.completeClaimed !== 'function') {
+      throw new OrchestrationUnsupportedError('completeClaimed')
+    }
+    if (typeof this.backend.heartbeatClaimed !== 'function') {
+      throw new OrchestrationUnsupportedError('heartbeatClaimed')
+    }
+  }
+
+  async readSteps(jobId: string): Promise<StepRecord[]> {
+    if (!this.backend.readSteps) {
+      throw new OrchestrationUnsupportedError('readSteps')
+    }
+    return this.backend.readSteps(jobId)
+  }
+
+  async appendStep(
+    jobId: string,
+    claimToken: string,
+    record: StepRecord,
+  ): Promise<AppendStepResult> {
+    if (!this.backend.appendStep) {
+      throw new OrchestrationUnsupportedError('appendStep')
+    }
+    return this.backend.appendStep(jobId, claimToken, record)
+  }
+
+  async completeClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<CompleteClaimedResult> {
+    if (!this.backend.completeClaimed) {
+      throw new OrchestrationUnsupportedError('completeClaimed')
+    }
+    return this.backend.completeClaimed(jobId, claimToken)
+  }
+
+  async heartbeatClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<HeartbeatClaimedResult> {
+    if (!this.backend.heartbeatClaimed) {
+      throw new OrchestrationUnsupportedError('heartbeatClaimed')
+    }
+    return this.backend.heartbeatClaimed(jobId, claimToken)
+  }
+
   /** Initialize the queue (create indexes, etc). */
   async startup(): Promise<void> {
     await this.backend.startup()
   }
 
+  /**
+   * Start the stuck-job reaper: periodically invoke the backend's
+   * `recoverStuckJobs()` with **this queue's** `visibilityTimeoutMs`, so the
+   * value the {@link Orchestrator} sizes heartbeats from and the value the
+   * reaper enforces can never drift apart (§7.1). Run this on exactly one
+   * process (or accept redundant-but-harmless sweeps on several).
+   *
+   * The timer is `unref`'d — it won't keep the process alive — and is cleared
+   * by {@link stopReaper} / {@link shutdown}.
+   *
+   * @param intervalMs sweep cadence. Default: 60000.
+   * @throws if the backend does not implement `recoverStuckJobs`.
+   */
+  startReaper(intervalMs = DEFAULT_REAPER_INTERVAL_MS): void {
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      throw new Error(
+        `startReaper intervalMs must be a positive finite number of milliseconds, got ${intervalMs}`,
+      )
+    }
+    if (typeof this.backend.recoverStuckJobs !== 'function') {
+      throw new Error(
+        'startReaper: backend does not implement recoverStuckJobs',
+      )
+    }
+    if (this.reaperTimer) return // already running — idempotent
+    const timer = setInterval(() => {
+      void this.backend
+        .recoverStuckJobs!(this.visibilityTimeoutMs)
+        .then((handled) => {
+          if (handled > 0) {
+            this.log.warn({ handled }, 'reaper recovered stuck jobs')
+          }
+        })
+        .catch((err) => {
+          this.log.error({ err }, 'reaper sweep failed; will retry next tick')
+        })
+    }, intervalMs)
+    timer.unref?.()
+    this.reaperTimer = timer
+  }
+
+  /** Stop the reaper started by {@link startReaper}. Safe to call twice. */
+  stopReaper(): void {
+    if (this.reaperTimer) {
+      clearInterval(this.reaperTimer)
+      this.reaperTimer = null
+    }
+  }
+
   /** Graceful shutdown. Stops processors and waits for active jobs. */
   async shutdown(timeoutMs = 30000): Promise<void> {
     this.isShuttingDown = true
+
+    this.stopReaper()
 
     // Stop accepting new push notifications immediately
     if (this.unsubscribePush) {
@@ -229,14 +393,18 @@ export class JobQueue {
    * Process a single job
    */
   private async processJob(state: ProcessorState, job: Job): Promise<void> {
-    const ctx = this.createContext(job.id)
+    const ctx = this.createContext(job)
 
     try {
       await state.handler(job, ctx)
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
       try {
-        await this.backend.fail(job.id, reason)
+        // Fenced with the claim token from *this* claim: if the job was
+        // reclaimed (reaper → another worker), the fail must not clobber the
+        // live owner's copy. On a fence miss, do nothing and do not retry.
+        const res = await this.backend.fail(job.id, reason, job.claimToken)
+        if (res === 'lease-lost') this.warnLeaseLost(job.id, 'fail')
       } catch (failErr) {
         this.log.error({ failErr, jobId: job.id }, 'error marking job as failed')
       }
@@ -247,14 +415,33 @@ export class JobQueue {
     }
   }
 
+  private warnLeaseLost(jobId: string, op: string): void {
+    this.log.warn(
+      { jobId, op },
+      'lease lost; skipping fail/complete — job owned by another worker',
+    )
+  }
+
   /**
-   * Create JobContext for handler
+   * Create JobContext for handler. All lifecycle writes are fenced with the
+   * claim token from this claim (when the backend minted one), so a zombie
+   * worker can never complete/fail a job that another worker now owns.
    */
-  private createContext(jobId: string): JobContext {
+  private createContext(job: Job): JobContext {
+    const { id: jobId, claimToken } = job
     return {
-      complete: () => this.backend.complete(jobId),
-      fail: (reason: string) => this.backend.fail(jobId, reason),
-      failFatal: (reason: string) => this.backend.failFatal(jobId, reason),
+      complete: async () => {
+        const res = await this.backend.complete(jobId, claimToken)
+        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'complete')
+      },
+      fail: async (reason: string) => {
+        const res = await this.backend.fail(jobId, reason, claimToken)
+        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'fail')
+      },
+      failFatal: async (reason: string) => {
+        const res = await this.backend.failFatal(jobId, reason, claimToken)
+        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'failFatal')
+      },
       log: (message: string) => {
         void this.backend.log(jobId, message)
       },

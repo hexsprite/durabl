@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { DummyBackend } from '../src/backends/DummyBackend'
+import { approxRecordBytes } from '../src/journal/serialize'
 
 describe('DummyBackend', () => {
   let backend: DummyBackend
@@ -93,6 +94,19 @@ describe('DummyBackend', () => {
 
       expect(backend.jobs[0].logs).toContain('processing started')
     })
+
+    // Regression: the handle mutated status directly with no lease fence, so a
+    // stale handle whose job had been reclaimed (new token) could still clobber
+    // it — MongoJobQueue.createHandle fences on the token.
+    it('a stale handle is a fenced no-op after the job is reclaimed', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+      const stored = backend.jobs.find((j) => j.id === handle!.id)!
+      // Another worker reclaims: new token, still active.
+      stored.claimToken = 'new-owner-token'
+
+      await handle!.complete()
+      expect(stored.status).toBe('active') // stale handle did not complete it
+    })
   })
 
   describe('claimNext()', () => {
@@ -161,6 +175,26 @@ describe('DummyBackend', () => {
     })
   })
 
+  describe('log() journal accounting', () => {
+    // Regression: log() added approxRecordBytes(message) — the bare string —
+    // while MongoJobQueue.logWrite and ImmediateBackend.log count the full
+    // {timestamp, message} entry. DummyBackend under-counted, drifting the
+    // size-guard fidelity away from prod.
+    it('counts the full {timestamp, message} entry, not the bare string', async () => {
+      const id = (await backend.enqueue('t', {})) as string
+      await backend.log(id, 'hello')
+
+      const job = backend.jobs.find((j) => j.id === id)!
+      const entryBytes = approxRecordBytes({
+        timestamp: new Date(),
+        message: 'hello',
+      })
+      const bareBytes = approxRecordBytes('hello')
+      expect(job.journalBytes).toBe(entryBytes) // entry-shaped, matches prod
+      expect(job.journalBytes).toBeGreaterThan(bareBytes) // not the bare string
+    })
+  })
+
   describe('getStats()', () => {
     it('returns correct counts', async () => {
       await backend.enqueue('job', {})
@@ -210,6 +244,96 @@ describe('DummyBackend', () => {
       expect(backend.getJobsByType('typeA').length).toBe(2)
       expect(backend.getJobsByStatus('pending').length).toBe(2)
       expect(backend.getJobsByStatus('active').length).toBe(1)
+    })
+  })
+
+  describe('lease-fenced lifecycle writes (zombie worker fencing)', () => {
+    /** Claim a job, then simulate a reaper reclaim: the job stays active but
+     * under a NEW claim token owned by another worker. Returns the stale
+     * token the "zombie" worker still holds. */
+    async function claimThenReclaim(): Promise<{
+      id: string
+      staleToken: string
+    }> {
+      await backend.enqueue('t', {})
+      const job = await backend.claimNext('t')
+      const stored = backend.jobs.find((j) => j.id === job!.id)!
+      stored.claimToken = 'new-owner-token'
+      return { id: job!.id, staleToken: job!.claimToken! }
+    }
+
+    // Regression (du-4ft): fail() was unfenced — a zombie worker's failure
+    // report clobbered a job the reaper had already handed to a live worker,
+    // resetting it to pending/failed under the new owner's feet.
+    it('a zombie fail() with a stale token does not clobber the reclaimed job', async () => {
+      const { id, staleToken } = await claimThenReclaim()
+      const res = await backend.fail(id, 'zombie says boom', staleToken)
+      expect(res).toBe('lease-lost')
+      const stored = backend.jobs.find((j) => j.id === id)!
+      expect(stored.status).toBe('active') // still owned by the new worker
+      expect(stored.logs).toHaveLength(0) // nothing destructive happened
+    })
+
+    // Regression (du-4ft): failFatal() was unfenced — a zombie could mark a
+    // live, reclaimed job terminally failed.
+    it('a zombie failFatal() with a stale token does not clobber the reclaimed job', async () => {
+      const { id, staleToken } = await claimThenReclaim()
+      const res = await backend.failFatal(id, 'zombie fatal', staleToken)
+      expect(res).toBe('lease-lost')
+      const stored = backend.jobs.find((j) => j.id === id)!
+      expect(stored.status).toBe('active')
+      expect(stored.logs).toHaveLength(0)
+    })
+
+    it('a zombie complete() with a stale token does not complete the reclaimed job', async () => {
+      const { id, staleToken } = await claimThenReclaim()
+      const res = await backend.complete(id, staleToken)
+      expect(res).toBe('lease-lost')
+      expect(backend.jobs.find((j) => j.id === id)!.status).toBe('active')
+    })
+
+    it('fenced writes with the live token still apply', async () => {
+      await backend.enqueue('t', {})
+      const job = await backend.claimNext('t')
+      expect(await backend.complete(job!.id, job!.claimToken)).toBe('applied')
+      expect(backend.jobs.find((j) => j.id === job!.id)!.status).toBe(
+        'completed',
+      )
+    })
+
+    it('unfenced writes (no token) keep legacy behavior and report applied', async () => {
+      await backend.enqueue('t', {})
+      const job = await backend.claimNext('t')
+      expect(await backend.complete(job!.id)).toBe('applied')
+      expect(backend.jobs.find((j) => j.id === job!.id)!.status).toBe(
+        'completed',
+      )
+    })
+
+    // Regression (du-4ft): completeClaimed matched status:'active' only. The
+    // reaper marks an attempt-exhausted job 'failed' WITHOUT clearing its
+    // claimToken; a worker that then finished all steps got 'lease-lost' and
+    // the completed work was permanently lost.
+    it('completeClaimed flips a reaper-exhausted-but-actually-complete run to completed', async () => {
+      await backend.enqueue('t', {})
+      const job = await backend.claimNext('t')
+      const stored = backend.jobs.find((j) => j.id === job!.id)!
+      // Simulate the reaper: attempt-exhausted → failed, token NOT cleared.
+      stored.status = 'failed'
+      const res = await backend.completeClaimed(job!.id, job!.claimToken!)
+      expect(res).toBe('completed')
+      expect(stored.status).toBe('completed')
+    })
+
+    it('completeClaimed on a reaper-failed job with a DIFFERENT token stays lease-lost', async () => {
+      await backend.enqueue('t', {})
+      const job = await backend.claimNext('t')
+      const stored = backend.jobs.find((j) => j.id === job!.id)!
+      stored.status = 'failed'
+      stored.claimToken = 'reclaimed-by-someone-else'
+      const res = await backend.completeClaimed(job!.id, job!.claimToken!)
+      expect(res).toBe('lease-lost')
+      expect(stored.status).toBe('failed')
     })
   })
 })
