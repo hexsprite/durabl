@@ -31,20 +31,48 @@ export {
   getGlobalBackend,
   setGlobalBackend,
 } from './JobQueue'
+export type { JobQueueOptions } from './JobQueue'
 
 // Types
 export type {
+  AppendStepResult,
+  CompleteClaimedResult,
   DedupeScope,
   EnqueueOptions,
+  HeartbeatClaimedResult,
   Job,
   JobContext,
   JobDoc,
   JobHandle,
   JobHandler,
   JobStatus,
+  LifecycleWriteResult,
   ProcessorConfig,
   QueueStats,
+  StepRecord,
 } from './types'
+
+// Durable-execution orchestrator (step-level resume)
+export { Orchestrator } from './orchestrator/Orchestrator'
+export type {
+  OrchestratorConfig,
+  OrchestratorContext,
+  OrchestratorFn,
+  StepKeys,
+  StepOptions,
+} from './orchestrator/types'
+export {
+  HeartbeatConfigConflict,
+  isFatalOrchestrationError,
+  JournalTooLarge,
+  MaxDurationExceeded,
+  NondeterminismError,
+  NonRetryable,
+  NonSerializableStepResult,
+  OrchestrationUnsupportedError,
+  OrchestratorTypeConflict,
+  StepTimeout,
+} from './journal/errors'
 
 // Logger interface + console default (inject your own pino/winston instance)
 export { type Logger, consoleLogger, defaultLogger } from './logger'
