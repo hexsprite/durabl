@@ -25,6 +25,7 @@ I stole the good ideas (pluggable backends from Django's task framework, the ded
 - **Delayed and prioritized scheduling.** `runAt` delays a job; lower `priority` numbers run first.
 - **Dedupe keys, two scopes.** `pending+active` blocks any duplicate. `pending` allows one pending behind one active, which gives you single-flight coalescing: run now, queue at most one more.
 - **Push/poll hybrid.** Rides MongoDB change streams for sub-100ms pickup, with a reconnect catch-up sentinel so jobs that land during a stream blip aren't missed. Degrades cleanly to polling when change streams are off or unavailable.
+- **Deploy-ordered startup hooks.** `createDeployGate` skips index/validator/migration work when an older image boots beside a newer one during a rolling deploy, so the old machine can't revert the new schema.
 - **Pluggable backends.** One interface, three implementations: `MongoJobQueue` for production, plus `DummyBackend` (records calls) and `ImmediateBackend` (runs inline) for tests. Swap the backend and test your job logic without mocking Mongo.
 
 ## Install
@@ -132,6 +133,30 @@ Mutual exclusion is enforced by unique partial indexes, not by a pre-read, so
 concurrent callers across a rolling deploy get the same answer as sequential
 ones: exactly one wins.
 
+### Deploy-ordered startup hooks
+
+A rolling deploy overlaps machines, so an *older* image can boot beside a newer one. Startup work that runs unconditionally on every boot — index creation, `collMod` validators, migrations — gets re-applied by whichever process boots last, and the old machine silently reverts the new schema.
+
+`createDeployGate` records the newest build any process has seen in a singleton document and turns the older machine's hooks into a no-op:
+
+```typescript
+import { createDeployGate } from 'durabl'
+
+const runIfLatestBuild = createDeployGate({ db, revision: process.env.GIT_SHA })
+
+runIfLatestBuild(async () => { await reconcileIndexes() })
+runIfLatestBuild(async () => { await runMigrations() })
+
+// Once, at the end of startup. Hooks run in registration order.
+const { ran } = await runIfLatestBuild.run()
+```
+
+The build version defaults to the mtime of `process.argv[1]` — cheap, monotonic per deploy, no build-time codegen. That's the fallback, not the contract: pass `buildTimestamp` to drive it from a real build identity, or `entrypoint` to point the stat somewhere else. A throwing hook propagates and the recorded version is left alone, so a half-finished deploy never claims to be the latest.
+
+**It's a skip, not a lock.** Two processes carrying the *identical* build timestamp both run their hooks; nothing serialises them. That's deliberate — the problem is ordering, not exclusion, and hooks have to be idempotent anyway since they run on every boot of the newest build. A lock on the startup path is a new way to hang a boot, so it isn't taken by default.
+
+For one hook, `runIfLatestBuild(options, hook)` does the create/register/run in a single call.
+
 ## Testing your jobs
 
 The backend is an interface, so your job logic never has to touch Mongo in a unit test.
@@ -204,6 +229,23 @@ interface EnqueueOptions {
 interface ProcessorConfig {
   concurrency?: number    // default 1
   pollInterval?: number   // default 5000 (60000 when change streams are on)
+}
+
+function createDeployGate(options: DeployGateOptions): DeployGate
+
+interface DeployGateOptions {
+  db: Db
+  collectionName?: string // default 'deployments'
+  deploymentId?: string   // singleton _id. default 'default'
+  buildTimestamp?: Date   // explicit build version; wins over entrypoint
+  entrypoint?: string     // path whose mtime is the version. default process.argv[1]
+  revision?: string       // git SHA / image digest, recorded alongside
+  logger?: Logger
+}
+
+interface DeployGate {
+  (hook: () => Promise<void>): void  // register; runs in registration order
+  run(): Promise<DeployGateResult>   // { ran, buildTimestamp, previousTimestamp, hooksRun }
 }
 ```
 
