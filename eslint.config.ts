@@ -22,7 +22,14 @@ import durabl from './src/eslint/index'
 
 export default [
   {
-    ignores: ['dist/**', 'coverage/**', 'node_modules/**', '.beads/**'],
+    ignores: [
+      'dist/**',
+      'coverage/**',
+      'node_modules/**',
+      '.beads/**',
+      // Harness-managed worktree checkouts; each lints in its own tree.
+      '.claude/**',
+    ],
   },
   js.configs.recommended,
   {
