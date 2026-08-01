@@ -48,14 +48,15 @@
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
-    "mongodb": ">=6.0.0",
     "@typescript-eslint/utils": ">=8.0.0",
-    "eslint": ">=9.0.0"
+    "eslint": ">=9.0.0",
+    "mongodb": ">=6.0.0"
   },
   "peerDependenciesMeta": {
     "@typescript-eslint/utils": {
@@ -66,11 +67,13 @@
     }
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.10.0",
     "@typescript-eslint/parser": "^8.61.1",
     "@typescript-eslint/rule-tester": "^8.61.1",
     "@typescript-eslint/utils": "^8.61.1",
     "eslint": "^9.39.4",
+    "jiti": "^2.7.0",
     "mongodb": "^6.21.0",
     "mongodb-memory-server": "^10.1.4",
     "tsup": "^8.3.5",

@@ -10,8 +10,13 @@ npm run test:watch        # vitest watch mode
 npx vitest run test/MongoJobQueue.test.ts          # single file
 npx vitest run -t "claims the next pending job"     # single test by name
 npm run typecheck         # tsc --noEmit (strict; noUnusedLocals/Params on)
+npm run lint              # eslint (zero-warning gate; dogfoods durabl/eslint on src)
 npm run build             # tsup → dist/ (esm + cjs + dts)
 ```
+
+`eslint.config.ts` imports the plugin straight from `src/eslint/` (resolved via
+`jiti`), so linting never depends on a prior `npm run build`. Rules the compiler
+already owns (`no-undef`, `no-unused-vars`) stay off — `tsc` is the authority.
 
 `mongodb` is a **peer** dependency. `tsup` marks it `external` — never bundle it.
 
