@@ -146,10 +146,10 @@ export class Orchestrator {
       // any in-flight step signal chained to it) stops instead of orphaning.
       const runController = new AbortController()
       const octx = buildContext({
-        queue: this.queue,
+        journal: this.queue,
         job,
         claimToken,
-        ctx,
+        log: (message) => ctx.log(message),
         steps,
         stepTimeoutMs: config.stepTimeoutMs,
         runController,

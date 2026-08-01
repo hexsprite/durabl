@@ -4,10 +4,14 @@
  */
 import { createHash, randomBytes } from 'node:crypto'
 
-import type { JobQueue } from '../JobQueue'
 import { NondeterminismError, StepTimeout } from '../journal/errors'
 import { fromStored, toStored } from '../journal/serialize'
-import type { Job, JobContext, StepRecord } from '../types'
+import type {
+  AppendStepResult,
+  HeartbeatClaimedResult,
+  Job,
+  StepRecord,
+} from '../types'
 
 import type {
   OrchestratorContext,
@@ -60,11 +64,30 @@ export function deriveUuid(seed: string, label: string): string {
   ].join('-')
 }
 
+/**
+ * The narrow seam the step machine writes through. `JobQueue` satisfies it
+ * structurally; tests (and `durabl/testing`) supply an in-memory
+ * implementation, so replay/bootstrap/duplicate-append behavior is exercised
+ * with no queue, backend, or job-type registration involved.
+ */
+export interface StepJournalPort {
+  appendStep(
+    jobId: string,
+    claimToken: string,
+    record: StepRecord,
+  ): Promise<AppendStepResult>
+  heartbeatClaimed(
+    jobId: string,
+    claimToken: string,
+  ): Promise<HeartbeatClaimedResult>
+}
+
 interface BuildContextArgs<T> {
-  queue: JobQueue
+  journal: StepJournalPort
   job: Job<T>
   claimToken: string
-  ctx: JobContext
+  /** Sink for `octx.log` lines (the queue's fire-and-forget `ctx.log`). */
+  log: (message: string) => void
   steps: StepRecord[]
   stepTimeoutMs: number
   /**
@@ -88,7 +111,7 @@ export class LeaseLostError extends Error {
  * `step()` call so order is deterministic even under concurrent fan-out (§3.3).
  */
 export function buildContext<T>(args: BuildContextArgs<T>): OrchestratorContext {
-  const { queue, job, claimToken, ctx, steps, stepTimeoutMs, runController } =
+  const { journal, job, claimToken, log, steps, stepTimeoutMs, runController } =
     args
   const journalBySeq = new Map<number, StepRecord>(
     steps.filter((s) => s.seq !== BOOTSTRAP_SEQ).map((s) => [s.seq, s]),
@@ -123,7 +146,7 @@ export function buildContext<T>(args: BuildContextArgs<T>): OrchestratorContext 
       result: toStored(bootstrap),
       ts: new Date(),
     }
-    bootstrapAppend = queue
+    bootstrapAppend = journal
       .appendStep(job.id, claimToken, record)
       .then((outcome) => {
         if (outcome.status === 'lease-lost') throw new LeaseLostError()
@@ -183,7 +206,7 @@ export function buildContext<T>(args: BuildContextArgs<T>): OrchestratorContext 
     // Durable-write ordering: a freshly minted bootstrap must land before any
     // user step that could depend on it (see `bootstrapAppend` above).
     if (bootstrapAppend) await bootstrapAppend
-    const outcome = await queue.appendStep(job.id, claimToken, record)
+    const outcome = await journal.appendStep(job.id, claimToken, record)
     if (outcome.status === 'lease-lost') throw new LeaseLostError()
     if (outcome.status === 'already-recorded') {
       // Driver-retry ambiguity after a successful write: return the stored
@@ -199,9 +222,9 @@ export function buildContext<T>(args: BuildContextArgs<T>): OrchestratorContext 
     step,
     now: () => ensureBootstrap().startedAt,
     uuid: (label: string) => deriveUuid(ensureBootstrap().seed, label),
-    log: (message: string) => ctx.log(message),
+    log: (message: string) => log(message),
     heartbeat: async () => {
-      const res = await queue.heartbeatClaimed(job.id, claimToken)
+      const res = await journal.heartbeatClaimed(job.id, claimToken)
       if (res === 'lease-lost' && !runController.signal.aborted) {
         // Surface it: abort the run so the next step boundary stops the body.
         runController.abort(new LeaseLostError())
@@ -273,7 +296,7 @@ export interface HeartbeatHandle {
  * orphaned run. Transient errors (thrown) warn and re-arm. §7.2.
  */
 export function startHeartbeat(
-  queue: JobQueue,
+  journal: StepJournalPort,
   jobId: string,
   claimToken: string,
   intervalMs: number,
@@ -286,7 +309,7 @@ export function startHeartbeat(
   const tick = async (): Promise<void> => {
     if (stopped) return
     try {
-      const res = await queue.heartbeatClaimed(jobId, claimToken)
+      const res = await journal.heartbeatClaimed(jobId, claimToken)
       // stop() may have fired while this write was in flight (the run completed
       // or failed and set the status): honor it so a post-stop 'lease-lost'
       // read is ignored instead of aborting an already-finished run.

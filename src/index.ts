@@ -54,6 +54,7 @@ export type {
 
 // Durable-execution orchestrator (step-level resume)
 export { Orchestrator } from './orchestrator/Orchestrator'
+export type { StepJournalPort } from './orchestrator/context'
 export type {
   OrchestratorConfig,
   OrchestratorContext,
