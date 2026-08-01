@@ -35,6 +35,11 @@
       "types": "./dist/eslint/index.d.ts",
       "import": "./dist/eslint/index.mjs",
       "require": "./dist/eslint/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.mjs",
+      "require": "./dist/testing/index.js"
     }
   },
   "files": [

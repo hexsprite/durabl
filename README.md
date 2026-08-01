@@ -150,6 +150,29 @@ expect(backend.jobs[0].dedupeKey).toBe('thing:42')
 
 `ImmediateBackend` runs handlers synchronously on enqueue, which is handy for integration tests where you want side effects without a poll loop.
 
+### Testing orchestrations (`durabl/testing`)
+
+Orchestrator bodies unit-test against the real step machine over an in-memory journal — no queue, no backend, no timers:
+
+```typescript
+import { testOrchestration } from 'durabl/testing'
+
+const t = testOrchestration(restartTrial, { data: { userId: 'u1' } })
+
+await t.crashAfter('create-sub') // worker dies right after the step commits
+await t.resume()                 // fresh attempt, same journal
+
+expect(stripeMock.createSubscription).toHaveBeenCalledTimes(1) // replayed, not re-run
+expect(t.steps.map((s) => s.name)).toEqual(['create-sub', 'sync'])
+```
+
+- `crashAfter(name)` — crash after the step's result is journaled; `resume()` skips it.
+- `crashBefore(name)` — crash after the side effect but before the journal write; `resume()` re-runs the step. This is the window per-step idempotency keys defend — assert your key dedupes.
+- `resumeWith(fn)` — replay the journal against a *different* body; assert it rejects with `NondeterminismError` (or doesn't) to prove a body edit is replay-compatible before it ships.
+- `steps`, `logs`, `attempts` — journaled steps (decoded), `octx.log` lines, attempt count.
+
+`octx.now()`/`octx.uuid()` are deterministic by default (fixed bootstrap seed), so step results are snapshot-stable. Serialization guards run on every append — a non-BSON-serializable step result fails the unit test the same way it would fail in production.
+
 ## API sketch
 
 ```typescript
