@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { DummyBackend } from '../src/backends/DummyBackend'
-import { approxRecordBytes } from '../src/journal/serialize'
 
 describe('DummyBackend', () => {
   let backend: DummyBackend
@@ -107,6 +106,57 @@ describe('DummyBackend', () => {
       await handle!.complete()
       expect(stored.status).toBe('active') // stale handle did not complete it
     })
+
+    // Regression: nothing modelled Mongo's unique partial index on the ACTIVE
+    // half of the 'pending' dedupe scope, so every caller got a handle and the
+    // single-flight guarantee the README sells was unit-tested as working
+    // while production ran N copies at once.
+    describe("dedupeScope 'pending' single-flight", () => {
+      const single = {
+        dedupeKey: 'reschedule:u1',
+        dedupeScope: 'pending' as const,
+      }
+
+      it('gives only the first caller the active slot', async () => {
+        const first = await backend.claimOrEnqueue('reschedule', {}, single)
+        const second = await backend.claimOrEnqueue('reschedule', {}, single)
+        const third = await backend.claimOrEnqueue('reschedule', {}, single)
+
+        expect(first).not.toBeNull()
+        expect(second).toBeNull()
+        expect(third).toBeNull()
+        expect(
+          backend.jobs.filter((j) => j.status === 'active').length,
+        ).toBe(1)
+      })
+
+      it('queues exactly one follow-up behind the active run', async () => {
+        await backend.claimOrEnqueue('reschedule', {}, single)
+        await backend.claimOrEnqueue('reschedule', {}, single)
+        await backend.claimOrEnqueue('reschedule', {}, single)
+
+        expect(backend.jobs.filter((j) => j.status === 'pending').length).toBe(1)
+        expect(backend.jobs).toHaveLength(2)
+      })
+
+      it("queues nothing behind a blocked 'pending+active' duplicate", async () => {
+        const both = { dedupeKey: 'welcome:u1' } // default scope
+        const first = await backend.claimOrEnqueue('welcome', {}, both)
+        const second = await backend.claimOrEnqueue('welcome', {}, both)
+
+        expect(first).not.toBeNull()
+        expect(second).toBeNull()
+        expect(backend.jobs).toHaveLength(1)
+      })
+
+      it('frees the slot once the active run completes', async () => {
+        const first = await backend.claimOrEnqueue('reschedule', {}, single)
+        await first!.complete()
+
+        const second = await backend.claimOrEnqueue('reschedule', {}, single)
+        expect(second).not.toBeNull()
+      })
+    })
   })
 
   describe('claimNext()', () => {
@@ -175,23 +225,47 @@ describe('DummyBackend', () => {
     })
   })
 
-  describe('log() journal accounting', () => {
-    // Regression: log() added approxRecordBytes(message) — the bare string —
-    // while MongoJobQueue.logWrite and ImmediateBackend.log count the full
-    // {timestamp, message} entry. DummyBackend under-counted, drifting the
-    // size-guard fidelity away from prod.
-    it('counts the full {timestamp, message} entry, not the bare string', async () => {
+  describe('log() bounding', () => {
+    // Regression: logs[] was unbounded and its bytes counted against the step
+    // journal. A chatty handler could therefore grow the job document to
+    // Mongo's hard 16MB cap — at which point the terminal write (fail /
+    // failFatal / the reaper's give-up path, all of which append a log line in
+    // the same update) failed too, wedging the job `active` with no way to
+    // record why.
+    it('retains only the newest maxLogEntries', async () => {
+      backend.maxLogEntries = 5
       const id = (await backend.enqueue('t', {})) as string
-      await backend.log(id, 'hello')
+      for (let i = 0; i < 20; i++) await backend.log(id, `entry-${i}`)
 
       const job = backend.jobs.find((j) => j.id === id)!
-      const entryBytes = approxRecordBytes({
-        timestamp: new Date(),
-        message: 'hello',
-      })
-      const bareBytes = approxRecordBytes('hello')
-      expect(job.journalBytes).toBe(entryBytes) // entry-shaped, matches prod
-      expect(job.journalBytes).toBeGreaterThan(bareBytes) // not the bare string
+      expect(job.logs).toHaveLength(5)
+      // Oldest dropped first — the tail is what explains a failure.
+      expect(job.logs).toEqual([
+        'entry-15',
+        'entry-16',
+        'entry-17',
+        'entry-18',
+        'entry-19',
+      ])
+    })
+
+    it('clips an over-long message and says so', async () => {
+      backend.maxLogMessageBytes = 40
+      const id = (await backend.enqueue('t', {})) as string
+      await backend.log(id, 'x'.repeat(500))
+
+      const [entry] = backend.jobs.find((j) => j.id === id)!.logs
+      expect(entry.length).toBe(40)
+      expect(entry).toContain('truncated')
+    })
+
+    it('keeps log volume out of the step-journal budget', async () => {
+      const id = (await backend.enqueue('t', {})) as string
+      for (let i = 0; i < 100; i++) await backend.log(id, 'noisy'.repeat(100))
+
+      // Logs are bounded structurally instead of billed to journalBytes, so
+      // chatter can never trip a spurious JournalTooLarge on the step journal.
+      expect(backend.jobs.find((j) => j.id === id)!.journalBytes).toBe(0)
     })
   })
 

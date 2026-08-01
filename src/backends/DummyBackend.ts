@@ -1,4 +1,3 @@
-/* eslint-disable max-lines */
 /**
  * DummyBackend - For Unit Tests
  *
@@ -14,9 +13,11 @@ import {
   heartbeatClaimedInMemory,
 } from '../journal/inMemory'
 import {
-  approxRecordBytes,
   DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+  DEFAULT_MAX_LOG_ENTRIES,
+  DEFAULT_MAX_LOG_MESSAGE_BYTES,
   sortBySeq,
+  truncateLogMessage,
 } from '../journal/serialize'
 import type {
   AppendStepResult,
@@ -68,6 +69,11 @@ interface RecordedJob<T = unknown> {
 export class DummyBackend implements IJobQueueBackend {
   /** All recorded jobs */
   jobs: RecordedJob[] = []
+
+  /** Retained `logs` entries per job; mirrors MongoJobQueue's `$slice` bound. */
+  maxLogEntries = DEFAULT_MAX_LOG_ENTRIES
+  /** Per-message ceiling; mirrors MongoJobQueue's message clipping. */
+  maxLogMessageBytes = DEFAULT_MAX_LOG_MESSAGE_BYTES
 
   /** `visibilityTimeoutMs` value of every `recoverStuckJobs()` call, in order. */
   recoverStuckJobsCalls: (number | undefined)[] = []
@@ -137,6 +143,13 @@ export class DummyBackend implements IJobQueueBackend {
     return job.id
   }
 
+  /**
+   * Mirrors {@link MongoJobQueue.claimOrEnqueue}, including the part Mongo
+   * enforces with a unique partial index rather than application logic: at most
+   * one *active* run per dedupe key. Modelling it here is what lets a unit test
+   * catch a broken single-flight assumption without booting Mongo — if this
+   * backend is more permissive than the real one, the tests certify a lie.
+   */
   async claimOrEnqueue<T>(
     type: string,
     data: T,
@@ -144,13 +157,28 @@ export class DummyBackend implements IJobQueueBackend {
   ): Promise<JobHandle<T> | null> {
     const dedupeScope = options.dedupeScope ?? 'pending+active'
 
-    // Check for existing pending job
     if (options.dedupeKey) {
-      const existing = this.jobs.find(
+      // A run is already queued — don't start another now.
+      const pending = this.jobs.find(
         (job) =>
           job.dedupeKey === options.dedupeKey && job.status === 'pending',
       )
-      if (existing) {
+      if (pending) return null
+
+      // Stand-in for the unique partial indexes: a job already holds the
+      // active slot for this key+scope.
+      const active = this.jobs.find(
+        (job) =>
+          job.dedupeKey === options.dedupeKey &&
+          job.dedupeScope === dedupeScope &&
+          job.status === 'active',
+      )
+      if (active) {
+        // Coalescing scope: queue exactly one follow-up (enqueue itself caps
+        // that at one) so the request is served after the active run ends.
+        if (dedupeScope === 'pending') {
+          await this.enqueue(type, data, options)
+        }
         return null
       }
     }
@@ -276,20 +304,35 @@ export class DummyBackend implements IJobQueueBackend {
     return 'applied'
   }
 
+  /**
+   * Mirrors MongoJobQueue's bounded `logs[]`: newest-N retained, each message
+   * clipped, and log bytes kept out of the step-journal total. Log volume must
+   * not be able to starve a terminal write here either, or the in-memory
+   * suites would certify a wedge that production can still hit.
+   */
   async log(jobId: string, message: string): Promise<void> {
     const job = this.jobs.find((j) => j.id === jobId)
-    if (job) {
-      job.logs.push(message)
-      // Logs share the journal size budget (§8.1) — keep the total current.
-      // Count the full {timestamp, message} entry that MongoJobQueue.logWrite
-      // and ImmediateBackend.log persist, not the bare string, so the guard's
-      // running total has the same fidelity across all three backends.
-      job.journalBytes += approxRecordBytes({ timestamp: new Date(), message })
+    if (!job) return
+    job.logs.push(truncateLogMessage(message, this.maxLogMessageBytes))
+    if (job.logs.length > this.maxLogEntries) {
+      // Oldest first — the tail is what explains a failure. Mongo does this
+      // with `$slice: -maxLogEntries` on the push.
+      job.logs.splice(0, job.logs.length - this.maxLogEntries)
     }
   }
 
-  async heartbeat(_jobId: string): Promise<void> {
-    // No-op for dummy backend
+  /**
+   * Dummy jobs track no `claimedAt`, so there is nothing to extend — but the
+   * lease fence is still modelled, or a test could not tell a live heartbeat
+   * from a zombie worker's.
+   */
+  async heartbeat(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
+    const job = this.jobs.find((j) => j.id === jobId)
+    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
+    return 'applied'
   }
 
   /** Records the call (for reaper wiring assertions); recovers nothing. */

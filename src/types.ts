@@ -122,10 +122,24 @@ export interface JobContext {
   fail(reason: string): Promise<void>
   /** Mark job as permanently failed (no retry) */
   failFatal(reason: string): Promise<void>
-  /** Add log entry to job */
+  /**
+   * Add log entry to job.
+   *
+   * Fire-and-forget by design — the write is not awaited, so a failed log
+   * write never fails the job. It is reported through the queue's logger
+   * rather than surfacing as an unhandled rejection.
+   */
   log(message: string): void
-  /** Update heartbeat timestamp (prevents visibility timeout) */
-  heartbeat(): Promise<void>
+  /**
+   * Extend the lease (prevents the reaper's visibility timeout from
+   * reclaiming this job).
+   *
+   * Lease-fenced like every other lifecycle write: returns `'lease-lost'`,
+   * and writes nothing, once another worker owns the job. A handler that sees
+   * `'lease-lost'` should stop — its work is being redone elsewhere and any
+   * further side effect is a duplicate.
+   */
+  heartbeat(): Promise<LifecycleWriteResult>
 }
 
 /**

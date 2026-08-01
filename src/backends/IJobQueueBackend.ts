@@ -98,9 +98,20 @@ export interface IJobQueueBackend {
   log(jobId: string, message: string): Promise<void>
 
   /**
-   * Update job heartbeat to prevent visibility timeout.
+   * Extend a job's lease so the reaper's visibility timeout does not reclaim
+   * it.
+   *
+   * When `claimToken` is provided the write is lease-fenced exactly like
+   * {@link complete}: it only applies while the job is still `active` under
+   * that token, and a miss returns `'lease-lost'` having modified nothing.
+   * Without the fence a zombie worker keeps renewing a lease it no longer
+   * holds — extending the *current* owner's window on its behalf and stamping
+   * `claimedAt` onto jobs in states where it is meaningless.
    */
-  heartbeat(jobId: string): Promise<void>
+  heartbeat(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult>
 
   /**
    * Find a job by query. Use for utilities like expiring stale jobs.
@@ -141,9 +152,17 @@ export interface IJobQueueBackend {
    * is for tests/manual ops only; a value that disagrees with the queue's
    * breaks the heartbeat/lease contract (§7.1).
    *
+   * Implementations should bound the work of a single sweep (`maxPerSweep`)
+   * and let the remainder drain across later ticks — after a mass worker death
+   * an unbounded pass walks the entire stuck set while the system is already
+   * degraded. A return value equal to the bound means there is more waiting.
+   *
    * @returns Number of stuck jobs handled (re-queued + failed).
    */
-  recoverStuckJobs?(visibilityTimeoutMs?: number): Promise<number>
+  recoverStuckJobs?(
+    visibilityTimeoutMs?: number,
+    maxPerSweep?: number,
+  ): Promise<number>
 
   /**
    * Subscribe to a push-style notification when a new pending job becomes
