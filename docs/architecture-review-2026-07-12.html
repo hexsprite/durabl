@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — durabl</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose", flowchart: { curve: "basis" } });
+    </script>
+    <style>
+      :root { color-scheme: light; }
+      html { scroll-behavior: smooth; }
+      body { background-image: radial-gradient(circle at 15% 0%, rgba(16,185,129,.08), transparent 28rem); }
+      .seam { border-style: dashed; }
+      .deep { background: linear-gradient(135deg, #0f172a, #1e293b); color: white; }
+      .diagram { min-height: 318px; }
+      .module-shadow { box-shadow: 0 1px 0 rgba(15,23,42,.05), 0 14px 40px rgba(15,23,42,.06); }
+      .leak-line { height: 2px; background: #dc2626; position: relative; }
+      .leak-line::after { content: ""; position: absolute; right: -1px; top: -4px; border-left: 8px solid #dc2626; border-top: 5px solid transparent; border-bottom: 5px solid transparent; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 antialiased">
+    <main class="mx-auto max-w-6xl space-y-12 px-5 py-12 sm:px-8">
+      <header class="border-b border-slate-300 pb-8">
+        <div class="flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
+          <div>
+            <p class="text-xs font-semibold uppercase tracking-[.22em] text-emerald-700">Deep-module review</p>
+            <h1 class="mt-2 font-serif text-4xl tracking-tight sm:text-5xl">durabl</h1>
+            <p class="mt-2 text-sm text-slate-500">12 July 2026 · main @ e5d6bb6</p>
+          </div>
+          <div class="grid grid-cols-2 gap-x-5 gap-y-2 text-xs text-slate-600 sm:grid-cols-4">
+            <span class="flex items-center gap-2"><i class="h-4 w-4 rounded border border-slate-500 bg-white"></i>module</span>
+            <span class="flex items-center gap-2"><i class="h-4 w-4 rounded border-2 border-dashed border-slate-500"></i>seam</span>
+            <span class="flex items-center gap-2"><i class="h-[2px] w-5 bg-red-600"></i>leakage</span>
+            <span class="flex items-center gap-2"><i class="h-4 w-4 rounded bg-slate-900"></i>deep module</span>
+          </div>
+        </div>
+      </header>
+
+      <section id="candidates" class="space-y-12">
+        <article id="journal-policy" class="module-shadow rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div><p class="text-xs font-semibold uppercase tracking-widest text-slate-500">Candidate 4 · narrow du-axt + du-718</p><h2 class="mt-1 font-serif text-3xl">Unify step-record compatibility</h2></div>
+            <div class="flex gap-2"><span class="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-800">Worth exploring</span><span class="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">in-process</span></div>
+          </div>
+          <p class="mt-4 font-mono text-xs leading-6 text-slate-600">src/backends/MongoJobQueue.ts:405–525 · src/journal/inMemory.ts:33–105 · src/orchestrator/context.ts:156–193</p>
+          <div class="mt-7 grid gap-5 lg:grid-cols-2">
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-red-700">Before · one invariant, three homes</figcaption><div class="diagram rounded-xl border border-red-100 bg-red-50/40 p-4"><pre class="mermaid">
+flowchart TB
+  C[Orchestration run<br/>checks seq + name]
+  M[Mongo adapter<br/>checks seq + name]
+  I[In-memory journal<br/>checks seq + name]
+  C -. same invariant .-> M
+  C -. same invariant .-> I
+  M &lt;-. semantic drift .-> I
+  classDef leak stroke:#dc2626,stroke-width:2px,fill:#fff7ed;
+  class C,M,I leak;
+            </pre></div></figure>
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-emerald-700">After · policy deepens, adapters translate</figcaption><div class="diagram rounded-xl border border-emerald-100 bg-emerald-50/30 p-4"><pre class="mermaid">
+flowchart TB
+  O[Orchestration run] --> P[Step-record<br/>compatibility rule]
+  P --> M[Mongo adapter]
+  P --> I[In-memory adapter]
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a,stroke-width:4px;
+  classDef adapter fill:#ecfdf5,stroke:#059669,stroke-dasharray:5 4;
+  class P deep;
+  class M,I adapter;
+            </pre></div></figure>
+          </div>
+          <div class="mt-6 grid gap-4 sm:grid-cols-2"><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Problem</h3><p class="mt-1 text-sm">The same “seq exists but name differs” nondeterminism rule appears in replay, in-memory append, and Mongo classification.</p></div><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Solution</h3><p class="mt-1 text-sm">Deepen only the compatibility rule; keep Mongo’s load-bearing atomic claim and conditional-write implementation in its adapter.</p></div></div>
+          <ul class="mt-5 grid gap-2 text-sm sm:grid-cols-3"><li>• locality: one invariant home</li><li>• leverage: three callers agree</li><li>• atomic seam stays visible</li></ul>
+        </article>
+
+        <article id="in-memory-runtime" class="module-shadow rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
+          <div class="flex flex-wrap items-start justify-between gap-3"><div><p class="text-xs font-semibold uppercase tracking-widest text-slate-500">Candidate 2 · du-dum</p><h2 class="mt-1 font-serif text-3xl">Deepen the in-memory job runtime</h2></div><div class="flex gap-2"><span class="rounded-full bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-800">Strong</span><span class="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">local-substitutable</span></div></div>
+          <p class="mt-4 font-mono text-xs leading-6 text-slate-600">src/backends/DummyBackend.ts:68–431 · src/backends/ImmediateBackend.ts:39–471 · test/DummyBackend.test.ts · test/ImmediateBackend.test.ts</p>
+          <div class="mt-7 grid gap-5 lg:grid-cols-2">
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-red-700">Before · parallel shallow implementations</figcaption><div class="diagram flex flex-col justify-center rounded-xl border border-red-100 bg-red-50/40 p-6"><div class="grid grid-cols-2 gap-5"><div><div class="rounded-t border border-red-300 bg-white p-3 text-center text-xs font-bold">Dummy interface</div><div class="h-36 rounded-b border-x border-b border-red-300 bg-red-100/70 p-3 text-xs leading-6">ids<br/>dedupe<br/>claim<br/>fence<br/>query<br/>stats</div></div><div><div class="rounded-t border border-red-300 bg-white p-3 text-center text-xs font-bold">Immediate interface</div><div class="h-36 rounded-b border-x border-b border-red-300 bg-red-100/70 p-3 text-xs leading-6">ids<br/>dedupe<br/>claim<br/>fence<br/>query<br/>stats</div></div></div><div class="mx-auto mt-5 w-3/4 leak-line"></div><p class="mt-3 text-center text-xs text-red-700">same job semantics copied across modules</p></div></figure>
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-emerald-700">After · two real adapters, one deep implementation</figcaption><div class="diagram flex flex-col justify-center rounded-xl border border-emerald-100 bg-emerald-50/30 p-6"><div class="grid grid-cols-2 gap-5"><div class="seam rounded-lg border-2 border-emerald-500 bg-white p-4 text-center text-sm font-semibold">Record-only adapter</div><div class="seam rounded-lg border-2 border-emerald-500 bg-white p-4 text-center text-sm font-semibold">Run-inline adapter</div></div><div class="mx-auto h-8 w-px bg-emerald-600"></div><div class="deep rounded-xl border-4 border-slate-900 p-6 text-center"><p class="text-xs uppercase tracking-widest text-slate-300">Deep module</p><p class="mt-2 text-lg font-semibold">In-memory job runtime</p><p class="mt-2 text-xs text-slate-300">ids · dedupe · claims · lifecycle · queries · journal</p></div></div></figure>
+          </div>
+          <div class="mt-6 grid gap-4 sm:grid-cols-2"><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Problem</h3><p class="mt-1 text-sm">Two test backends independently implement the same job semantics, so fixes require parallel reasoning and parallel tests.</p></div><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Solution</h3><p class="mt-1 text-sm">Let one deep in-memory runtime own job state; retain record-only and run-inline behavior as genuine adapters.</p></div></div>
+          <ul class="mt-5 grid gap-2 text-sm sm:grid-cols-3"><li>• locality: state rules concentrate</li><li>• leverage: two adapters reuse</li><li>• delete duplicated test matrices</li></ul>
+        </article>
+
+        <article id="orchestration-run" class="module-shadow rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
+          <div class="flex flex-wrap items-start justify-between gap-3"><div><p class="text-xs font-semibold uppercase tracking-widest text-slate-500">Candidate 1 · refine du-ezp</p><h2 class="mt-1 font-serif text-3xl">Deepen the orchestration step machine</h2></div><div class="flex gap-2"><span class="rounded-full bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-800">Strong</span><span class="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">in-process</span></div></div>
+          <p class="mt-4 font-mono text-xs leading-6 text-slate-600">src/orchestrator/Orchestrator.ts:121–255 · src/orchestrator/context.ts:63–313 · test/Orchestrator.test.ts:25–750</p>
+          <div class="mt-7 grid gap-5 lg:grid-cols-2">
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-red-700">Before · tests cross four modules</figcaption><div class="diagram rounded-xl border border-red-100 bg-red-50/40 p-4"><pre class="mermaid">
+flowchart LR
+  T[Test] --> O[Orchestrator]
+  O --> Q[JobQueue]
+  Q --> D[Dummy adapter]
+  O --> C[context helpers]
+  D --> C
+  classDef leak stroke:#dc2626,stroke-width:2px,fill:#fff;
+  class O,Q,D,C leak;
+            </pre><p class="mt-2 text-center text-xs text-red-700">setup observes the run indirectly through polling and stored jobs</p></div></figure>
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-emerald-700">After · one deep orchestration run module</figcaption><div class="diagram flex flex-col justify-center rounded-xl border border-emerald-100 bg-emerald-50/30 p-6"><div class="rounded-lg border bg-white p-3 text-center text-sm">Tests + Orchestrator adapter</div><div class="mx-auto h-8 w-px bg-emerald-600"></div><div class="deep rounded-xl border-4 border-slate-900 p-6"><p class="text-center text-lg font-semibold">Orchestration run</p><div class="mt-4 grid grid-cols-2 gap-2 text-center text-xs text-slate-300"><span>step order</span><span>resume</span><span>timeouts</span><span>heartbeat</span><span>abort</span><span>completion</span></div></div><div class="mx-auto h-8 w-px bg-emerald-600"></div><div class="seam rounded-lg border-2 border-emerald-500 bg-white p-3 text-center text-sm">Journal adapter</div></div></figure>
+          </div>
+          <div class="mt-6 grid gap-4 sm:grid-cols-2"><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Problem</h3><p class="mt-1 text-sm">The step machine is exported, but its concrete queue-heavy interface leaves replay, bootstrap, timeout, and duplicate-append tests crossing polling and stored jobs.</p></div><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Solution</h3><p class="mt-1 text-sm">Deepen the full orchestration run behind one interface; let Orchestrator compose it with queue and journal adapters.</p></div></div>
+          <ul class="mt-5 grid gap-2 text-sm sm:grid-cols-3"><li>• interface becomes test surface</li><li>• locality: races stay together</li><li>• leverage: fewer harness layers</li></ul>
+        </article>
+
+        <article id="journal-capability" class="module-shadow rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
+          <div class="flex flex-wrap items-start justify-between gap-3"><div><p class="text-xs font-semibold uppercase tracking-widest text-slate-500">Candidate 5 · du-2qw</p><h2 class="mt-1 font-serif text-3xl">Collapse journal capability discovery</h2></div><div class="flex gap-2"><span class="rounded-full bg-slate-200 px-3 py-1 text-xs font-bold text-slate-700">Speculative</span><span class="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">ports &amp; adapters</span></div></div>
+          <p class="mt-4 font-mono text-xs leading-6 text-slate-600">src/backends/IJobQueueBackend.ts:21–227 · src/JobQueue.ts:212–283 · src/orchestrator/Orchestrator.ts:34–38</p>
+          <div class="mt-7 grid gap-5 lg:grid-cols-2">
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-red-700">Before · capability leaks into every call</figcaption><div class="diagram flex flex-col justify-center rounded-xl border border-red-100 bg-red-50/40 p-5"><div class="rounded border border-red-300 bg-white p-3 text-center text-sm font-semibold">IJobQueueBackend</div><div class="grid grid-cols-4 gap-2 py-4 text-center text-[11px]"><span class="rounded border bg-white p-2">read?</span><span class="rounded border bg-white p-2">append?</span><span class="rounded border bg-white p-2">complete?</span><span class="rounded border bg-white p-2">heartbeat?</span></div><div class="rounded border border-red-300 bg-white p-3 text-center text-sm">assert once + guard four times</div><div class="mx-auto mt-5 w-3/4 leak-line"></div><p class="mt-3 text-center text-xs text-red-700">caller must keep capability facts in mind</p></div></figure>
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-emerald-700">After · capability has one seam</figcaption><div class="diagram flex flex-col justify-center rounded-xl border border-emerald-100 bg-emerald-50/30 p-6"><div class="rounded-lg border bg-white p-3 text-center text-sm">Orchestrator</div><div class="mx-auto h-8 w-px bg-emerald-600"></div><div class="deep rounded-xl border-4 border-slate-900 p-6 text-center"><p class="text-xs uppercase tracking-widest text-slate-300">Deep module</p><p class="mt-2 text-lg font-semibold">Journal capability</p><p class="mt-2 text-xs text-slate-300">validated once · used coherently</p></div><div class="mx-auto h-8 w-px bg-emerald-600"></div><div class="seam rounded-lg border-2 border-emerald-500 bg-white p-3 text-center text-sm">Backend adapters</div></div></figure>
+          </div>
+          <div class="mt-6 grid gap-4 sm:grid-cols-2"><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Problem</h3><p class="mt-1 text-sm">Four optional methods plus inline-execution knowledge make the backend interface shallow and force repeated capability checks past the seam.</p></div><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Solution</h3><p class="mt-1 text-sm">Concentrate capability discovery in one module and hand orchestration a coherent journal capability.</p></div></div>
+          <ul class="mt-5 grid gap-2 text-sm sm:grid-cols-3"><li>• interface shrinks for callers</li><li>• locality: validate once</li><li>• adapters stay explicit</li></ul>
+        </article>
+
+        <article id="processor-runtime" class="module-shadow rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
+          <div class="flex flex-wrap items-start justify-between gap-3"><div><p class="text-xs font-semibold uppercase tracking-widest text-slate-500">Candidate 3 · du-wwy.1</p><h2 class="mt-1 font-serif text-3xl">Deepen the processor runtime</h2></div><div class="flex gap-2"><span class="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-800">Worth exploring</span><span class="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">in-process</span></div></div>
+          <p class="mt-4 font-mono text-xs leading-6 text-slate-600">src/JobQueue.ts:20–28, 109–204, 339–454 · test/JobQueueConcurrency.test.ts:13–125 · test/JobQueuePushIntegration.test.ts:18–30</p>
+          <div class="mt-7 grid gap-5 lg:grid-cols-2">
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-red-700">Before · runtime is private and scattered</figcaption><div class="diagram rounded-xl border border-red-100 bg-red-50/40 p-4"><pre class="mermaid">
+flowchart TB
+  P[process] --> C[concurrency reservation]
+  U[push callback] --> C
+  L[poll loop] --> C
+  C --> H[handler lifecycle]
+  H --> L
+  S[shutdown] -. reads private state .-> C
+  classDef leak stroke:#dc2626,stroke-width:2px,fill:#fff7ed;
+  class P,U,L,C,H,S leak;
+            </pre></div></figure>
+            <figure><figcaption class="mb-2 text-xs font-bold uppercase tracking-wider text-emerald-700">After · one testable scheduling module</figcaption><div class="diagram rounded-xl border border-emerald-100 bg-emerald-50/30 p-4"><pre class="mermaid">
+flowchart TB
+  Q[JobQueue] --> R[Processor runtime]
+  U[Push adapter] --> R
+  R --> B[Backend adapter]
+  T[Tests] --> R
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a,stroke-width:4px;
+  classDef adapter fill:#ecfdf5,stroke:#059669,stroke-dasharray:5 4;
+  class R deep;
+  class U,B adapter;
+            </pre></div></figure>
+          </div>
+          <div class="mt-6 grid gap-4 sm:grid-cols-2"><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Problem</h3><p class="mt-1 text-sm">Push, polling, concurrency, backoff, handler completion, and shutdown share a private state machine that tests reach through casts, mini backends, and real sleeps.</p></div><div><h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Solution</h3><p class="mt-1 text-sm">Deepen processor scheduling behind a small interface while preserving JobQueue as the public module.</p></div></div>
+          <ul class="mt-5 grid gap-2 text-sm sm:grid-cols-3"><li>• interface becomes test surface</li><li>• locality: scheduling races concentrate</li><li>• leverage: fewer timed tests</li></ul>
+        </article>
+      </section>
+
+      <section id="top-recommendation" class="rounded-2xl bg-slate-950 p-8 text-white module-shadow sm:p-10">
+        <p class="text-xs font-semibold uppercase tracking-[.22em] text-emerald-400">Top recommendation</p>
+        <h2 class="mt-3 font-serif text-3xl"><a class="underline decoration-emerald-400 underline-offset-4" href="#orchestration-run">Deepen the orchestration step machine</a></h2>
+        <p class="mt-3 max-w-3xl text-slate-300">Its implementation already concentrates the hardest replay and lease behavior; shrinking its queue-heavy interface makes that depth available directly to tests without adding speculative seams.</p>
+      </section>
+    </main>
+  </body>
+</html>
