@@ -572,6 +572,7 @@ describe('lease-loss surfacing and abortable duration cap (du-04b)', () => {
         // Simulate another worker reclaiming the job (new claim token).
         backend.jobs.find((j) => j.id === job.id)!.claimToken = 'stolen'
         // Wait for the auto-heartbeat to notice and abort the run.
+        // eslint-disable-next-line durabl/no-nondeterministic-control-path -- test harness: a real body only awaits octx.*, but this one must block on the abort event to prove the run stops at the next step boundary.
         await new Promise<void>((resolve) =>
           octx.signal.addEventListener('abort', () => resolve(), {
             once: true,
@@ -642,6 +643,7 @@ describe('lease-loss surfacing and abortable duration cap (du-04b)', () => {
       async (_job, octx) => {
         await octx.step('one', async () => 'x')
         // Outlive the 40ms cap (test-only sleep; real bodies only await octx.*).
+        // eslint-disable-next-line durabl/no-nondeterministic-control-path -- deliberate: the sleep is what breaches maxDurationMs.
         await new Promise((r) => setTimeout(r, 120))
         try {
           await octx.step('two', async () => {
