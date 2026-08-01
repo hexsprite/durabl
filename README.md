@@ -117,8 +117,20 @@ if (handle) {
     await handle.fail(String(err)) // poll loop will retry
   }
 }
-// else: someone is already running and one run is queued behind them.
+// else: someone is already running, and this request has been coalesced into
+// the single follow-up queued behind them — the poll loop will run it.
 ```
+
+Exactly what `null` means, per scope:
+
+| scope | a run is already active | a run is already queued |
+| --- | --- | --- |
+| `'pending'` (single-flight) | `null`; one follow-up is queued behind it, and a burst collapses into that same one | `null`; nothing queued (one is enough) |
+| `'pending+active'` (default) | `null`; nothing queued — this scope means "no duplicate at all" | `null`; nothing queued |
+
+Mutual exclusion is enforced by unique partial indexes, not by a pre-read, so
+concurrent callers across a rolling deploy get the same answer as sequential
+ones: exactly one wins.
 
 ## Testing your jobs
 
@@ -243,7 +255,7 @@ Guarantees and limits worth knowing:
 - **At-least-once steps, not exactly-once.** A crash in the window between a step fn returning and its journal append committing re-runs that step. Close it on dangerous steps with the provided idempotency key (Stripe et al. dedupe on it) or a `dedupeKey` on enqueue.
 - **Determinism on the control path.** Only `await` `octx.*` (or `Promise.all`/`allSettled` over steps) in the orchestrator body; do live reads / `Date.now()` / randomness *inside* a step. The optional `durabl/eslint` rule enforces this; the divergence detector (a changed step name at a journaled seq → fatal `NondeterminismError`) is the runtime backstop.
 - **Auto-managed lease.** The wrapper heartbeats on a self-scheduling loop sized to the queue's reaper timeout (`visibilityTimeoutMs`, the single source of truth). `stepTimeoutMs` and `maxDurationMs` keep a hung step from heartbeating forever. When a heartbeat comes back `'lease-lost'` (the job was reclaimed) the loop stops and `octx.signal` aborts — the orphaned body throws at its next `step()` boundary instead of firing side effects.
-- **Journal lives on the job doc**, sharing Mongo's 16MB budget with `logs[]`. Return ids/refs, not whole payloads; an oversized journal fails with a clear `JournalTooLarge`. Treat journaled results as sensitive (don't journal secrets).
+- **Journal lives on the job doc**, inside Mongo's 16MB budget. Return ids/refs, not whole payloads; an oversized journal fails with a clear `JournalTooLarge`. Treat journaled results as sensitive (don't journal secrets). `logs[]` shares the document but not the budget — it's bounded to the newest `maxLogEntries` (default 1000, each message clipped at `maxLogMessageBytes`), so log volume can neither trip a spurious `JournalTooLarge` nor grow the document to the point where the write that marks a job failed no longer fits.
 
 Full design and rationale: [`docs/orchestrator-spec.md`](docs/orchestrator-spec.md).
 

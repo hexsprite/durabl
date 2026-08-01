@@ -268,6 +268,54 @@ describe('MongoJobQueue', () => {
     })
   })
 
+  describe('recoverStuckJobs() batching', () => {
+    /** Claim `count` jobs and backdate their leases so all look stuck. */
+    async function seedStuckJobs(count: number): Promise<void> {
+      for (let i = 0; i < count; i++) {
+        await backend.enqueue('stuck', { i }, { maxAttempts: 5 })
+        const claimed = await backend.claimNext('stuck')
+        await collection.updateOne(
+          { _id: claimed!.id },
+          { $set: { claimedAt: new Date(Date.now() - 400000 - i * 1000) } },
+        )
+      }
+    }
+
+    // Regression: the sweep opened an unbounded cursor and issued one write per
+    // stuck document, serially. After a mass worker death that walks the entire
+    // stuck set in a single pass — while the system is already degraded.
+    it('handles at most maxPerSweep jobs in one pass', async () => {
+      await seedStuckJobs(5)
+
+      const handled = await backend.recoverStuckJobs(300000, 2)
+
+      expect(handled).toBe(2)
+      expect(await collection.countDocuments({ status: 'active' })).toBe(3)
+    })
+
+    it('drains the remainder across subsequent sweeps', async () => {
+      await seedStuckJobs(5)
+
+      let total = 0
+      for (let i = 0; i < 3; i++) {
+        total += await backend.recoverStuckJobs(300000, 2)
+      }
+
+      expect(total).toBe(5)
+      expect(await collection.countDocuments({ status: 'active' })).toBe(0)
+    })
+
+    it('recovers the longest-stuck leases first', async () => {
+      await seedStuckJobs(3) // seeded oldest-lease-last
+
+      await backend.recoverStuckJobs(300000, 1)
+
+      // The job backdated furthest (i = 2) is the one recovered.
+      const recovered = await collection.findOne({ status: 'pending' })
+      expect((recovered!.data as { i: number }).i).toBe(2)
+    })
+  })
+
   describe('recoverStuckJobs()', () => {
     it('recovers jobs past visibility timeout', async () => {
       await backend.enqueue('job', {})

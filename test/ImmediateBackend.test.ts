@@ -203,6 +203,45 @@ describe('ImmediateBackend', () => {
       const job = await backend.findOne({ type: 'job' })
       expect(job!.status).toBe('active') // still owned by the new worker
     })
+
+    // Regression: an un-completed handle did not stop the next caller from
+    // getting one too, so this backend agreed with the (broken) production
+    // behaviour instead of catching it.
+    describe("dedupeScope 'pending' single-flight", () => {
+      const single = {
+        dedupeKey: 'reschedule:u1',
+        dedupeScope: 'pending' as const,
+      }
+
+      it('refuses a second active run while the first handle is outstanding', async () => {
+        const first = await backend.claimOrEnqueue('reschedule', {}, single)
+        const second = await backend.claimOrEnqueue('reschedule', {}, single)
+
+        expect(first).not.toBeNull()
+        expect(second).toBeNull()
+        expect((await backend.getStats()).active).toBe(1)
+      })
+
+      it('frees the slot once the active run completes', async () => {
+        const first = await backend.claimOrEnqueue('reschedule', {}, single)
+        await first!.complete()
+
+        const second = await backend.claimOrEnqueue('reschedule', {}, single)
+        expect(second).not.toBeNull()
+      })
+
+      it('does not block a different dedupe key', async () => {
+        const a = await backend.claimOrEnqueue('reschedule', {}, single)
+        const b = await backend.claimOrEnqueue(
+          'reschedule',
+          {},
+          { dedupeKey: 'reschedule:u2', dedupeScope: 'pending' },
+        )
+
+        expect(a).not.toBeNull()
+        expect(b).not.toBeNull()
+      })
+    })
   })
 
   describe('completeClaimed() dedupe release', () => {

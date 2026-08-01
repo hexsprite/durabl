@@ -17,6 +17,12 @@ import type {
   StepRecord,
 } from './types'
 
+/** An in-flight {@link JobQueue.sleep}, tracked so shutdown can cancel it. */
+interface PendingSleep {
+  timer?: ReturnType<typeof setTimeout>
+  resolve: () => void
+}
+
 interface ProcessorState {
   type: string
   handler: JobHandler<unknown>
@@ -55,7 +61,15 @@ export class JobQueue {
   private processors: Map<string, ProcessorState> = new Map()
   private isShuttingDown = false
   private unsubscribePush: (() => void) | null = null
-  private reaperTimer: ReturnType<typeof setInterval> | null = null
+  private reaperTimer: ReturnType<typeof setTimeout> | null = null
+  /**
+   * Whether the reaper loop is live. Separate from {@link reaperTimer} because
+   * during an in-flight sweep no timer is armed — without this flag a second
+   * `startReaper()` call mid-sweep would start a parallel loop.
+   */
+  private reaperActive = false
+  /** Poll-loop sleeps currently parked; cleared by {@link shutdown}. */
+  private pendingSleeps: Set<PendingSleep> = new Set()
   /** Reaper visibility timeout this queue is operated with (§7.1). */
   readonly visibilityTimeoutMs: number
 
@@ -311,18 +325,39 @@ export class JobQueue {
         'startReaper: backend does not implement recoverStuckJobs',
       )
     }
-    if (this.reaperTimer) return // already running — idempotent
-    const timer = setInterval(() => {
-      void this.backend
-        .recoverStuckJobs!(this.visibilityTimeoutMs)
-        .then((handled) => {
-          if (handled > 0) {
-            this.log.warn({ handled }, 'reaper recovered stuck jobs')
-          }
-        })
-        .catch((err) => {
-          this.log.error({ err }, 'reaper sweep failed; will retry next tick')
-        })
+    if (this.reaperActive) return // already running — idempotent
+    this.reaperActive = true
+
+    // Self-scheduling, not setInterval: the next sweep is armed only once the
+    // previous one settles. A setInterval fires on the clock regardless, so a
+    // sweep that outlasts its interval — exactly what happens after a mass
+    // worker death, when the stuck set is largest — overlapped with the next
+    // one and multiplied the cursor work at the worst possible moment.
+    // (Same shape as `startHeartbeat` in orchestrator/context.ts.)
+    const tick = async (): Promise<void> => {
+      if (!this.reaperActive || this.isShuttingDown) return
+      try {
+        const handled = await this.backend.recoverStuckJobs!(
+          this.visibilityTimeoutMs,
+        )
+        if (handled > 0) {
+          this.log.warn({ handled }, 'reaper recovered stuck jobs')
+        }
+      } catch (err) {
+        this.log.error({ err }, 'reaper sweep failed; will retry next tick')
+      }
+      // stopReaper()/shutdown() may have run while the sweep was in flight.
+      if (!this.reaperActive || this.isShuttingDown) return
+      this.armReaper(tick, intervalMs)
+    }
+
+    this.armReaper(tick, intervalMs)
+  }
+
+  /** Arm the next reaper tick. Unref'd — the reaper never keeps a process alive. */
+  private armReaper(tick: () => Promise<void>, intervalMs: number): void {
+    const timer = setTimeout(() => {
+      void tick()
     }, intervalMs)
     timer.unref?.()
     this.reaperTimer = timer
@@ -330,8 +365,9 @@ export class JobQueue {
 
   /** Stop the reaper started by {@link startReaper}. Safe to call twice. */
   stopReaper(): void {
+    this.reaperActive = false
     if (this.reaperTimer) {
-      clearInterval(this.reaperTimer)
+      clearTimeout(this.reaperTimer)
       this.reaperTimer = null
     }
   }
@@ -352,6 +388,11 @@ export class JobQueue {
     for (const state of this.processors.values()) {
       state.running = false
     }
+
+    // Wake every parked poll loop so it exits now instead of at the end of its
+    // current interval — and, more importantly, so its timer stops holding the
+    // event loop open after this method resolves.
+    this.cancelPendingSleeps()
 
     // Wait for active jobs to complete
     const deadline = Date.now() + timeoutMs
@@ -443,14 +484,50 @@ export class JobQueue {
         if (res === 'lease-lost') this.warnLeaseLost(jobId, 'failFatal')
       },
       log: (message: string) => {
-        void this.backend.log(jobId, message)
+        // Fire-and-forget, but never unhandled: a rejected job-log write with
+        // no catch takes the whole worker down under Node's default
+        // --unhandled-rejections=throw. A lost log line is not worth a
+        // process; report it and carry on.
+        this.backend.log(jobId, message).catch((err: unknown) => {
+          this.log.warn({ err, jobId }, 'failed to write job log entry')
+        })
       },
-      heartbeat: () => this.backend.heartbeat(jobId),
+      heartbeat: async () => {
+        const res = await this.backend.heartbeat(jobId, claimToken)
+        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'heartbeat')
+        return res
+      },
     }
   }
 
+  /**
+   * Sleep that shutdown can cut short.
+   *
+   * The poll loops park here for a full `pollInterval` between sweeps — 60s
+   * when push is active. A plain `setTimeout` left `shutdown()` resolving
+   * while an armed timer still held the event loop open, so a process that
+   * awaited a graceful shutdown sat there for up to a minute before exiting.
+   * Registering the timer lets {@link cancelPendingSleeps} clear it and wake
+   * the loop, which then sees the shutdown flag and returns.
+   */
   private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms))
+    return new Promise((resolve) => {
+      const entry: PendingSleep = { resolve }
+      entry.timer = setTimeout(() => {
+        this.pendingSleeps.delete(entry)
+        resolve()
+      }, ms)
+      this.pendingSleeps.add(entry)
+    })
+  }
+
+  /** Wake every parked poll loop at once. Each re-checks its run flags and exits. */
+  private cancelPendingSleeps(): void {
+    for (const entry of this.pendingSleeps) {
+      if (entry.timer) clearTimeout(entry.timer)
+      entry.resolve()
+    }
+    this.pendingSleeps.clear()
   }
 }
 

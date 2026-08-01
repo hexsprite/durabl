@@ -69,7 +69,9 @@ class MiniBackend implements IJobQueueBackend {
     return 'applied'
   }
   async log(): Promise<void> {}
-  async heartbeat(): Promise<void> {}
+  async heartbeat(): Promise<LifecycleWriteResult> {
+    return 'applied'
+  }
   async findOne<T>(): Promise<Job<T> | null> {
     return null
   }

@@ -6,10 +6,12 @@ import type { Collection, Db } from 'mongodb'
 import { defaultLogger, type Logger } from '../logger'
 import { JournalTooLarge, NondeterminismError } from '../journal/errors'
 import {
-  approxRecordBytes,
   DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+  DEFAULT_MAX_LOG_ENTRIES,
+  DEFAULT_MAX_LOG_MESSAGE_BYTES,
   guardAppend,
   sortBySeq,
+  truncateLogMessage,
 } from '../journal/serialize'
 import {
   type AppendStepResult,
@@ -45,13 +47,29 @@ export interface MongoJobQueueOptions {
   /** Injectable logger. Default: console. */
   logger?: Logger
   /**
-   * Soft cap (bytes) on the cumulative step journal + logs before `appendStep`
-   * throws `JournalTooLarge`. Default: 8MB (well under Mongo's 16MB cap). §8.1.
+   * Soft cap (bytes) on the cumulative step journal before `appendStep` throws
+   * `JournalTooLarge`. Default: 8MB (well under Mongo's 16MB cap). §8.1.
+   * `logs[]` is bounded separately — see `maxLogEntries`.
    */
   journalSoftLimitBytes?: number
+  /**
+   * Newest-N `logs[]` entries retained per job; older entries are dropped.
+   * Bounding the array is what keeps terminal writes (which append a log line)
+   * applicable no matter how chatty a handler is. Default: 1000.
+   */
+  maxLogEntries?: number
+  /** Ceiling on one log message; longer messages are clipped. Default: 4000. */
+  maxLogMessageBytes?: number
 }
 
 type JobAvailableListener = (type: string) => void
+
+/**
+ * Stuck jobs handled per {@link MongoJobQueue.recoverStuckJobs} sweep. Bounds
+ * how long one pass can run after a mass worker death; the remainder is picked
+ * up on the next reaper tick.
+ */
+const DEFAULT_REAPER_BATCH_SIZE = 1000
 
 /**
  * Does this driver/server error mean "the resulting document exceeds the BSON
@@ -80,6 +98,8 @@ export class MongoJobQueue implements IJobQueueBackend {
   private useChangeStreams: boolean
   private logger: Logger
   private journalSoftLimitBytes: number
+  private maxLogEntries: number
+  private maxLogMessageBytes: number
   private watcher: MongoChangeStreamWatcher | null = null
   /** Buffer listeners subscribed before startup() so they get attached. */
   private pendingListeners: Set<JobAvailableListener> = new Set()
@@ -94,6 +114,9 @@ export class MongoJobQueue implements IJobQueueBackend {
     this.useChangeStreams = options.useChangeStreams ?? false
     this.journalSoftLimitBytes =
       options.journalSoftLimitBytes ?? DEFAULT_JOURNAL_SOFT_LIMIT_BYTES
+    this.maxLogEntries = options.maxLogEntries ?? DEFAULT_MAX_LOG_ENTRIES
+    this.maxLogMessageBytes =
+      options.maxLogMessageBytes ?? DEFAULT_MAX_LOG_MESSAGE_BYTES
     this.logger = (options.logger ?? defaultLogger).child({
       category: 'MongoJobQueue',
     })
@@ -187,6 +210,25 @@ export class MongoJobQueue implements IJobQueueBackend {
     }
   }
 
+  /**
+   * Create+claim a job for inline execution.
+   *
+   * Mutual exclusion is enforced by the unique partial indexes, never by the
+   * pre-read below — that read is a cheap short-circuit only, and being a
+   * check-then-act it cannot be the guarantee. Under `dedupeScope: 'pending'`
+   * the `dedupe_active_idx` index is what makes "at most one active run per
+   * key" true; without it every concurrent caller inserted its own `active`
+   * doc and they all ran at once.
+   *
+   * Losing the race is not the same as having nothing to do. Under
+   * `'pending'` — the single-flight coalescing scope — a caller who finds a
+   * run already active queues exactly one follow-up (capped by
+   * `dedupe_pending_idx`) and returns `null`, so the work that arrived during
+   * the active run is not silently dropped. Under `'pending+active'` a
+   * duplicate means "this job already exists"; nothing is queued.
+   *
+   * @returns a handle when this caller won the slot, `null` otherwise.
+   */
   async claimOrEnqueue<T>(
     type: string,
     data: T,
@@ -195,7 +237,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     const now = new Date()
     const dedupeScope: DedupeScope = options.dedupeScope ?? 'pending+active'
 
-    // Coalescing check - if pending job exists, return null
+    // Short-circuit: a run is already queued, so don't start another now.
     if (options.dedupeKey) {
       const pending = await this.collection.findOne({
         dedupeKey: options.dedupeKey,
@@ -229,8 +271,15 @@ export class MongoJobQueue implements IJobQueueBackend {
       await this.collection.insertOne(doc as JobDoc)
       return this.createHandle(doc._id, data, doc.claimToken)
     } catch (err) {
-      if (this.isDuplicateKeyError(err)) return null
-      throw err
+      if (!this.isDuplicateKeyError(err)) throw err
+      // Another caller holds the active slot. Under the coalescing scope,
+      // queue at most one follow-up so this request still gets served after
+      // the in-flight run finishes; `enqueue` returns null (a no-op) when one
+      // is already queued.
+      if (options.dedupeKey && dedupeScope === 'pending') {
+        await this.enqueue(type, data, options)
+      }
+      return null
     }
   }
 
@@ -257,17 +306,31 @@ export class MongoJobQueue implements IJobQueueBackend {
   }
 
   /**
-   * `$push` + `$inc` fragment for one log entry. Every log write bumps
-   * `journalBytes` so the §8.1 running total stays exact for the size guard.
+   * `$push` fragment for one log entry, bounded to the newest
+   * `maxLogEntries` via `$slice` and with the message itself clipped.
+   *
+   * The bound is what keeps every *terminal* write applicable: `fail`,
+   * `failFatal` and the reaper's give-up path all carry a log line in the same
+   * update, so an unbounded `logs[]` that reached Mongo's 16MB document cap
+   * would fail those writes too — leaving the job stuck `active` with no way
+   * to record why. Bounding the array means the terminal write always fits.
+   *
+   * Log bytes deliberately do **not** feed `journalBytes`: that total guards
+   * the step journal (§8.1), and mixing the two let log volume trigger a
+   * spurious `JournalTooLarge` on an otherwise small journal.
    */
   private logWrite(
     message: string,
     timestamp = new Date(),
   ): Record<string, unknown> {
-    const entry = { timestamp, message }
+    const entry = {
+      timestamp,
+      message: truncateLogMessage(message, this.maxLogMessageBytes),
+    }
     return {
-      $push: { logs: entry },
-      $inc: { journalBytes: approxRecordBytes(entry) },
+      $push: {
+        logs: { $each: [entry], $slice: -this.maxLogEntries },
+      },
     }
   }
 
@@ -356,13 +419,19 @@ export class MongoJobQueue implements IJobQueueBackend {
     await this.collection.updateOne({ _id: jobId }, this.logWrite(message))
   }
 
-  async heartbeat(jobId: string): Promise<void> {
-    await this.collection.updateOne(
-      { _id: jobId },
+  async heartbeat(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
+    const res = await this.collection.updateOne(
+      this.lifecycleFilter(jobId, claimToken),
       {
         $set: { claimedAt: new Date() },
       },
     )
+    // matchedCount, not modifiedCount: a same-millisecond claimedAt write is a
+    // no-op modification but the lease is still held (see heartbeatClaimed).
+    return claimToken && res.matchedCount !== 1 ? 'lease-lost' : 'applied'
   }
 
   /**
@@ -584,14 +653,29 @@ export class MongoJobQueue implements IJobQueueBackend {
    * value here is for tests/manual ops only; a value that disagrees with the
    * queue's breaks the heartbeat/lease contract.
    *
+   * The sweep is **bounded** (`maxPerSweep`, default 1000). After a mass
+   * worker death the stuck set can be enormous, and an unbounded sweep walks
+   * all of it in one pass — issuing a write per document while the system is
+   * already degraded. Draining across several ticks keeps each pass short and
+   * predictable; the returned count tells an operator whether it is keeping up
+   * (a full batch means there is more waiting).
+   *
    * @returns Number of stuck jobs handled (re-queued + failed).
    */
-  async recoverStuckJobs(visibilityTimeoutMs = 300000): Promise<number> {
+  async recoverStuckJobs(
+    visibilityTimeoutMs = 300000,
+    maxPerSweep = DEFAULT_REAPER_BATCH_SIZE,
+  ): Promise<number> {
     const cutoff = new Date(Date.now() - visibilityTimeoutMs)
-    const cursor = this.collection.find({
-      status: 'active',
-      claimedAt: { $lt: cutoff },
-    })
+    const cursor = this.collection
+      .find({
+        status: 'active',
+        claimedAt: { $lt: cutoff },
+      })
+      // Oldest lease first: the jobs that have been stuck longest are the ones
+      // most worth recovering when the batch cannot cover everything.
+      .sort({ claimedAt: 1 })
+      .limit(maxPerSweep)
 
     let handled = 0
     for await (const job of cursor) {
@@ -658,7 +742,11 @@ export class MongoJobQueue implements IJobQueueBackend {
         await this.fail(jobId, reason, claimToken)
       },
       log: (msg: string) => {
-        void this.log(jobId, msg)
+        // See JobQueue.createContext: an uncaught rejection here would kill
+        // the process over a dropped log line.
+        this.log(jobId, msg).catch((err: unknown) => {
+          this.logger.warn({ err, jobId }, 'failed to write job log entry')
+        })
       },
     }
   }

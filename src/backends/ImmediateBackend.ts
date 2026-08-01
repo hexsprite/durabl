@@ -1,4 +1,3 @@
-/* eslint-disable max-lines */
 /** Executes job handlers synchronously when enqueued. For integration tests. */
 import { randomUUID } from 'node:crypto'
 
@@ -9,7 +8,6 @@ import {
   type JournalableJob,
 } from '../journal/inMemory'
 import {
-  approxRecordBytes,
   DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
   sortBySeq,
 } from '../journal/serialize'
@@ -155,11 +153,19 @@ export class ImmediateBackend implements IJobQueueBackend {
   ): Promise<JobHandle<T> | null> {
     const dedupeScope = options.dedupeScope ?? 'pending+active'
 
-    // For claimOrEnqueue, check if any pending exists
     if (options.dedupeKey) {
-      // Check for pending job with this dedupeKey
       for (const job of this.jobs.values()) {
-        if (job.dedupeKey === options.dedupeKey && job.status === 'pending') {
+        if (job.dedupeKey !== options.dedupeKey) continue
+        // A run is already queued — don't start another now.
+        if (job.status === 'pending') return null
+        // Stand-in for Mongo's unique partial indexes: at most one active run
+        // per key+scope. Without this an un-completed handle did not stop the
+        // next caller from getting one too.
+        if (job.status === 'active' && job.dedupeScope === dedupeScope) {
+          // Deliberate divergence from MongoJobQueue: it queues one follow-up
+          // here. This backend executes on enqueue, so "queue a follow-up"
+          // would mean running the very job we are coalescing away, inline and
+          // immediately. Returning null is the honest inline equivalent.
           return null
         }
       }
@@ -252,11 +258,12 @@ export class ImmediateBackend implements IJobQueueBackend {
         }
       },
       log: (message: string) => {
+        // Safe to leave uncaught: this backend's `log` is a synchronous
+        // in-memory byte-count update and has no failure mode. The Mongo path
+        // needs a catch (see JobQueue.createContext); this one does not.
         void this.log(jobId, message)
       },
-      heartbeat: async () => {
-        await this.heartbeat(jobId)
-      },
+      heartbeat: () => this.heartbeat(jobId, claimToken),
     }
   }
 
@@ -314,21 +321,25 @@ export class ImmediateBackend implements IJobQueueBackend {
     return 'applied'
   }
 
-  async log(jobId: string, message: string): Promise<void> {
-    // Log text isn't stored, but its size still counts against the shared
-    // journal budget (§8.1) — mirror Mongo's per-entry accounting so the
-    // size guard has the same fidelity here.
-    const job = this.jobs.get(jobId)
-    if (job) {
-      job.journalBytes += approxRecordBytes({ timestamp: new Date(), message })
-    }
-  }
+  /**
+   * This backend keeps no log array, and log bytes no longer count against the
+   * step-journal budget — `logs[]` is bounded structurally in the backends that
+   * persist it (see `MongoJobQueue.logWrite`) so a chatty handler can neither
+   * wedge a job at Mongo's document cap nor trip a spurious `JournalTooLarge`.
+   * Nothing to do here.
+   */
+  async log(_jobId: string, _message: string): Promise<void> {}
 
-  async heartbeat(jobId: string): Promise<void> {
+  async heartbeat(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<LifecycleWriteResult> {
     const job = this.jobs.get(jobId)
+    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
     if (job) {
       job.claimedAt = new Date()
     }
+    return 'applied'
   }
 
   // --- Durable-orchestration journal capability (in-memory) -----------------

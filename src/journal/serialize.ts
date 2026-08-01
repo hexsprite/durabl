@@ -14,6 +14,43 @@ import { JournalTooLarge, NonSerializableStepResult } from './errors'
 export const DEFAULT_JOURNAL_SOFT_LIMIT_BYTES = 8_000_000
 
 /**
+ * Ceiling on retained `logs[]` entries per job.
+ *
+ * `logs[]` shares the job document with `steps[]`, and every terminal write
+ * (`fail`, `failFatal`, the reaper's give-up path) appends a log line as part
+ * of the same update. Unbounded, a chatty handler could grow the document to
+ * Mongo's hard 16MB cap — at which point the terminal write fails too, so the
+ * job could no longer even be marked failed. It wedged `active` and the reaper
+ * re-served it forever.
+ *
+ * Bounding the array structurally is what makes the terminal write always fit.
+ * Oldest entries are dropped first: the tail is what explains a failure.
+ */
+export const DEFAULT_MAX_LOG_ENTRIES = 1000
+
+/**
+ * Ceiling on a single log message. One pathological entry (a dumped payload,
+ * a stack of stacks) must not consume the whole budget that
+ * {@link DEFAULT_MAX_LOG_ENTRIES} is sized against.
+ */
+export const DEFAULT_MAX_LOG_MESSAGE_BYTES = 4000
+
+/** Marker appended to a message clipped by {@link truncateLogMessage}. */
+const TRUNCATION_SUFFIX = '… [truncated]'
+
+/**
+ * Clip an over-long log message, leaving evidence that it was clipped — a
+ * silently shortened log line is worse than a visibly shortened one.
+ */
+export function truncateLogMessage(
+  message: string,
+  maxBytes = DEFAULT_MAX_LOG_MESSAGE_BYTES,
+): string {
+  if (message.length <= maxBytes) return message
+  return message.slice(0, maxBytes - TRUNCATION_SUFFIX.length) + TRUNCATION_SUFFIX
+}
+
+/**
  * Stored in place of a `step<void>`/`undefined` result so the journal records
  * "this step completed" without storing a literal `undefined` (invalid BSON in
  * an object position). Replayed back to `undefined` by {@link fromStored}.
@@ -97,10 +134,15 @@ export function approxRecordBytes(value: unknown): number {
 
 /**
  * Run the serialization + size guards for an append against a **running
- * journal-bytes total** (steps + logs share the same 16MB document budget,
- * §8.1). Backends maintain `currentJournalBytes` incrementally so the guard is
- * O(record), not O(journal). Throws {@link NonSerializableStepResult} or
- * {@link JournalTooLarge} on violation.
+ * step-journal byte total** (§8.1). Backends maintain `currentJournalBytes`
+ * incrementally so the guard is O(record), not O(journal). Throws
+ * {@link NonSerializableStepResult} or {@link JournalTooLarge} on violation.
+ *
+ * `logs[]` is deliberately *not* part of this total. Logs are bounded
+ * structurally instead (see {@link DEFAULT_MAX_LOG_ENTRIES}), which keeps the
+ * two budgets independent: a chatty handler cannot consume the step budget and
+ * trigger a spurious `JournalTooLarge`, and a large journal cannot starve the
+ * terminal write that carries a log line with it.
  *
  * @returns the incoming record's approximate byte size, for the caller to add
  *   to its running total once the append commits.

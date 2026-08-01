@@ -575,14 +575,32 @@ path for long steps.
 
 ### 8.1 Cumulative size guard (R7)
 
-The 16MB BSON cap is a *cumulative* per-job budget shared by `steps[]` **and**
-`logs[]`, not a fan-out-only worry. Left unguarded, a long flow's append would
-eventually hit an opaque Mongo error mid-flow, retry, re-hit it, and burn every
-attempt to a confusing fatal. Instead, `appendStep` tracks the running serialized
-journal size and throws `JournalTooLarge(step, approxBytes)` (fatal, §5) at a
+The 16MB BSON cap is a per-job budget that `steps[]` and `logs[]` both draw on,
+not a fan-out-only worry. Left unguarded, a long flow's append would eventually
+hit an opaque Mongo error mid-flow, retry, re-hit it, and burn every attempt to
+a confusing fatal. Instead, `appendStep` tracks the running serialized journal
+size and throws `JournalTooLarge(step, approxBytes)` (fatal, §5) at a
 configurable soft cap (default well under 16MB) — a clear, actionable failure
 naming the offending step. Guidance unchanged: **return ids/refs, not whole
 payloads** — keep results small.
+
+**Revision (2026-08-01):** the two are now bounded *independently* rather than
+against one shared running total.
+
+- `steps[]` keeps the `journalBytes` running total and the `JournalTooLarge`
+  soft cap described above.
+- `logs[]` is bounded **structurally** — newest `maxLogEntries` retained via
+  `$slice` on the push, each message clipped at `maxLogMessageBytes` — and its
+  bytes no longer count toward `journalBytes`.
+
+Two defects motivated the split. Log writes never ran through the guard at all,
+so a chatty handler could grow the document to the *hard* 16MB cap; because
+every terminal write (`fail`, `failFatal`, the reaper's give-up path) appends a
+log line in the same update, the write that marks the job failed then failed
+too, wedging the job `active` for the reaper to re-serve forever. And billing
+log volume to the step budget meant chatter could trip `JournalTooLarge` on an
+otherwise small journal. Structural bounding fixes both: the terminal write
+always fits, and the two budgets cannot starve each other.
 
 ### 8.2 Step results may contain PII — treat the journal as sensitive (S1)
 
