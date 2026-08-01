@@ -75,6 +75,15 @@ export {
   StepTimeout,
 } from './journal/errors'
 
+// Deploy gate — startup hooks an older rolling-deploy machine must skip
+export { createDeployGate, runIfLatestBuild } from './deployGate'
+export type {
+  DeployGate,
+  DeployGateOptions,
+  DeployGateResult,
+  DeploymentDoc,
+} from './deployGate'
+
 // Logger interface + console default (inject your own pino/winston instance)
 export { type Logger, consoleLogger, defaultLogger } from './logger'
 
