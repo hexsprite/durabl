@@ -1,5 +1,9 @@
 # durabl
 
+[![CI](https://github.com/hexsprite/durabl/actions/workflows/ci.yml/badge.svg)](https://github.com/hexsprite/durabl/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/durabl.svg)](https://www.npmjs.com/package/durabl)
+[![license](https://img.shields.io/npm/l/durabl.svg)](./LICENSE)
+
 A small durable job queue backed by MongoDB. Atomic claiming, retries, visibility-timeout leases, dedupe keys, and optional change-stream push — no Redis, no separate worker service, no orchestrator.
 
 > **Status: work in progress.** This is the production job queue I've run inside [Focuster](https://focuster.com) since 2016, just lifted out of the app and decoupled from Meteor. It works and it's tested, but the packaging is young: the API may still shift and the docs are thin in places. Treat `0.x` as "useful, not yet stable."
@@ -387,6 +391,53 @@ MONGO_URL="mongodb://localhost:27017/?replicaSet=rs0" npm test
 ```
 
 The change-stream suite self-skips if `MONGO_URL` points at a standalone (non-replica-set) server.
+
+## Operating it
+
+Most of what follows was learned running this in production. None of it is
+obvious from the API, and each item has a failure mode attached.
+
+**Run the reaper on exactly one process.** `queue.startReaper()`. Without it, a
+job whose worker died stays `active` forever — and if it holds a `dedupeKey`
+under the default `pending+active` scope, it blocks every future job for that key
+permanently. Running it on several processes is harmless (the sweeps are
+idempotent), just redundant.
+
+**Configure the visibility timeout in one place.** `visibilityTimeoutMs` on the
+`JobQueue` constructor is the single source of truth: the `Orchestrator` sizes
+its heartbeat from it and `startReaper()` passes it to the backend. If you call
+`backend.recoverStuckJobs(...)` directly with your own constant, the two drift,
+and the symptom is jobs getting reclaimed mid-flight while the handler is still
+running — near the top of the list of things you do not want to debug in
+production.
+
+**Enqueue everywhere, process where you mean to.** Construct the backend on every
+instance so `enqueue()` works, but call `process()` only on the instances meant to
+do the work — otherwise every web server becomes a worker.
+
+**Handlers must reach a terminal call.** A handler that returns without
+`ctx.complete()` leaves the job `active`; the reaper reclaims it, it runs again,
+and its side effects repeat until `maxAttempts` is spent. The terminal error then
+says "stalled", which points away from the real cause. Always complete or fail.
+
+**Alert on backlog age, drain on SIGTERM.** See the two sections above. These are
+the two things most likely to be missing from a working-looking deployment.
+
+**Turning on change streams changes pickup latency for scheduled jobs.** With
+push active the poll interval becomes a 60s safety net, so a job with a future
+`runAt` can fire up to 60s late. Fine for most work; surprising if you were
+relying on the 5s default.
+
+## Further reading
+
+- [`docs/orchestrator-spec.md`](docs/orchestrator-spec.md) — the full design of
+  the durable-execution layer: why resume-from-step rather than replay, step
+  identity, journal write semantics and lease fencing, the failure taxonomy, and
+  what is deliberately deferred.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — test setup, the chaos and property
+  harnesses, and the invariants that are not up for casual change.
+- [`CHANGELOG.md`](CHANGELOG.md)
+- [`examples/quickstart.mjs`](examples/quickstart.mjs) — runnable end-to-end.
 
 ## What this is not
 

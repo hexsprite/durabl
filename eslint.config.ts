@@ -53,6 +53,21 @@ export default [
     },
   },
   {
+    // Runnable examples are plain Node ESM, not library source: they run in a
+    // terminal, so `console` is the correct output channel and Node globals are
+    // real. Linting them at all is deliberate — a broken example is a broken
+    // first impression.
+    files: ['examples/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: { console: 'readonly', process: 'readonly', setTimeout: 'readonly' },
+    },
+    rules: {
+      'no-console': 'off',
+    },
+  },
+  {
     files: ['src/**/*.ts', 'test/**/*.ts'],
     plugins: { durabl },
     rules: {
