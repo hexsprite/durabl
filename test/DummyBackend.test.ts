@@ -416,3 +416,63 @@ describe('DummyBackend', () => {
     })
   })
 })
+
+describe('DummyBackend claimNext: dedupe exclusivity', () => {
+  /**
+   * Found by the property-based harness (test/queueProperties.test.ts), not by
+   * hand: claimOrEnqueue modelled the "one active run per key+scope" rule, but
+   * claimNext took the first pending job of a type with no dedupe check at all.
+   * So a pending job queued behind an active one — exactly the pair that
+   * dedupeScope 'pending' exists to allow — got claimed while the first was
+   * still running, and two handlers ran concurrently for one key.
+   *
+   * This backend's whole purpose is letting a unit test catch a broken
+   * single-flight assumption without booting Mongo. More permissive than the
+   * real backend means the tests certify a lie.
+   */
+  it('does not claim a pending job whose key already has an active run', async () => {
+    const backend = new DummyBackend()
+    const opts = { dedupeKey: 'u1', dedupeScope: 'pending' as const }
+
+    const handle = await backend.claimOrEnqueue('sync', { n: 1 }, opts)
+    expect(handle).not.toBeNull()
+    await backend.enqueue('sync', { n: 2 }, opts)
+
+    expect(await backend.claimNext('sync')).toBeNull()
+    expect(backend.getJobsByStatus('active')).toHaveLength(1)
+  })
+
+  it('claims a different key while one key is contended', async () => {
+    const backend = new DummyBackend()
+    const scope = 'pending' as const
+    await backend.claimOrEnqueue('sync', {}, { dedupeKey: 'u1', dedupeScope: scope })
+    await backend.enqueue('sync', {}, { dedupeKey: 'u1', dedupeScope: scope })
+    await backend.enqueue('sync', { free: true }, { dedupeKey: 'u2', dedupeScope: scope })
+
+    const claimed = await backend.claimNext<{ free?: boolean }>('sync')
+    expect(claimed?.data.free).toBe(true)
+  })
+
+  it('claims the queued follow-up once the holder finishes', async () => {
+    const backend = new DummyBackend()
+    const opts = { dedupeKey: 'u1', dedupeScope: 'pending' as const }
+    const handle = await backend.claimOrEnqueue('sync', { n: 1 }, opts)
+    await backend.enqueue('sync', { n: 2 }, opts)
+
+    expect(await backend.claimNext('sync')).toBeNull()
+    await handle!.complete()
+
+    const claimed = await backend.claimNext<{ n: number }>('sync')
+    expect(claimed?.data.n).toBe(2)
+  })
+
+  it('still claims jobs that carry no dedupeKey', async () => {
+    const backend = new DummyBackend()
+    await backend.enqueue('sync', { n: 1 })
+    await backend.enqueue('sync', { n: 2 })
+
+    expect(await backend.claimNext('sync')).not.toBeNull()
+    // No key means no exclusion — both are independently claimable.
+    expect(await backend.claimNext('sync')).not.toBeNull()
+  })
+})

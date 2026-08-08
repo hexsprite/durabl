@@ -242,7 +242,30 @@ export class DummyBackend implements IJobQueueBackend {
   }
 
   async claimNext<T>(type: string): Promise<Job<T> | null> {
-    const job = this.jobs.find((j) => j.type === type && j.status === 'pending')
+    // Stand-in for Mongo's unique partial dedupe indexes: a pending job whose
+    // key+scope already has an active run is NOT claimable. Without this check
+    // the pending-behind-active pair that `dedupeScope: 'pending'` exists to
+    // allow got claimed while the first run was still going, so two handlers
+    // ran concurrently for one key — the exact failure this backend is supposed
+    // to let a unit test catch without booting Mongo.
+    //
+    // Skips blocked candidates rather than stopping at the first one, so a
+    // contended key cannot starve every other key of the same type (see the
+    // equivalent reasoning in MongoJobQueue.claimNext).
+    const activeSlots = new Set(
+      this.jobs
+        .filter((j) => j.status === 'active' && j.dedupeKey)
+        .map((j) => `${j.dedupeKey}|${j.dedupeScope ?? 'pending+active'}`),
+    )
+    const job = this.jobs.find(
+      (j) =>
+        j.type === type &&
+        j.status === 'pending' &&
+        !(
+          j.dedupeKey &&
+          activeSlots.has(`${j.dedupeKey}|${j.dedupeScope ?? 'pending+active'}`)
+        ),
+    )
     if (!job) return null
 
     job.status = 'active'
