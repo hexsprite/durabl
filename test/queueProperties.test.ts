@@ -27,6 +27,13 @@ import { closeMongo, getMongo, uniqueCollectionName } from './mongoHelper'
 import { activeKeys, checkInvariants, type ModelJob } from './model/queueModel'
 
 const RUNS = Number(process.env.CHAOS_RUNS ?? 40)
+/**
+ * Fixed seed so a failure is replayable and CI cannot go intermittently red for
+ * reasons nobody can reproduce. Without it fast-check picks a new seed per run,
+ * which turns a genuine finding into "flaky test" and gets the suite ignored.
+ * Override with CHAOS_SEED to explore beyond this slice.
+ */
+const SEED = Number(process.env.CHAOS_SEED ?? 20260808)
 
 /** Small domains: collisions are where the interesting behaviour lives. */
 const TYPES = ['alpha', 'beta']
@@ -158,7 +165,7 @@ describe('claim/dedupe invariants hold over generated scenarios', () => {
           })
         }
       }),
-      { numRuns: RUNS, endOnFailure: true },
+      { numRuns: RUNS, seed: SEED, endOnFailure: true },
     )
   })
 
@@ -171,7 +178,7 @@ describe('claim/dedupe invariants hold over generated scenarios', () => {
         const violations = await runScenario(backend, ops, readAll)
         expect(violations).toEqual([])
       }),
-      { numRuns: RUNS, endOnFailure: true },
+      { numRuns: RUNS, seed: SEED, endOnFailure: true },
     )
   })
 })
@@ -243,7 +250,7 @@ describe('claimable work is never withheld (the du-pz9 property)', () => {
           }
         },
       ),
-      { numRuns: 10, endOnFailure: true },
+      { numRuns: 10, seed: SEED, endOnFailure: true },
     )
   })
 })
