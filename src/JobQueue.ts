@@ -11,6 +11,8 @@ import type {
   Job,
   JobContext,
   JobHandle,
+  JobEvent,
+  JobEventSink,
   JobHandler,
   ProcessorConfig,
   QueueStats,
@@ -42,6 +44,12 @@ const PUSH_POLL_INTERVAL_MS = 60000
 const DEFAULT_VISIBILITY_TIMEOUT_MS = 300000
 /** Default cadence for the built-in reaper timer ({@link JobQueue.startReaper}). */
 const DEFAULT_REAPER_INTERVAL_MS = 60000
+/**
+ * Recovered-count at which a sweep is assumed to have hit the backend's batch
+ * cap. Mirrors `DEFAULT_REAPER_BATCH_SIZE` in MongoJobQueue; a full batch means
+ * there is more waiting, which is the signal worth alerting on.
+ */
+const REAPER_SATURATION_HINT = 1000
 
 /** Options for the {@link JobQueue} constructor. */
 export interface JobQueueOptions {
@@ -53,6 +61,16 @@ export interface JobQueueOptions {
    * Must be a positive finite number. Default: 300000.
    */
   visibilityTimeoutMs?: number
+  /**
+   * Metrics sink for lifecycle events. Absent means zero behaviour change and
+   * zero cost beyond one undefined check.
+   *
+   * Logs are for a human reading an incident; this is for a machine counting.
+   * Called synchronously and fire-and-forget: a throwing sink is caught and
+   * reported through the logger, never allowed to fail a job or take down a
+   * worker — same reasoning as the fire-and-forget `ctx.log` write.
+   */
+  onJobEvent?: JobEventSink
 }
 
 export class JobQueue {
@@ -72,6 +90,8 @@ export class JobQueue {
   private pendingSleeps: Set<PendingSleep> = new Set()
   /** In-flight drain started by {@link installSignalHandlers}, if any. */
   private signalDrain: Promise<void> | null = null
+  /** Metrics sink, if configured. */
+  private onJobEvent?: JobEventSink
   /** Reaper visibility timeout this queue is operated with (§7.1). */
   readonly visibilityTimeoutMs: number
 
@@ -82,6 +102,7 @@ export class JobQueue {
   ) {
     this.backend = backend
     this.log = logger.child({ category: 'JobQueue' })
+    this.onJobEvent = options.onJobEvent
     this.visibilityTimeoutMs =
       options.visibilityTimeoutMs ?? DEFAULT_VISIBILITY_TIMEOUT_MS
     // A zero/negative window would make the reaper reclaim every active job
@@ -344,6 +365,13 @@ export class JobQueue {
         )
         if (handled > 0) {
           this.log.warn({ handled }, 'reaper recovered stuck jobs')
+          // `saturated` means the sweep hit its batch cap, so more is waiting —
+          // the difference between a blip and a backlog an operator must watch.
+          this.emit({
+            kind: 'reaper-recovered',
+            handled,
+            saturated: handled >= REAPER_SATURATION_HINT,
+          })
         }
       } catch (err) {
         this.log.error({ err }, 'reaper sweep failed; will retry next tick')
@@ -510,17 +538,44 @@ export class JobQueue {
    */
   private async processJob(state: ProcessorState, job: Job): Promise<void> {
     const ctx = this.createContext(job)
+    // Claim-to-terminal duration. Measured here rather than from `claimedAt` so
+    // it reflects this worker's handling time, not clock skew between hosts.
+    const startedAt = Date.now()
+    this.emit({
+      kind: 'claimed',
+      type: job.type,
+      jobId: job.id,
+      attempt: job.attempt,
+    })
 
     try {
       await state.handler(job, ctx)
+      this.emit({
+        kind: 'completed',
+        type: job.type,
+        jobId: job.id,
+        durationMs: Date.now() - startedAt,
+      })
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
+      // `terminal` distinguishes a retry from a give-up, which is the whole
+      // point of charting this: a flaky job that recovers is not an incident.
+      this.emit({
+        kind: 'failed',
+        type: job.type,
+        jobId: job.id,
+        durationMs: Date.now() - startedAt,
+        attempt: job.attempt,
+        maxAttempts: job.maxAttempts,
+        terminal: job.attempt >= job.maxAttempts,
+        reason,
+      })
       try {
         // Fenced with the claim token from *this* claim: if the job was
         // reclaimed (reaper → another worker), the fail must not clobber the
         // live owner's copy. On a fence miss, do nothing and do not retry.
         const res = await this.backend.fail(job.id, reason, job.claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(job.id, 'fail')
+        if (res === 'lease-lost') this.warnLeaseLost(job.id, 'fail', job.type)
       } catch (failErr) {
         this.log.error({ failErr, jobId: job.id }, 'error marking job as failed')
       }
@@ -531,11 +586,28 @@ export class JobQueue {
     }
   }
 
-  private warnLeaseLost(jobId: string, op: string): void {
+  /**
+   * Hand an event to the configured sink.
+   *
+   * Wrapped: a throwing sink is a bug in the consumer's metrics code, and it
+   * must not be able to fail a job or kill a worker. Reported through the
+   * logger so it is visible rather than swallowed.
+   */
+  private emit(event: JobEvent): void {
+    if (!this.onJobEvent) return
+    try {
+      this.onJobEvent(event)
+    } catch (err) {
+      this.log.warn({ err, kind: event.kind }, 'onJobEvent sink threw')
+    }
+  }
+
+  private warnLeaseLost(jobId: string, op: string, type?: string): void {
     this.log.warn(
       { jobId, op },
       'lease lost; skipping fail/complete — job owned by another worker',
     )
+    if (type) this.emit({ kind: 'lease-lost', type, jobId, op })
   }
 
   /**
@@ -544,19 +616,20 @@ export class JobQueue {
    * worker can never complete/fail a job that another worker now owns.
    */
   private createContext(job: Job): JobContext {
-    const { id: jobId, claimToken } = job
+    const { id: jobId, claimToken, type } = job
     return {
       complete: async () => {
         const res = await this.backend.complete(jobId, claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'complete')
+        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'complete', type)
       },
       fail: async (reason: string) => {
         const res = await this.backend.fail(jobId, reason, claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'fail')
+        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'fail', type)
       },
       failFatal: async (reason: string) => {
         const res = await this.backend.failFatal(jobId, reason, claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'failFatal')
+        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'failFatal', type)
+        else this.emit({ kind: 'fail-fatal', type, jobId, reason })
       },
       log: (message: string) => {
         // Fire-and-forget, but never unhandled: a rejected job-log write with
@@ -569,7 +642,7 @@ export class JobQueue {
       },
       heartbeat: async () => {
         const res = await this.backend.heartbeat(jobId, claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'heartbeat')
+        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'heartbeat', type)
         return res
       },
     }

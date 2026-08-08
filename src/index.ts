@@ -43,6 +43,8 @@ export type {
   Job,
   JobContext,
   JobDoc,
+  JobEvent,
+  JobEventSink,
   JobHandle,
   JobHandler,
   JobStatus,

@@ -267,3 +267,49 @@ export function jobDocToJob<T>(
     ...(includeClaimToken ? { claimToken: doc.claimToken } : {}),
   }
 }
+
+/**
+ * A queue lifecycle event, for metrics.
+ *
+ * Logs are for a human reading an incident; events are for a machine counting.
+ * Without this a consumer wanting throughput or failure-rate dashboards has to
+ * parse structured logs and match on durabl's internal message strings, which
+ * makes those strings a de-facto public API that any refactor silently breaks.
+ */
+export type JobEvent =
+  | { kind: 'claimed'; type: string; jobId: string; attempt: number }
+  | {
+      kind: 'completed'
+      type: string
+      jobId: string
+      /** Claim to terminal write, ms. */
+      durationMs: number
+    }
+  | {
+      kind: 'failed'
+      type: string
+      jobId: string
+      durationMs: number
+      attempt: number
+      maxAttempts: number
+      /** False when attempts remain, so a retry is expected. */
+      terminal: boolean
+      reason: string
+    }
+  | { kind: 'fail-fatal'; type: string; jobId: string; reason: string }
+  | {
+      kind: 'lease-lost'
+      type: string
+      jobId: string
+      /** The operation that discovered the fence miss. */
+      op: string
+    }
+  | {
+      kind: 'reaper-recovered'
+      handled: number
+      /** Sweep hit the batch cap, so more work is waiting. */
+      saturated: boolean
+    }
+
+/** Sink for {@link JobEvent}s. Synchronous and fire-and-forget. */
+export type JobEventSink = (event: JobEvent) => void

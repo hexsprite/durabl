@@ -218,6 +218,45 @@ interface QueueStats {
 
 The handler receives a `JobContext` with `complete()`, `fail(reason)`, `failFatal(reason)`, `log(message)`, and `heartbeat()`.
 
+### Metrics
+
+`getStats()` is a point-in-time gauge; `onJobEvent` is the stream. Pass it a
+sink and you get counters and histograms without parsing logs:
+
+```typescript
+const queue = new JobQueue(backend, logger, {
+  onJobEvent: (e) => {
+    switch (e.kind) {
+      case 'completed':
+        statsd.timing('jobs.duration', e.durationMs, { type: e.type })
+        statsd.increment('jobs.completed', { type: e.type })
+        break
+      case 'failed':
+        // `terminal` is the distinction worth charting: a flaky job that
+        // recovers on retry is not an incident, a give-up is.
+        statsd.increment(e.terminal ? 'jobs.dead' : 'jobs.retried', {
+          type: e.type,
+        })
+        break
+      case 'lease-lost':
+        statsd.increment('jobs.lease_lost', { type: e.type, op: e.op })
+        break
+      case 'reaper-recovered':
+        statsd.gauge('jobs.reaper.recovered', e.handled)
+        if (e.saturated) statsd.increment('jobs.reaper.saturated')
+        break
+    }
+  },
+})
+```
+
+Kinds: `claimed`, `completed`, `failed`, `fail-fatal`, `lease-lost`,
+`reaper-recovered`. The sink is synchronous and fire-and-forget — if it throws,
+the error is logged and the job is unaffected. Omitting it costs nothing.
+
+Don't build dashboards by matching durabl's log messages. Those strings are not
+an API and will change.
+
 ### Deployment: drain on SIGTERM
 
 Call this, or `shutdown()` from your own signal handler:
