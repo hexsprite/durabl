@@ -26,9 +26,9 @@ jobs:
       MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.mongodb-binaries
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -37,7 +37,7 @@ jobs:
       # mongodb-memory-server, which downloads a mongod binary on first use.
       # Without this cache every job pays that download (~100MB) again.
       - name: Cache mongod binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.mongodb-binaries
           key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
