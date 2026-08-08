@@ -692,16 +692,38 @@ export class MongoJobQueue implements IJobQueueBackend {
   }
 
   async getStats(type?: string): Promise<QueueStats> {
+    const now = new Date()
     const q = type ? { type } : {}
     const count = (s: JobStatus) =>
       this.collection.countDocuments({ ...q, status: s })
-    const [pending, active, completed, failed] = await Promise.all([
+    const [pending, active, completed, failed, oldest] = await Promise.all([
       count('pending'),
       count('active'),
       count('completed'),
       count('failed'),
+      // Backlog age. `runAt: {$lte: now}` keeps deliberately-delayed jobs out
+      // of the measurement — they are scheduled, not late. Sorting on `runAt`
+      // alone (not the claim order) is what makes this "oldest", and the
+      // `{type, status, priority, runAt}` claim index serves the predicate;
+      // no additional index is needed.
+      this.collection
+        .find({ ...q, status: 'pending', runAt: { $lte: now } })
+        .project<{ runAt: Date }>({ runAt: 1 })
+        .sort({ runAt: 1 })
+        .limit(1)
+        .next(),
     ])
-    return { pending, active, completed, failed }
+    const oldestPendingRunAt = oldest?.runAt ?? null
+    return {
+      pending,
+      active,
+      completed,
+      failed,
+      oldestPendingRunAt,
+      oldestPendingLagMs: oldestPendingRunAt
+        ? Math.max(0, now.getTime() - oldestPendingRunAt.getTime())
+        : 0,
+    }
   }
 
   /**

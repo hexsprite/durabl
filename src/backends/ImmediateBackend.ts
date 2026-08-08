@@ -25,6 +25,7 @@ import type {
   StepRecord,
 } from '../types'
 
+import { backlogAge } from './backlogAge'
 import type { IJobQueueBackend } from './IJobQueueBackend'
 
 /** Internal job record: public {@link Job} plus the off-public step journal
@@ -448,6 +449,7 @@ export class ImmediateBackend implements IJobQueueBackend {
       active: jobs.filter((j) => j.status === 'active').length,
       completed: jobs.filter((j) => j.status === 'completed').length,
       failed: jobs.filter((j) => j.status === 'failed').length,
+      ...backlogAge(jobs),
     }
   }
 

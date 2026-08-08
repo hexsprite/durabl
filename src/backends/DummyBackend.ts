@@ -32,6 +32,7 @@ import type {
   StepRecord,
 } from '../types'
 
+import { backlogAge } from './backlogAge'
 import type { IJobQueueBackend } from './IJobQueueBackend'
 
 interface RecordedJob<T = unknown> {
@@ -45,6 +46,15 @@ interface RecordedJob<T = unknown> {
   dedupeKey?: string
   dedupeScope?: 'pending' | 'pending+active'
   createdAt: Date
+  /**
+   * When the job becomes due (`createdAt + delay`). Recorded so `getStats`
+   * can report backlog age the same way the Mongo backend does.
+   *
+   * NOTE: `claimNext` here does NOT filter on it — a delayed job is claimable
+   * immediately in this backend, unlike Mongo. That divergence predates this
+   * field and is tracked separately; see du-dum (shared InMemoryJobStore).
+   */
+  runAt: Date
   logs: string[]
   claimToken?: string
   steps: StepRecord[]
@@ -123,6 +133,7 @@ export class DummyBackend implements IJobQueueBackend {
       }
     }
 
+    const createdAt = new Date()
     const job: RecordedJob = {
       id: this.generateId(),
       type,
@@ -133,7 +144,8 @@ export class DummyBackend implements IJobQueueBackend {
       maxAttempts: options.maxAttempts ?? 3,
       dedupeKey: options.dedupeKey,
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
-      createdAt: new Date(),
+      createdAt,
+      runAt: new Date(createdAt.getTime() + (options.delay ?? 0)),
       logs: [],
       steps: [],
       journalBytes: 0,
@@ -184,6 +196,7 @@ export class DummyBackend implements IJobQueueBackend {
     }
 
     // Create and immediately claim
+    const claimedAt = new Date()
     const job: RecordedJob<T> = {
       id: this.generateId(),
       type,
@@ -194,7 +207,9 @@ export class DummyBackend implements IJobQueueBackend {
       maxAttempts: options.maxAttempts ?? 3,
       dedupeKey: options.dedupeKey,
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
-      createdAt: new Date(),
+      createdAt: claimedAt,
+      // Claimed inline at creation, so it was due the moment it existed.
+      runAt: claimedAt,
       logs: [],
       claimToken: randomUUID(),
       steps: [],
@@ -244,7 +259,7 @@ export class DummyBackend implements IJobQueueBackend {
       priority: job.priority,
       dedupeKey: job.dedupeKey,
       dedupeScope: job.dedupeScope,
-      runAt: job.createdAt,
+      runAt: job.runAt,
       createdAt: job.createdAt,
       claimToken: job.claimToken,
     }
@@ -434,6 +449,7 @@ export class DummyBackend implements IJobQueueBackend {
       active: filtered.filter((j) => j.status === 'active').length,
       completed: filtered.filter((j) => j.status === 'completed').length,
       failed: filtered.filter((j) => j.status === 'failed').length,
+      ...backlogAge(filtered),
     }
   }
 

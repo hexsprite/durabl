@@ -279,11 +279,16 @@ describe('DummyBackend', () => {
 
       const stats = await backend.getStats()
 
+      // Exhaustive on purpose: a new stats field should fail here so it gets
+      // considered rather than silently appearing in consumers' payloads.
       expect(stats).toEqual({
         pending: 1,
         active: 1,
         completed: 1,
         failed: 0,
+        // Backlog age — the one pending job is already due.
+        oldestPendingRunAt: expect.any(Date),
+        oldestPendingLagMs: expect.any(Number),
       })
     })
 

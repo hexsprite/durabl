@@ -205,9 +205,37 @@ interface ProcessorConfig {
   concurrency?: number    // default 1
   pollInterval?: number   // default 5000 (60000 when change streams are on)
 }
+
+interface QueueStats {
+  pending: number
+  active: number
+  completed: number
+  failed: number
+  oldestPendingRunAt?: Date | null // oldest *due* pending job, null if none
+  oldestPendingLagMs?: number      // how far past due it is. 0 if none
+}
 ```
 
 The handler receives a `JobContext` with `complete()`, `fail(reason)`, `failFatal(reason)`, `log(message)`, and `heartbeat()`.
+
+### What to alert on
+
+Alert on **`oldestPendingLagMs`**, not on `pending`.
+
+Depth cannot tell a healthy queue from a stuck one. A backlog of 5 that has been
+waiting 40 minutes is an incident; a backlog of 5000 draining fast is normal
+Monday-morning traffic. Lag distinguishes them, and it is the metric that goes
+red for every cause worth waking up for — dead workers, a wedged handler, a
+processor that was never registered, a poll loop stalled behind contention.
+
+```typescript
+const { pending, oldestPendingLagMs } = await queue.getStats('pushSync')
+if ((oldestPendingLagMs ?? 0) > 5 * 60_000) pageSomeone({ pending })
+```
+
+Jobs scheduled for the future are excluded on purpose: something deliberately
+delayed until next week is scheduled, not late. Counting it would peg the metric
+permanently red, and a metric that is always red is one nobody looks at.
 
 ## Durable orchestration (step-level resume)
 

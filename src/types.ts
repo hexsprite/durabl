@@ -174,13 +174,32 @@ export interface ProcessorConfig {
 }
 
 /**
- * Queue statistics
+ * Queue statistics.
+ *
+ * Depth alone cannot tell a healthy queue from a stuck one: a backlog of 5 that
+ * has been waiting 40 minutes is an incident, a backlog of 5000 draining fast is
+ * fine. {@link QueueStats.oldestPendingLagMs} is the signal to alert on.
  */
 export interface QueueStats {
   pending: number
   active: number
   completed: number
   failed: number
+  /**
+   * `runAt` of the oldest job that is pending **and already due**, or `null`
+   * when nothing is waiting.
+   *
+   * Jobs scheduled for the future are excluded deliberately. A job deliberately
+   * delayed until next week is not backlog, and counting it would peg the metric
+   * permanently red and make it useless.
+   */
+  oldestPendingRunAt?: Date | null
+  /**
+   * How far past its `runAt` the oldest due pending job is, in ms. `0` when the
+   * queue is empty or nothing is overdue. Floored at 0 so clock skew cannot
+   * produce a negative lag.
+   */
+  oldestPendingLagMs?: number
 }
 
 /**
