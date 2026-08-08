@@ -218,6 +218,30 @@ interface QueueStats {
 
 The handler receives a `JobContext` with `complete()`, `fail(reason)`, `failFatal(reason)`, `log(message)`, and `heartbeat()`.
 
+### Deployment: drain on SIGTERM
+
+Call this, or `shutdown()` from your own signal handler:
+
+```typescript
+queue.installSignalHandlers({ timeoutMs: 20_000 })
+```
+
+Skipping it is expensive and invisible. In-flight jobs die mid-handler, sit
+`active` until the visibility timeout expires (5 minutes by default), burn an
+attempt each, and then **re-run their side effects from the top**. If your
+handlers write to external systems, every deploy is a source of duplicate
+writes. Nothing logs an error, because from the queue's point of view nothing
+went wrong — a worker simply stopped talking.
+
+The drain budget must fit inside your platform's kill deadline. If the platform
+sends SIGKILL 30s after SIGTERM, a 60s budget buys you nothing.
+
+`installSignalHandlers` does **not** call `process.exit()` — exiting is your
+call, and a library that exits on your behalf is unusable inside a framework
+with its own shutdown sequence. Await `queue.draining` (or `shutdown()`
+directly) and exit when you're ready. It returns an uninstall function, and
+removes only the listeners it added.
+
 ### What to alert on
 
 Alert on **`oldestPendingLagMs`**, not on `pending`.

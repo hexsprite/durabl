@@ -70,6 +70,8 @@ export class JobQueue {
   private reaperActive = false
   /** Poll-loop sleeps currently parked; cleared by {@link shutdown}. */
   private pendingSleeps: Set<PendingSleep> = new Set()
+  /** In-flight drain started by {@link installSignalHandlers}, if any. */
+  private signalDrain: Promise<void> | null = null
   /** Reaper visibility timeout this queue is operated with (§7.1). */
   readonly visibilityTimeoutMs: number
 
@@ -370,6 +372,79 @@ export class JobQueue {
       clearTimeout(this.reaperTimer)
       this.reaperTimer = null
     }
+  }
+
+  /**
+   * Drain the queue on process signals, so forgetting to wire shutdown is the
+   * loud path rather than the silent one.
+   *
+   * Skipping the drain is expensive and invisible: in-flight jobs die
+   * mid-handler, sit `active` until the visibility timeout expires, burn an
+   * attempt each, and re-run their side effects from the top. A deploy is
+   * therefore a steady source of duplicated external writes. That is not a
+   * hypothetical — the first production consumer of this library had a working
+   * DDP graceful-shutdown handler and never called {@link shutdown}, because it
+   * was not discoverable at the point where shutdown was being thought about.
+   *
+   * Not enabled by default: an import must never mutate global process state as
+   * a side effect. Call it explicitly.
+   *
+   * This does NOT call `process.exit()`. Exiting is the host application's
+   * decision — a library that exits on your behalf is unusable inside a
+   * framework with its own shutdown sequence (Meteor, Next, Nest all have one).
+   * Await the returned drain instead, then exit when you are ready.
+   *
+   * @param opts.signals which signals to handle. Default: SIGTERM, SIGINT.
+   * @param opts.timeoutMs drain budget, passed to {@link shutdown}. Must fit
+   *   inside your platform's kill deadline, or the platform wins.
+   * @returns an uninstall function that removes exactly the listeners this
+   *   added — never `removeAllListeners`, which would clobber a host
+   *   application's own handlers.
+   */
+  installSignalHandlers(
+    opts: { signals?: NodeJS.Signals[]; timeoutMs?: number } = {},
+  ): () => void {
+    const signals = opts.signals ?? (['SIGTERM', 'SIGINT'] as NodeJS.Signals[])
+    const timeoutMs = opts.timeoutMs
+    const registered: Array<[NodeJS.Signals, () => void]> = []
+
+    const onSignal = (signal: NodeJS.Signals) => () => {
+      if (this.signalDrain) {
+        // A second signal is an operator saying "stop waiting". Honour it by
+        // reporting rather than silently starting a parallel drain.
+        this.log.warn(
+          { signal },
+          'second shutdown signal received; drain already in progress',
+        )
+        return
+      }
+      this.log.info({ signal, timeoutMs }, 'signal received; draining queue')
+      this.signalDrain = this.shutdown(timeoutMs).catch((err: unknown) => {
+        // Never let a drain failure become an unhandled rejection that takes
+        // the process down harder than the signal already would.
+        this.log.error({ err, signal }, 'error draining queue on signal')
+      })
+    }
+
+    for (const signal of signals) {
+      const handler = onSignal(signal)
+      process.once(signal, handler)
+      registered.push([signal, handler])
+    }
+
+    return () => {
+      for (const [signal, handler] of registered) {
+        process.removeListener(signal, handler)
+      }
+    }
+  }
+
+  /**
+   * The in-flight signal-triggered drain, if any. Exposed so a host can await
+   * the same drain its signal handler started instead of racing it.
+   */
+  get draining(): Promise<void> | null {
+    return this.signalDrain
   }
 
   /** Graceful shutdown. Stops processors and waits for active jobs. */
