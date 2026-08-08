@@ -257,10 +257,16 @@ export class DummyBackend implements IJobQueueBackend {
         .filter((j) => j.status === 'active' && j.dedupeKey)
         .map((j) => `${j.dedupeKey}|${j.dedupeScope ?? 'pending+active'}`),
     )
+    // `runAt` gate, mirroring Mongo's `{runAt: {$lte: now}}`. Without it a job
+    // enqueued with `delay` was claimable instantly here and correctly withheld
+    // in production, so a unit test could pass while the same logic misbehaved
+    // for real — which defeats the reason this backend exists.
+    const now = Date.now()
     const job = this.jobs.find(
       (j) =>
         j.type === type &&
         j.status === 'pending' &&
+        j.runAt.getTime() <= now &&
         !(
           j.dedupeKey &&
           activeSlots.has(`${j.dedupeKey}|${j.dedupeScope ?? 'pending+active'}`)

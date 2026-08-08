@@ -1,4 +1,17 @@
-/** Executes job handlers synchronously when enqueued. For integration tests. */
+/**
+ * Executes job handlers synchronously when enqueued. For integration tests.
+ *
+ * **`delay` is deliberately ignored.** Running the handler inline on enqueue is
+ * the entire point of this backend, and honouring a delay would mean either
+ * blocking the caller for the duration or deferring to a timer — at which point
+ * it is no longer immediate and no longer useful for the "assert the side effect
+ * happened" tests it exists to serve. `runAt` is therefore always now.
+ *
+ * This is a documented divergence from `MongoJobQueue` and `DummyBackend`, both
+ * of which withhold a job until it is due. A test that depends on delay
+ * semantics wants `DummyBackend` (for claim behaviour) or Mongo (for the real
+ * thing); this backend cannot model it honestly.
+ */
 import { randomUUID } from 'node:crypto'
 
 import {

@@ -9,7 +9,7 @@
  * Covered here at the pure-function and in-memory-backend level; the Mongo
  * implementation and its query plan are covered in MongoJobQueue.test.ts.
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { backlogAge } from '../src/backends/backlogAge'
 import { DummyBackend } from '../src/backends/DummyBackend'
@@ -116,11 +116,63 @@ describe('DummyBackend getStats: backlog age', () => {
   })
 })
 
-it('exposes a runAt honouring delay on the DummyBackend claim result', async () => {
+it('records a runAt honouring delay on the DummyBackend job', async () => {
   const backend = new DummyBackend()
   await backend.enqueue('sync', {}, { delay: 60_000 })
-  const claimed = await backend.claimNext('sync')
-  // claimNext used to report createdAt as runAt, which made a delayed job
-  // indistinguishable from a due one to any caller reading the claim result.
-  expect(claimed?.runAt.getTime()).toBeGreaterThan(at(30_000).getTime())
+  // Read the stored job rather than claiming it: a delayed job is correctly
+  // unclaimable now (see the runAt-on-claim suite below), so the claim result is
+  // no longer a way to observe this. RecordedJob previously had no runAt at all
+  // and claimNext substituted createdAt, which made a delayed job
+  // indistinguishable from a due one to any caller.
+  const [job] = backend.getJobsByType('sync')
+  expect(job?.runAt.getTime()).toBeGreaterThan(at(30_000).getTime())
+})
+
+describe('in-memory backends honour runAt on claim (du-cir)', () => {
+  /**
+   * DummyBackend used to filter only on {type, status: 'pending'}, while Mongo
+   * filters {type, status: 'pending', runAt: {$lte: now}}. So a delayed job was
+   * claimable instantly here and correctly withheld in production — meaning a
+   * unit test written against this backend could pass while the same logic
+   * misbehaved for real. The whole point of the interface is that job logic is
+   * testable without Mongo, and that only holds if the in-memory backends model
+   * the same semantics.
+   */
+  it('does not claim a job that is not yet due', async () => {
+    const backend = new DummyBackend()
+    await backend.enqueue('sync', { n: 1 }, { delay: 60_000 })
+
+    expect(await backend.claimNext('sync')).toBeNull()
+  })
+
+  it('claims the job once its runAt has passed', async () => {
+    vi.useFakeTimers()
+    try {
+      const backend = new DummyBackend()
+      await backend.enqueue('sync', { n: 1 }, { delay: 60_000 })
+      expect(await backend.claimNext('sync')).toBeNull()
+
+      vi.advanceTimersByTime(60_001)
+      const claimed = await backend.claimNext<{ n: number }>('sync')
+      expect(claimed?.data.n).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('skips a delayed job to claim a due one behind it', async () => {
+    const backend = new DummyBackend()
+    await backend.enqueue('sync', { late: true }, { delay: 60_000 })
+    await backend.enqueue('sync', { due: true })
+
+    const claimed = await backend.claimNext<{ due?: boolean }>('sync')
+    // A future-dated job must not block work that is ready now.
+    expect(claimed?.data.due).toBe(true)
+  })
+
+  it('claims undelayed jobs immediately, as before', async () => {
+    const backend = new DummyBackend()
+    await backend.enqueue('sync', { n: 1 })
+    expect(await backend.claimNext('sync')).not.toBeNull()
+  })
 })
