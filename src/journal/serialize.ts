@@ -8,7 +8,11 @@
  */
 import type { StepRecord } from '../types'
 
-import { JournalTooLarge, NonSerializableStepResult } from './errors'
+import {
+  JournalTooLarge,
+  NondeterminismError,
+  NonSerializableStepResult,
+} from './errors'
 
 /** Default cumulative-journal soft cap, well under Mongo's 16MB BSON limit. */
 export const DEFAULT_JOURNAL_SOFT_LIMIT_BYTES = 8_000_000
@@ -164,4 +168,32 @@ export function guardAppend(
 /** Journal read normalization: copy sorted by ascending `seq` (§3.6). */
 export function sortBySeq(steps: StepRecord[]): StepRecord[] {
   return [...steps].sort((a, b) => a.seq - b.seq)
+}
+
+/**
+ * Assert that a journaled step at this `seq` is the step the body is asking for.
+ *
+ * The rule — "a recorded step at this seq under a different name means the
+ * orchestrator body diverged" (§6) — was coded three independent times: on read
+ * in `octx.step()`, and at append time in both the in-memory journal and the
+ * Mongo adapter. Three copies of one invariant is three chances for them to
+ * drift apart, and a divergence check that disagrees with itself is worse than
+ * one that is merely strict.
+ *
+ * Pure: no IO, no backend dependency, so it is unit-testable without Mongo.
+ * Placement stays with the callers — `octx.step()` still fails fast on read,
+ * Mongo still classifies at append time inside its conditional write. Only the
+ * comparison is shared.
+ *
+ * @throws {NondeterminismError} when the names differ.
+ */
+export function assertStepMatches(
+  jobId: string,
+  seq: number,
+  recordedName: string,
+  expectedName: string,
+): void {
+  if (recordedName !== expectedName) {
+    throw new NondeterminismError(jobId, seq, recordedName, expectedName)
+  }
 }

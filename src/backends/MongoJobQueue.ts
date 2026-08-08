@@ -4,8 +4,9 @@ import { randomUUID } from 'node:crypto'
 import type { Collection, Db, Filter } from 'mongodb'
 
 import { defaultLogger, type Logger } from '../logger'
-import { JournalTooLarge, NondeterminismError } from '../journal/errors'
+import { JournalTooLarge } from '../journal/errors'
 import {
+  assertStepMatches,
   DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
   DEFAULT_MAX_LOG_ENTRIES,
   DEFAULT_MAX_LOG_MESSAGE_BYTES,
@@ -679,14 +680,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     existing: StepRecord,
     record: StepRecord,
   ): AppendStepResult {
-    if (existing.name !== record.name) {
-      throw new NondeterminismError(
-        jobId,
-        record.seq,
-        existing.name,
-        record.name,
-      )
-    }
+    assertStepMatches(jobId, record.seq, existing.name, record.name)
     return { status: 'already-recorded', existing }
   }
 

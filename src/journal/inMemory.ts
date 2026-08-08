@@ -13,8 +13,7 @@ import type {
   StepRecord,
 } from '../types'
 
-import { NondeterminismError } from './errors'
-import { guardAppend } from './serialize'
+import { assertStepMatches, guardAppend } from './serialize'
 
 /** Minimal shape an in-memory backend's job record must expose to the journal. */
 export interface JournalableJob {
@@ -54,14 +53,7 @@ export function appendStepInMemory(
   }
   const existing = job.steps.find((s) => s.seq === record.seq)
   if (existing) {
-    if (existing.name !== record.name) {
-      throw new NondeterminismError(
-        job.id,
-        record.seq,
-        existing.name,
-        record.name,
-      )
-    }
+    assertStepMatches(job.id, record.seq, existing.name, record.name)
     return { status: 'already-recorded', existing }
   }
   const incoming = guardAppend(record, job.journalBytes, softLimitBytes)

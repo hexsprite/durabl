@@ -19,6 +19,7 @@ import {
 import {
   approxRecordBytes,
   assertSerializable,
+  assertStepMatches,
   fromStored,
   guardAppend,
   toStored,
@@ -258,6 +259,45 @@ describe('context: deriveUuid determinism (bootstrap seed)', () => {
     expect(typeof u).toBe('string')
     expect(u).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+  })
+})
+
+describe('assertStepMatches (shared divergence predicate)', () => {
+  /**
+   * The rule was coded three times — on read in octx.step(), and at append time
+   * in both the in-memory journal and the Mongo adapter. Three copies of one
+   * invariant is three chances to drift, and a divergence check that disagrees
+   * with itself is worse than one that is merely strict. Pure, so it is testable
+   * without Mongo.
+   */
+  it('passes when the recorded name matches', () => {
+    expect(() => assertStepMatches('job-1', 3, 'charge', 'charge')).not.toThrow()
+  })
+
+  it('throws NondeterminismError when the names differ', () => {
+    expect(() => assertStepMatches('job-1', 3, 'charge', 'refund')).toThrow(
+      NondeterminismError,
+    )
+  })
+
+  it('reports the job, seq and both names so the divergence is diagnosable', () => {
+    try {
+      assertStepMatches('job-42', 7, 'recorded-step', 'expected-step')
+      expect.unreachable('should have thrown')
+    } catch (err) {
+      const e = err as NondeterminismError & { jobId?: string; seq?: number }
+      expect(e).toBeInstanceOf(NondeterminismError)
+      expect(e.message).toContain('7')
+      expect(e.message).toContain('recorded-step')
+      expect(e.message).toContain('expected-step')
+    }
+  })
+
+  it('treats names differing only by case as divergence', () => {
+    // Step names are identifiers, not prose: 'Charge' is not 'charge'.
+    expect(() => assertStepMatches('job-1', 0, 'Charge', 'charge')).toThrow(
+      NondeterminismError,
     )
   })
 })

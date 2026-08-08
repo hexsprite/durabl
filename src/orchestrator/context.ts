@@ -4,8 +4,8 @@
  */
 import { createHash, randomBytes } from 'node:crypto'
 
-import { NondeterminismError, StepTimeout } from '../journal/errors'
-import { fromStored, toStored } from '../journal/serialize'
+import { StepTimeout } from '../journal/errors'
+import { assertStepMatches, fromStored, toStored } from '../journal/serialize'
 import type {
   AppendStepResult,
   HeartbeatClaimedResult,
@@ -178,10 +178,9 @@ export function buildContext<T>(args: BuildContextArgs<T>): OrchestratorContext 
 
     const recorded = journalBySeq.get(seq)
     if (recorded) {
-      if (recorded.name !== name) {
-        // Divergence detected on resume → fatal (§6).
-        throw new NondeterminismError(job.id, seq, recorded.name, name)
-      }
+      // Divergence detected on resume → fatal (§6). Shared predicate so the
+      // read-time and append-time checks cannot drift apart.
+      assertStepMatches(job.id, seq, recorded.name, name)
       return fromStored(recorded.result) as R
     }
 
