@@ -463,13 +463,57 @@ export class MongoJobQueue implements IJobQueueBackend {
       // a fast-failing handler can't burn every attempt in milliseconds and a
       // downstream outage doesn't become an instant-retry storm.
       const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
-      const res = await this.collection.updateOne(filter, {
-        $set: { status: 'pending' as JobStatus, failReason: reason, runAt },
-        ...this.logWrite(`Attempt failed: ${reason}`, now),
-      })
-      matchedCount = res.matchedCount
+      try {
+        const res = await this.collection.updateOne(filter, {
+          $set: { status: 'pending' as JobStatus, failReason: reason, runAt },
+          ...this.logWrite(`Attempt failed: ${reason}`, now),
+        })
+        matchedCount = res.matchedCount
+      } catch (err) {
+        if (dedupeKeyFromDuplicateError(err) === null) throw err
+        // Returning this job to `pending` would put two pending docs under one
+        // dedupe key, which `dedupe_pending_idx` forbids. That happens exactly
+        // in the case `dedupeScope: 'pending'` exists to allow: a follow-up was
+        // queued behind this run while it was active.
+        //
+        // The queued follow-up already represents the work, so retrying this
+        // document would duplicate it. Retire this one instead.
+        //
+        // It must not be left to propagate: `processJob` catches a failing
+        // `fail()`, logs, and moves on — leaving the job `active` forever. The
+        // reaper's requeue path performs the same write and would throw the
+        // same way, so nothing could ever recover it, and the job would hold
+        // its dedupeKey permanently.
+        matchedCount = await this.retireCoalesced(filter, reason, now)
+      }
     }
     return claimToken && matchedCount !== 1 ? 'lease-lost' : 'applied'
+  }
+
+  /**
+   * Mark a job terminal because a pending job under the same dedupe key already
+   * covers its work. Used when a requeue would violate a dedupe index.
+   *
+   * Terminal rather than deleted: the failure stays observable, and the reason
+   * says why this attempt stopped so an operator does not read it as work lost.
+   *
+   * @returns matchedCount, so callers can apply the usual lease-fence check.
+   */
+  private async retireCoalesced(
+    filter: Filter<JobDoc>,
+    reason: string,
+    now: Date,
+  ): Promise<number> {
+    const note = `${reason} (coalesced: a queued follow-up already covers this work)`
+    const res = await this.collection.updateOne(filter, {
+      $set: {
+        status: 'failed' as JobStatus,
+        failReason: note,
+        failedAt: now,
+      },
+      ...this.logWrite(`Attempt failed, coalesced: ${reason}`, now),
+    })
+    return res.matchedCount
   }
 
   async failFatal(
@@ -795,13 +839,29 @@ export class MongoJobQueue implements IJobQueueBackend {
         )
       } else {
         const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
-        await this.collection.updateOne(
-          { _id: job._id, status: 'active' },
-          {
-            $set: { status: 'pending' as JobStatus, runAt },
-            ...this.logWrite('Recovered (stalled)', now),
-          },
-        )
+        try {
+          await this.collection.updateOne(
+            { _id: job._id, status: 'active' },
+            {
+              $set: { status: 'pending' as JobStatus, runAt },
+              ...this.logWrite('Recovered (stalled)', now),
+            },
+          )
+        } catch (err) {
+          if (dedupeKeyFromDuplicateError(err) === null) throw err
+          // Same collision as in `fail()`: a follow-up is already queued under
+          // this dedupe key, so returning this one to `pending` is forbidden and
+          // unnecessary. Retire it so the active slot frees.
+          //
+          // Without this the reaper threw on every sweep for this job, so a
+          // stalled job whose key had a queued follow-up could never be
+          // recovered by anything — it held the key forever.
+          await this.retireCoalesced(
+            { _id: job._id, status: 'active' },
+            'Stalled',
+            now,
+          )
+        }
       }
       handled++
     }
