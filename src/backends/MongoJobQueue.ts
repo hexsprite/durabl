@@ -1,7 +1,7 @@
 /** MongoJobQueue - MongoDB-backed durable job queue. */
 import { randomUUID } from 'node:crypto'
 
-import type { Collection, Db } from 'mongodb'
+import type { Collection, Db, Filter } from 'mongodb'
 
 import { defaultLogger, type Logger } from '../logger'
 import { JournalTooLarge, NondeterminismError } from '../journal/errors'
@@ -70,6 +70,41 @@ type JobAvailableListener = (type: string) => void
  * up on the next reaper tick.
  */
 const DEFAULT_REAPER_BATCH_SIZE = 1000
+
+/**
+ * How many dedupe-blocked candidates one {@link MongoJobQueue.claimNext} call
+ * will step over before yielding to the poll loop.
+ *
+ * Each skip costs a round trip, so an unbounded loop turns one claim into an
+ * unbounded number of them precisely when the queue is most contended. Yielding
+ * is cheap and safe: the poll loop returns shortly, and a key that frees up in
+ * the meantime is claimable then.
+ */
+const MAX_DEDUPE_SKIPS = 20
+
+/**
+ * The `dedupeKey` a duplicate-key error was raised on, or `null` if this is not
+ * a dedupe-index violation and therefore not ours to swallow.
+ *
+ * Reads the driver's structured `keyValue` rather than parsing the message —
+ * message text is not a stable interface, and a partial parse would silently
+ * turn a real error into a skipped candidate. A duplicate key on any other
+ * index is a genuine fault and must propagate.
+ */
+function dedupeKeyFromDuplicateError(err: unknown): string | null {
+  if (!err || typeof err !== 'object') return null
+  const e = err as {
+    code?: unknown
+    keyValue?: Record<string, unknown>
+    keyPattern?: Record<string, unknown>
+  }
+  if (e.code !== 11000) return null
+  const key = e.keyValue?.dedupeKey ?? null
+  if (typeof key !== 'string') return null
+  // Guard against a same-named field on some unrelated future index.
+  if (e.keyPattern && !('dedupeKey' in e.keyPattern)) return null
+  return key
+}
 
 /**
  * Does this driver/server error mean "the resulting document exceeds the BSON
@@ -285,24 +320,66 @@ export class MongoJobQueue implements IJobQueueBackend {
 
   async claimNext<T>(type: string): Promise<Job<T> | null> {
     const now = new Date()
-    const doc = await this.collection.findOneAndUpdate(
-      { type, status: 'pending', runAt: { $lte: now } },
-      {
-        // Mint a fresh per-claim lease nonce. All orchestration fencing keys on
-        // this, not on `attempt` (R8) — an admin/manual re-activation that does
-        // not bump `attempt` would otherwise silently break the fence.
-        $set: {
-          status: 'active' as JobStatus,
-          claimedAt: now,
-          claimToken: randomUUID(),
-        },
-        $inc: { attempt: 1 },
-      },
-      { sort: { priority: 1, runAt: 1 }, returnDocument: 'after' },
+    // dedupeKeys whose active slot is already taken, discovered as we go. The
+    // sort picks the best candidate; if that candidate's key is held, it would
+    // win the sort again on every retry, so it has to be excluded explicitly or
+    // the loop spins on it.
+    const blockedKeys: string[] = []
+
+    for (let attempt = 0; attempt <= MAX_DEDUPE_SKIPS; attempt++) {
+      const filter: Filter<JobDoc> = {
+        type,
+        status: 'pending',
+        runAt: { $lte: now },
+        ...(blockedKeys.length ? { dedupeKey: { $nin: blockedKeys } } : {}),
+      }
+
+      try {
+        const doc = await this.collection.findOneAndUpdate(
+          filter,
+          {
+            // Mint a fresh per-claim lease nonce. All orchestration fencing keys
+            // on this, not on `attempt` (R8) — an admin/manual re-activation
+            // that does not bump `attempt` would otherwise silently break the
+            // fence.
+            $set: {
+              status: 'active' as JobStatus,
+              claimedAt: now,
+              claimToken: randomUUID(),
+            },
+            $inc: { attempt: 1 },
+          },
+          { sort: { priority: 1, runAt: 1 }, returnDocument: 'after' },
+        )
+        // includeClaimToken: the claim path is the one reader allowed to see the
+        // live fencing token (processJob fences lifecycle writes with it).
+        return doc ? jobDocToJob(doc as JobDoc<T>, true) : null
+      } catch (err) {
+        // A dedupe index rejected the pending -> active transition: another job
+        // with this dedupeKey is already active. That is the `pending` scope
+        // working as designed (at most one active per key), not a failure —
+        // there is simply nothing claimable under this key right now.
+        //
+        // It must not propagate. `JobQueue.claimAndProcess` treats any throw
+        // from here as a backend failure and applies exponential backoff to the
+        // ProcessorState, which is keyed on job TYPE — so one contended key
+        // would stall the poll loop for every other key of that type, with the
+        // delay doubling to a minute, while logging errors on a healthy queue.
+        const key = dedupeKeyFromDuplicateError(err)
+        if (key === null) throw err
+        blockedKeys.push(key)
+      }
+    }
+
+    // Exhausted the skip budget. Unbounded retrying would turn one claim into
+    // an unbounded number of round trips on a deeply contended backlog, so we
+    // yield instead: the poll loop comes back, and any key that frees up in the
+    // meantime is claimable then.
+    this.logger.debug(
+      { type, blocked: blockedKeys.length },
+      'claimNext yielded: dedupe-blocked candidates exceeded skip budget',
     )
-    // includeClaimToken: the claim path is the one reader allowed to see the
-    // live fencing token (processJob fences lifecycle writes with it).
-    return doc ? jobDocToJob(doc as JobDoc<T>, true) : null
+    return null
   }
 
   /**
