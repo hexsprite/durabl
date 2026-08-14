@@ -102,7 +102,7 @@ export interface Job<T = unknown> {
 
 /**
  * Handle returned by claimOrEnqueue() for inline job execution.
- * Allows caller to complete/fail the job after running their code.
+ * Lifecycle writes are lease-fenced with the claim token.
  */
 export interface JobHandle<T = unknown> {
   id: string
@@ -110,6 +110,23 @@ export interface JobHandle<T = unknown> {
   complete(): Promise<void>
   fail(reason: string): Promise<void>
   log(message: string): void
+  /**
+   * Extend the inline lease. Stop work if this returns `lease-lost`.
+   *
+   * Optional for source compatibility with custom 0.2.x backends. Durabl's
+   * built-in backends return {@link LeaseAwareJobHandle}.
+   */
+  heartbeat?(): Promise<LifecycleWriteResult>
+}
+
+/** Inline handle returned by Durabl backends, with lease renewal support. */
+export interface LeaseAwareJobHandle<T = unknown> extends JobHandle<T> {
+  heartbeat(): Promise<LifecycleWriteResult>
+}
+
+/** A handle capability with its payload specialized to one enqueue call. */
+export type JobHandleFor<Handle extends JobHandle, T> = Omit<Handle, 'data'> & {
+  data: T
 }
 
 /**

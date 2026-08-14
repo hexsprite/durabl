@@ -21,7 +21,7 @@ I stole the good ideas (pluggable backends from Django's task framework, the ded
 
 - **Atomic claim.** `findOneAndUpdate` on pending, due jobs sorted by priority. The MongoDB equivalent of `SELECT ... FOR UPDATE SKIP LOCKED`: two workers never claim the same job.
 - **Visibility-timeout leases.** A claimed job is leased, not removed. Handlers heartbeat to extend the lease, and a reaper returns jobs from dead workers to `pending`.
-- **Retries with attempt caps and backoff.** Failed jobs go back to `pending` with a jittered backoff delay until `maxAttempts`, then land in a terminal `failed` state. `failFatal()` skips retries for unrecoverable errors.
+- **Retries with attempt caps and backoff.** Failed jobs go back to `pending` with a jittered backoff delay until `maxAttempts`, then land in a terminal `failed` state. If a pending-scope follow-up already occupies that slot, it becomes the retry survivor and inherits the consumed attempt and delay. `failFatal()` skips retries for unrecoverable errors.
 - **Delayed and prioritized scheduling.** `runAt` delays a job; lower `priority` numbers run first.
 - **Dedupe keys, two scopes.** `pending+active` blocks any duplicate. `pending` allows one pending behind one active, which gives you single-flight coalescing: run now, queue at most one more.
 - **Push/poll hybrid.** Rides MongoDB change streams for sub-100ms pickup, with a reconnect catch-up sentinel so jobs that land during a stream blip aren't missed. Degrades cleanly to polling when change streams are off or unavailable.
@@ -121,6 +121,14 @@ if (handle) {
 // the single follow-up queued behind them — the poll loop will run it.
 ```
 
+A `JobQueue` constructed with a Durabl built-in backend returns a
+`LeaseAwareJobHandle`. Inline work must heartbeat before the queue's visibility
+timeout expires. Call `handle.heartbeat()` on a cadence suitable for the
+configured lease, and stop the work if it returns `'lease-lost'`; another worker
+now owns the job. `heartbeat` remains optional on the base `JobHandle` type so
+custom backends built against Durabl 0.2.x stay source-compatible. `JobQueue`
+preserves the handle capability supplied by its backend.
+
 Exactly what `null` means, per scope:
 
 | scope | a run is already active | a run is already queued |
@@ -175,16 +183,28 @@ expect(t.steps.map((s) => s.name)).toEqual(['create-sub', 'sync'])
 
 ## API sketch
 
-```typescript
-class JobQueue {
+class JobQueue<Handle extends JobHandle = JobHandle> {
   enqueue<T>(type, data, options?): Promise<string | null>
-  claimOrEnqueue<T>(type, data, options?): Promise<JobHandle<T> | null>
+  claimOrEnqueue<T>(type, data, options?): Promise<JobHandleFor<Handle, T> | null>
   process<T>(type, handler, config?): void
   getStats(type?): Promise<QueueStats>
   startup(): Promise<void>
   startReaper(intervalMs?): void   // sweep with the queue's visibilityTimeoutMs
   stopReaper(): void
   shutdown(timeoutMs?): Promise<void>
+}
+
+interface JobHandle<T> {
+  id: string
+  data: T
+  complete(): Promise<void>
+  fail(reason: string): Promise<void>
+  log(message: string): void
+  heartbeat?(): Promise<'applied' | 'lease-lost'>
+}
+
+interface LeaseAwareJobHandle<T> extends JobHandle<T> {
+  heartbeat(): Promise<'applied' | 'lease-lost'>
 }
 
 interface EnqueueOptions {

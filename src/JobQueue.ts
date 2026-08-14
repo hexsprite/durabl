@@ -11,6 +11,7 @@ import type {
   Job,
   JobContext,
   JobHandle,
+  JobHandleFor,
   JobHandler,
   ProcessorConfig,
   QueueStats,
@@ -55,8 +56,8 @@ export interface JobQueueOptions {
   visibilityTimeoutMs?: number
 }
 
-export class JobQueue {
-  private backend: IJobQueueBackend
+export class JobQueue<Handle extends JobHandle = JobHandle> {
+  private backend: IJobQueueBackend<Handle>
   private log: Logger
   private processors: Map<string, ProcessorState> = new Map()
   private isShuttingDown = false
@@ -74,7 +75,7 @@ export class JobQueue {
   readonly visibilityTimeoutMs: number
 
   constructor(
-    backend: IJobQueueBackend,
+    backend: IJobQueueBackend<Handle>,
     logger: Logger = defaultLogger,
     options: JobQueueOptions = {},
   ) {
@@ -116,7 +117,7 @@ export class JobQueue {
     type: string,
     data: T,
     options?: EnqueueOptions,
-  ): Promise<JobHandle<T> | null> {
+  ): Promise<JobHandleFor<Handle, T> | null> {
     return this.backend.claimOrEnqueue(type, data, options)
   }
 

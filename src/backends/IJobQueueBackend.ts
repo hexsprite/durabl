@@ -13,12 +13,13 @@ import type {
   HeartbeatClaimedResult,
   Job,
   JobHandle,
+  JobHandleFor,
   LifecycleWriteResult,
   QueueStats,
   StepRecord,
 } from '../types'
 
-export interface IJobQueueBackend {
+export interface IJobQueueBackend<Handle extends JobHandle = JobHandle> {
   /**
    * True for backends that execute enqueued jobs *inline* through their own
    * handler registry (see `ImmediateBackend.registerHandler`) instead of the
@@ -49,7 +50,7 @@ export interface IJobQueueBackend {
     type: string,
     data: T,
     options?: EnqueueOptions,
-  ): Promise<JobHandle<T> | null>
+  ): Promise<JobHandleFor<Handle, T> | null>
 
   /**
    * Claim the next available job for processing.

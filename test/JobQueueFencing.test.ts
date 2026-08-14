@@ -8,11 +8,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { DummyBackend } from '../src/backends/DummyBackend'
 import { JobQueue } from '../src/JobQueue'
+import type { LeaseAwareJobHandle } from '../src/types'
 import { silentLogger } from './testLogger'
 import { waitUntil } from './waitUntil'
 
 let backend: DummyBackend
-let queue: JobQueue
+let queue: JobQueue<LeaseAwareJobHandle>
 
 beforeEach(() => {
   backend = new DummyBackend()
@@ -111,5 +112,11 @@ describe('JobQueue lifecycle fencing (zombie worker)', () => {
       () => backend.jobs.find((j) => j.id === id)?.status === 'completed',
     )
     expect(backend.jobs.find((j) => j.id === id)!.status).toBe('completed')
+  })
+
+  it('claimOrEnqueue exposes a lease-aware handle through JobQueue', async () => {
+    const handle = await queue.claimOrEnqueue('inline', {})
+
+    expect(await handle!.heartbeat()).toBe('applied')
   })
 })

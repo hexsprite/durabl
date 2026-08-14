@@ -121,6 +121,32 @@ describe('MongoJobQueue', () => {
       const job = await collection.findOne({ _id: handle!.id })
       expect(job!.status).toBe('failed')
     })
+
+    it('handle.heartbeat() extends the inline lease', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+      const oldClaimedAt = new Date(0)
+      await collection.updateOne(
+        { _id: handle!.id },
+        { $set: { claimedAt: oldClaimedAt } },
+      )
+
+      expect(await handle!.heartbeat()).toBe('applied')
+      const job = await collection.findOne({ _id: handle!.id })
+      expect(job!.claimedAt!.getTime()).toBeGreaterThan(oldClaimedAt.getTime())
+    })
+
+    it('handle.heartbeat() reports a lost inline lease', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+      const reclaimedAt = new Date(0)
+      await collection.updateOne(
+        { _id: handle!.id },
+        { $set: { claimToken: 'new-owner', claimedAt: reclaimedAt } },
+      )
+
+      expect(await handle!.heartbeat()).toBe('lease-lost')
+      const job = await collection.findOne({ _id: handle!.id })
+      expect(job!.claimedAt).toEqual(reclaimedAt)
+    })
   })
 
   describe('claimNext()', () => {

@@ -44,6 +44,8 @@ export type {
   JobContext,
   JobDoc,
   JobHandle,
+  JobHandleFor,
+  LeaseAwareJobHandle,
   JobHandler,
   JobStatus,
   LifecycleWriteResult,

@@ -1,7 +1,7 @@
 /** MongoJobQueue - MongoDB-backed durable job queue. */
 import { randomUUID } from 'node:crypto'
 
-import type { Collection, Db } from 'mongodb'
+import type { Collection, Db, Filter } from 'mongodb'
 
 import { defaultLogger, type Logger } from '../logger'
 import { JournalTooLarge, NondeterminismError } from '../journal/errors'
@@ -22,7 +22,7 @@ import {
   type Job,
   type JobDoc,
   jobDocToJob,
-  type JobHandle,
+  type LeaseAwareJobHandle,
   type JobStatus,
   type LifecycleWriteResult,
   type QueueStats,
@@ -71,6 +71,47 @@ type JobAvailableListener = (type: string) => void
  */
 const DEFAULT_REAPER_BATCH_SIZE = 1000
 
+interface DedupeIdentity {
+  dedupeKey: string
+  dedupeScope: DedupeScope
+}
+
+/**
+ * The dedupe identity a duplicate-key error was raised on, or `null` if this
+ * is not a dedupe-index violation and therefore not ours to swallow.
+ *
+ * Reads the driver's structured `keyValue` rather than parsing the message —
+ * message text is not a stable interface, and a partial parse would silently
+ * turn a real error into a skipped candidate. A duplicate key on any other
+ * index is a genuine fault and must propagate.
+ */
+function dedupeIdentityFromDuplicateError(
+  err: unknown,
+): DedupeIdentity | null {
+  if (!err || typeof err !== 'object') return null
+  const e = err as {
+    code?: unknown
+    keyValue?: Record<string, unknown>
+    keyPattern?: Record<string, unknown>
+  }
+  if (e.code !== 11000) return null
+  const dedupeKey = e.keyValue?.dedupeKey
+  const dedupeScope = e.keyValue?.dedupeScope
+  if (
+    typeof dedupeKey !== 'string' ||
+    (dedupeScope !== 'pending' && dedupeScope !== 'pending+active')
+  ) {
+    return null
+  }
+  if (
+    e.keyPattern &&
+    (!('dedupeKey' in e.keyPattern) || !('dedupeScope' in e.keyPattern))
+  ) {
+    return null
+  }
+  return { dedupeKey, dedupeScope }
+}
+
 /**
  * Does this driver/server error mean "the resulting document exceeds the BSON
  * size cap"? Matched robustly across server/driver versions. Observed in the
@@ -92,7 +133,7 @@ function isBsonTooLargeError(err: unknown): boolean {
   )
 }
 
-export class MongoJobQueue implements IJobQueueBackend {
+export class MongoJobQueue implements IJobQueueBackend<LeaseAwareJobHandle> {
   private db: Db
   private collection: Collection<JobDoc>
   private useChangeStreams: boolean
@@ -233,7 +274,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     type: string,
     data: T,
     options: EnqueueOptions = {},
-  ): Promise<JobHandle<T> | null> {
+  ): Promise<LeaseAwareJobHandle<T> | null> {
     const now = new Date()
     const dedupeScope: DedupeScope = options.dedupeScope ?? 'pending+active'
 
@@ -285,24 +326,55 @@ export class MongoJobQueue implements IJobQueueBackend {
 
   async claimNext<T>(type: string): Promise<Job<T> | null> {
     const now = new Date()
-    const doc = await this.collection.findOneAndUpdate(
-      { type, status: 'pending', runAt: { $lte: now } },
-      {
-        // Mint a fresh per-claim lease nonce. All orchestration fencing keys on
-        // this, not on `attempt` (R8) — an admin/manual re-activation that does
-        // not bump `attempt` would otherwise silently break the fence.
-        $set: {
-          status: 'active' as JobStatus,
-          claimedAt: now,
-          claimToken: randomUUID(),
-        },
-        $inc: { attempt: 1 },
+    // Dedupe identities whose active slot is already taken, discovered as we
+    // go. The sort picks the best candidate; if that identity is held, it would
+    // win again on every retry, so it must be excluded explicitly.
+    const blocked: DedupeIdentity[] = []
+    // Failed duplicate-key updates roll back, so one token can fence whichever
+    // candidate this call eventually claims.
+    const claimUpdate = {
+      $set: {
+        status: 'active' as JobStatus,
+        claimedAt: now,
+        claimToken: randomUUID(),
       },
-      { sort: { priority: 1, runAt: 1 }, returnDocument: 'after' },
-    )
-    // includeClaimToken: the claim path is the one reader allowed to see the
-    // live fencing token (processJob fences lifecycle writes with it).
-    return doc ? jobDocToJob(doc as JobDoc<T>, true) : null
+      $inc: { attempt: 1 },
+    }
+
+    while (true) {
+      const filter: Filter<JobDoc> = {
+        type,
+        status: 'pending',
+        runAt: { $lte: now },
+        ...(blocked.length ? { $nor: blocked } : {}),
+      }
+
+      try {
+        const doc = await this.collection.findOneAndUpdate(
+          filter,
+          claimUpdate,
+          { sort: { priority: 1, runAt: 1 }, returnDocument: 'after' },
+        )
+        // includeClaimToken: the claim path is the one reader allowed to see the
+        // live fencing token (processJob fences lifecycle writes with it).
+        return doc ? jobDocToJob(doc as JobDoc<T>, true) : null
+      } catch (err) {
+        // A dedupe index rejected the pending -> active transition: another job
+        // with this dedupeKey is already active. That is the `pending` scope
+        // working as designed (at most one active per key), not a failure —
+        // there is simply nothing claimable under this key right now.
+        //
+        // It must not propagate. `JobQueue.claimAndProcess` treats any throw
+        // from here as a backend failure and applies exponential backoff to the
+        // ProcessorState, which is keyed on job TYPE — so one contended key
+        // would stall the poll loop for every other key of that type, with the
+        // delay doubling to a minute, while logging errors on a healthy queue.
+        const identity = dedupeIdentityFromDuplicateError(err)
+        if (identity === null) throw err
+        blocked.push(identity)
+      }
+    }
+
   }
 
   /**
@@ -386,13 +458,96 @@ export class MongoJobQueue implements IJobQueueBackend {
       // a fast-failing handler can't burn every attempt in milliseconds and a
       // downstream outage doesn't become an instant-retry storm.
       const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
-      const res = await this.collection.updateOne(filter, {
-        $set: { status: 'pending' as JobStatus, failReason: reason, runAt },
-        ...this.logWrite(`Attempt failed: ${reason}`, now),
-      })
-      matchedCount = res.matchedCount
+      try {
+        const res = await this.collection.updateOne(filter, {
+          $set: { status: 'pending' as JobStatus, failReason: reason, runAt },
+          ...this.logWrite(`Attempt failed: ${reason}`, now),
+        })
+        matchedCount = res.matchedCount
+      } catch (err) {
+        if (dedupeIdentityFromDuplicateError(err) === null) throw err
+        // Returning this job to `pending` would put two pending docs under one
+        // dedupe key, which `dedupe_pending_idx` forbids. That happens exactly
+        // in the case `dedupeScope: 'pending'` exists to allow: a follow-up was
+        // queued behind this run while it was active.
+        //
+        // The queued follow-up already represents the work, so retrying this
+        // document would duplicate it. Retire this one instead.
+        //
+        // It must not be left to propagate: `processJob` catches a failing
+        // `fail()`, logs, and moves on — leaving the job `active` forever. The
+        // reaper's requeue path performs the same write and would throw the
+        // same way, so nothing could ever recover it, and the job would hold
+        // its dedupeKey permanently.
+        matchedCount = await this.retireCoalesced(
+          filter,
+          job,
+          reason,
+          now,
+          runAt,
+        )
+      }
     }
     return claimToken && matchedCount !== 1 ? 'lease-lost' : 'applied'
+  }
+
+  /**
+   * The pending follower becomes the retry survivor when the active document
+   * cannot return to pending. Preserve the consumed attempt and delay so steady
+   * traffic cannot bypass retry caps or turn an outage into a retry storm.
+   */
+  private async carryRetryToFollowUp(
+    job: JobDoc,
+    runAt: Date,
+  ): Promise<void> {
+    if (!job.dedupeKey || job.dedupeScope !== 'pending') return
+    await this.collection.updateOne(
+      {
+        dedupeKey: job.dedupeKey,
+        dedupeScope: 'pending',
+        status: 'pending',
+      },
+      { $max: { attempt: job.attempt, runAt } },
+    )
+  }
+
+  /**
+   * Mark an active job terminal because its pending follower covers the retry.
+   *
+   * First replace the lease token under the caller's fence. The active index
+   * keeps the follower unclaimable while its retry budget is updated. If the
+   * lease changed after the failed requeue, this lock misses and no follower
+   * state changes.
+   *
+   * @returns matchedCount, so callers can apply the usual lease-fence check.
+   */
+  private async retireCoalesced(
+    filter: Filter<JobDoc>,
+    job: JobDoc,
+    reason: string,
+    now: Date,
+    runAt: Date,
+  ): Promise<number> {
+    const retirementToken = randomUUID()
+    const lock = await this.collection.updateOne(filter, {
+      $set: { claimToken: retirementToken, claimedAt: now },
+    })
+    if (lock.matchedCount !== 1) return 0
+
+    await this.carryRetryToFollowUp(job, runAt)
+    const note = `${reason} (coalesced: a queued follow-up already covers this work)`
+    const res = await this.collection.updateOne(
+      { _id: job._id, status: 'active', claimToken: retirementToken },
+      {
+        $set: {
+          status: 'failed' as JobStatus,
+          failReason: note,
+          failedAt: now,
+        },
+        ...this.logWrite(`Attempt failed, coalesced: ${reason}`, now),
+      },
+    )
+    return res.matchedCount
   }
 
   async failFatal(
@@ -681,10 +836,17 @@ export class MongoJobQueue implements IJobQueueBackend {
     for await (const job of cursor) {
       const now = new Date()
       const exhausted = job.attempt >= job.maxAttempts
+      const leaseFilter: Filter<JobDoc> = {
+        _id: job._id,
+        status: 'active',
+        claimedAt: job.claimedAt,
+        ...(job.claimToken ? { claimToken: job.claimToken } : {}),
+      }
+      let matchedCount = 0
 
       if (exhausted) {
-        await this.collection.updateOne(
-          { _id: job._id, status: 'active' },
+        const result = await this.collection.updateOne(
+          leaseFilter,
           {
             $set: {
               status: 'failed' as JobStatus,
@@ -694,17 +856,37 @@ export class MongoJobQueue implements IJobQueueBackend {
             ...this.logWrite('Stalled — retries exhausted', now),
           },
         )
+        matchedCount = result.matchedCount
       } else {
         const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
-        await this.collection.updateOne(
-          { _id: job._id, status: 'active' },
-          {
-            $set: { status: 'pending' as JobStatus, runAt },
-            ...this.logWrite('Recovered (stalled)', now),
-          },
-        )
+        try {
+          const result = await this.collection.updateOne(
+            leaseFilter,
+            {
+              $set: { status: 'pending' as JobStatus, runAt },
+              ...this.logWrite('Recovered (stalled)', now),
+            },
+          )
+          matchedCount = result.matchedCount
+        } catch (err) {
+          if (dedupeIdentityFromDuplicateError(err) === null) throw err
+          // Same collision as in `fail()`: a follow-up is already queued under
+          // this dedupe key, so returning this one to `pending` is forbidden and
+          // unnecessary. Retire it so the active slot frees.
+          //
+          // Without this the reaper threw on every sweep for this job, so a
+          // stalled job whose key had a queued follow-up could never be
+          // recovered by anything — it held the key forever.
+          matchedCount = await this.retireCoalesced(
+            leaseFilter,
+            job,
+            'Stalled',
+            now,
+            runAt,
+          )
+        }
       }
-      handled++
+      handled += matchedCount
     }
     return handled
   }
@@ -731,7 +913,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     jobId: string,
     data: T,
     claimToken?: string,
-  ): JobHandle<T> {
+  ): LeaseAwareJobHandle<T> {
     return {
       id: jobId,
       data,
@@ -741,6 +923,7 @@ export class MongoJobQueue implements IJobQueueBackend {
       fail: async (reason: string) => {
         await this.fail(jobId, reason, claimToken)
       },
+      heartbeat: () => this.heartbeat(jobId, claimToken),
       log: (msg: string) => {
         // See JobQueue.createContext: an uncaught rejection here would kill
         // the process over a dropped log line.

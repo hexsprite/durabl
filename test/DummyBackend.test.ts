@@ -87,6 +87,15 @@ describe('DummyBackend', () => {
       expect(backend.jobs[0].logs).toContain('Failed: something broke')
     })
 
+    it('handle.heartbeat() is lease-fenced', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+      expect(await handle!.heartbeat()).toBe('applied')
+
+      const stored = backend.jobs.find((job) => job.id === handle!.id)!
+      stored.claimToken = 'new-owner-token'
+      expect(await handle!.heartbeat()).toBe('lease-lost')
+    })
+
     it('handle.log() adds log entry', async () => {
       const handle = await backend.claimOrEnqueue('job', {})
       handle!.log('processing started')
@@ -182,6 +191,36 @@ describe('DummyBackend', () => {
 
       const job = await backend.claimNext('job')
       expect(job).toBeNull()
+    })
+
+    it('skips a pending-scope follow-up while its key is active', async () => {
+      const options = {
+        dedupeKey: 'blocked',
+        dedupeScope: 'pending' as const,
+      }
+      await backend.claimOrEnqueue('job', { key: 'blocked' }, options)
+      await backend.enqueue('job', { key: 'blocked' }, options)
+      await backend.enqueue('job', { key: 'free' }, {
+        dedupeKey: 'free',
+        dedupeScope: 'pending',
+      })
+
+      const job = await backend.claimNext<{ key: string }>('job')
+      expect(job?.data.key).toBe('free')
+    })
+
+    it('does not block the same key in an independent dedupe scope', async () => {
+      await backend.claimOrEnqueue('job', { scope: 'pending+active' }, {
+        dedupeKey: 'shared',
+        dedupeScope: 'pending+active',
+      })
+      await backend.enqueue('job', { scope: 'pending' }, {
+        dedupeKey: 'shared',
+        dedupeScope: 'pending',
+      })
+
+      const job = await backend.claimNext<{ scope: string }>('job')
+      expect(job?.data.scope).toBe('pending')
     })
   })
 

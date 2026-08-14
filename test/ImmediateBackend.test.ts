@@ -157,6 +157,15 @@ describe('ImmediateBackend', () => {
       expect(stats.failed).toBe(1)
     })
 
+    it('handle.heartbeat() is lease-fenced', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+      expect(await handle!.heartbeat()).toBe('applied')
+
+      await handle!.fail('lease expired')
+      await backend.claimNext('job')
+      expect(await handle!.heartbeat()).toBe('lease-lost')
+    })
+
     it('returns null when pending job exists with same dedupeKey', async () => {
       // Register a handler that fails, putting job back to pending
       backend.registerHandler('job', async (_job, ctx) => {
