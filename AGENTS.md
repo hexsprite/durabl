@@ -48,7 +48,7 @@ Two layers, split on purpose:
 - **Dedupe** is enforced by a unique *partial* index (`src/backends/mongoJobIndexes.ts`), not application logic. Two scopes:
   - `pending+active` (default) — blocks any duplicate.
   - `pending` — allows one pending behind one active = single-flight coalescing. This is what `claimOrEnqueue` uses to replace a distributed lock.
-- **Leases, not deletes.** A claimed job is `active` with a visibility timeout. Handlers `heartbeat()` to extend; a reaper returns dead-worker jobs to `pending`.
+- **Leases, not deletes.** A claimed job is `active` with a visibility timeout. `JobQueue` heartbeats managed runs. The reaper returns dead-worker jobs to `pending`.
 - **Job-level durability only.** No step replay. A handler that crashes halfway retries from the top. Don't add checkpointing without a deliberate decision — it's explicitly out of scope.
 
 ### Push/poll hybrid (`MongoChangeStreamWatcher`)

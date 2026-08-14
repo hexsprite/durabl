@@ -23,13 +23,14 @@ I stole the good ideas (pluggable backends from Django's task framework, the ded
 
 ## Features
 
-- **Atomic claim.** `findOneAndUpdate` on pending, due jobs sorted by priority. The MongoDB equivalent of `SELECT ... FOR UPDATE SKIP LOCKED`: two workers never claim the same job.
-- **Visibility-timeout leases.** A claimed job is leased, not removed. Handlers heartbeat to extend the lease, and a reaper returns jobs from dead workers to `pending`.
-- **Retries with attempt caps and backoff.** Failed jobs go back to `pending` with a jittered backoff delay until `maxAttempts`, then land in a terminal `failed` state. `failFatal()` skips retries for unrecoverable errors.
-- **Delayed and prioritized scheduling.** `runAt` delays a job; lower `priority` numbers run first.
-- **Dedupe keys, two scopes.** `pending+active` blocks any duplicate. `pending` allows one pending behind one active, which gives you single-flight coalescing: run now, queue at most one more.
-- **Push/poll hybrid.** Rides MongoDB change streams for sub-100ms pickup, with a reconnect catch-up sentinel so jobs that land during a stream blip aren't missed. Degrades cleanly to polling when change streams are off or unavailable.
-- **Pluggable backends.** One interface, three implementations: `MongoJobQueue` for production, plus `DummyBackend` (records calls) and `ImmediateBackend` (runs inline) for tests. Swap the backend and test your job logic without mocking Mongo.
+- **Atomic claim.** `findOneAndUpdate` claims pending, due jobs by priority. Two workers never claim the same job.
+- **Queue-managed leases.** The queue heartbeats each managed run and aborts it if renewal stays unconfirmed through the lease deadline. The reaper returns jobs from dead workers to `pending`.
+- **Managed retries.** A successful handler return completes the job. An `Error` retries or fails at `maxAttempts`. `FatalJobError` fails immediately and preserves its cause.
+- **Delayed and prioritized scheduling.** `runAt` delays a job. Lower `priority` numbers run first.
+- **Dedupe keys, two scopes.** `pending+active` blocks all duplicates. `pending` allows one pending follower behind one active run.
+- **Latest-payload coalescing.** `coalesce: 'latest'` replaces the pending follower payload while the active payload stays immutable.
+- **Push/poll hybrid.** MongoDB change streams provide fast pickup. The poll loop remains a safety net.
+- **Pluggable backends.** `MongoJobQueue` is the production backend. `DummyBackend` records calls. `ImmediateBackend` runs `queue.process` handlers during `enqueue`.
 
 ## Install
 
@@ -48,34 +49,39 @@ import { JobQueue, MongoJobQueue } from 'durabl'
 const client = await MongoClient.connect(process.env.MONGO_URL!)
 const db = client.db('app')
 
-// 1. Create and start the backend (creates indexes).
+// Create and start the backend. startup() creates the indexes.
 const backend = new MongoJobQueue({ db })
 await backend.startup()
 
-// 2. Wrap it in a queue.
 const queue = new JobQueue(backend)
 
-// 3. Register a processor.
+// Register a managed processor.
 queue.process<{ userId: string }>(
   'welcome-email',
   async (job, ctx) => {
-    await sendWelcomeEmail(job.data.userId)
-    await ctx.complete()
+    await sendWelcomeEmail(job.data.userId, { signal: ctx.signal })
+    ctx.log('welcome email sent')
+    // Return to complete the job.
   },
   { concurrency: 4, pollInterval: 5000 },
 )
 
-// 4. Enqueue. The dedupeKey makes this idempotent: a second enqueue while
-//    the first is still pending/active returns null instead of duplicating.
+// The dedupe key blocks another pending or active job for this user.
 const jobId = await queue.enqueue(
   'welcome-email',
   { userId: 'u_123' },
   { dedupeKey: 'welcome-email:u_123' },
 )
 if (jobId === null) {
-  // A job for this user is already queued — nothing to do.
+  // A job for this user is already pending or active.
 }
 ```
+
+The queue owns the claim lifecycle. It heartbeats the job while the handler runs.
+If renewal stays unconfirmed through the local lease deadline, it aborts `ctx.signal` and suppresses stale terminal writes.
+A successful return completes the job. Throw an `Error` to retry the job.
+Throw `FatalJobError` when another attempt cannot succeed.
+`JobContext` contains only `signal` and `log(message)`.
 
 ### Change streams (push pickup)
 
@@ -90,69 +96,175 @@ When push is active, `JobQueue` bumps its default poll interval to 60s and leans
 
 ### Reaper (stuck-job recovery)
 
-A claimed job is a lease, not a delete — if a worker dies mid-job, the reaper returns the job to `pending` (or terminal `failed` once attempts are exhausted) after its visibility timeout expires. Start it on one process:
+A claimed job is a lease. The reaper recovers a job after its visibility timeout expires.
+Start the reaper on one process and inspect the immediate recovery:
 
 ```typescript
-const queue = new JobQueue(backend, logger, { visibilityTimeoutMs: 300000 })
-queue.startReaper() // sweeps every 60s; queue.startReaper(intervalMs) to tune
+const result = await queue.startReaper()
+if (result.status === 'started') {
+  reportReaperStartup(result.recovered)
+}
 ```
 
-`startReaper()` always sweeps with the queue's configured `visibilityTimeoutMs`, which is the single source of truth: the `Orchestrator` sizes its heartbeats from the same value, so the lease window a handler maintains and the window the reaper enforces can never drift apart. The timer is `unref`'d and stops on `shutdown()` (or `stopReaper()`).
+`recovered` is the number of jobs recovered by the startup sweep. It is `null` if that sweep failed.
+Periodic sweeps continue after a failed startup sweep. A later call returns `{ status: 'already-running' }`.
 
-`backend.recoverStuckJobs(visibilityTimeoutMs)` remains public for manual/one-off sweeps and tests, but don't schedule it yourself with a hand-passed value — if it disagrees with the queue's, jobs get reaped out from under live workers (or dead workers hold leases too long).
+Set `visibilityTimeoutMs` in the `JobQueue` constructor. The queue uses this value for managed heartbeats and reaper sweeps.
+The timer does not keep the process alive. `stopReaper()` and `shutdown()` stop it.
+
+`backend.recoverStuckJobs(visibilityTimeoutMs)` remains a low-level API for tests and one-off operations.
+Do not schedule it with another timeout value.
 
 ### Inline execution with coalescing
 
-For the "run it now, but never run two at once, and coalesce a burst into at most one follow-up" pattern (this replaced a 300-line distributed lock in Focuster), use `claimOrEnqueue` with `dedupeScope: 'pending'`:
+Use `claimOrEnqueue` when a request must run now and only one run can own a key.
+Pass the returned handle to `runClaimed`. Do not manage its lifecycle directly.
 
 ```typescript
 const handle = await queue.claimOrEnqueue(
   'reschedule',
-  { userId },
-  { dedupeKey: `reschedule:${userId}`, dedupeScope: 'pending' },
+  { userId, requestedAt: new Date() },
+  {
+    dedupeKey: `reschedule:${userId}`,
+    dedupeScope: 'pending',
+    coalesce: 'latest',
+  },
 )
 
 if (handle) {
-  // We won the slot — run inline, no poll delay.
-  try {
-    await reschedule(userId)
-    await handle.complete()
-  } catch (err) {
-    await handle.fail(String(err)) // poll loop will retry
-  }
+  await queue.runClaimed(handle, async (job, ctx) => {
+    await reschedule(job.data, { signal: ctx.signal })
+  })
 }
-// else: someone is already running, and this request has been coalesced into
-// the single follow-up queued behind them — the poll loop will run it.
 ```
 
-Exactly what `null` means, per scope:
+The active payload never changes. If a pending follower exists, `coalesce: 'latest'` replaces its payload.
+Without `coalesce`, the pending follower keeps the first payload. This is the legacy behavior.
+Use latest coalescing only for replaceable workloads.
 
-| scope | a run is already active | a run is already queued |
+After a successful return, `runClaimed` claims pending jobs with the same type and dedupe key.
+If a handler fails but a pending follower already covers its work, Durabl marks the old job `superseded`, runs the follower, then throws the original handler error.
+`maxDrains` limits the number of additional claims across both paths. Its default is 10, so one call can run at most 11 jobs.
+Set `{ maxDrains: 0 }` to disable follower draining.
+
+`claimOrEnqueue` returns `null` when another job already holds the dedupe slot:
+
+| Scope | Active run exists | Pending follower exists |
 | --- | --- | --- |
-| `'pending'` (single-flight) | `null`; one follow-up is queued behind it, and a burst collapses into that same one | `null`; nothing queued (one is enough) |
-| `'pending+active'` (default) | `null`; nothing queued — this scope means "no duplicate at all" | `null`; nothing queued |
+| `'pending'` | Creates one follower, then returns `null` | Returns `null`. Latest coalescing replaces its payload. Legacy behavior keeps its first payload. |
+| `'pending+active'` | Returns `null` without creating a follower | Returns `null` without creating another job. |
 
-Mutual exclusion is enforced by unique partial indexes, not by a pre-read, so
-concurrent callers across a rolling deploy get the same answer as sequential
-ones: exactly one wins.
+The unique partial indexes enforce this result across processes. Do not use a state read as a coordination lock.
+
+## Migrating to 0.3.0
+
+Version 0.3.0 is a breaking minor release under the `0.x` version policy.
+
+### Processor migration
+
+1. Remove calls to `ctx.complete()`, `ctx.fail()`, `ctx.failFatal()`, and `ctx.heartbeat()`.
+2. Return from the handler after successful work.
+3. Throw an `Error` when the queue can retry the job.
+4. Throw `FatalJobError` when another attempt cannot succeed.
+5. Use `ctx.signal` to cancel external work. Use `ctx.log(message)` for job logs.
+6. Replace `ImmediateBackend.registerHandler` with `queue.process`. Await `queue.enqueue` to await inline processing.
+
+Import `FatalJobError` from `durabl`.
+
+The queue now heartbeats all managed runs. It derives each terminal transition from the handler outcome.
+
+### Inline migration
+
+Replace each manual handle loop with one managed call:
+
+```typescript
+const handle = await queue.claimOrEnqueue(type, data, options)
+if (handle) await queue.runClaimed(handle, handler)
+```
+
+Remove manual heartbeat, completion, failure, and follower-drain calls.
+Use `maxDrains` only when the default of 10 additional same-key claims is not suitable.
+
+### Reaper migration
+
+Await `startReaper()` and inspect its result:
+
+```typescript
+const result = await queue.startReaper()
+if (result.status === 'started') reportRecovered(result.recovered)
+```
+
+### Custom backend migration
+
+Custom backends must add these methods and result types:
+
+```typescript
+claimNextByKey<T>(
+  type: string,
+  dedupeKey: string,
+): Promise<JobHandle<T> | null>
+
+complete(jobId: string, claimToken?: string): Promise<CompleteJobResult>
+fail(
+  jobId: string,
+  reason: string,
+  claimToken?: string,
+): Promise<FailJobResult>
+failFatal(
+  jobId: string,
+  reason: string,
+  claimToken?: string,
+): Promise<FailFatalJobResult>
+release(jobId: string, claimToken?: string): Promise<ReleaseJobResult>
+hasOutstanding(type: string, dedupeKey: string): Promise<boolean>
+```
+
+Claim tokens must fence lifecycle writes.
+Terminal methods must not overwrite an existing terminal state.
+They must return these result objects:
+
+| Method | Result objects |
+| --- | --- |
+| `complete` | `{ status: 'completed' }`, `{ status: 'already-terminal', terminalStatus }`, `{ status: 'lease-lost' }`, or `{ status: 'not-found' }` |
+| `fail` | `{ status: 'retry-scheduled' }`, `{ status: 'failed-terminal' }`, `{ status: 'superseded' }`, `{ status: 'already-terminal', terminalStatus }`, `{ status: 'lease-lost' }`, or `{ status: 'not-found' }` |
+| `failFatal` | `{ status: 'failed-terminal' }`, `{ status: 'already-terminal', terminalStatus }`, `{ status: 'lease-lost' }`, or `{ status: 'not-found' }` |
+| `release` | `{ status: 'released' }`, `{ status: 'superseded' }`, `{ status: 'already-terminal', terminalStatus }`, `{ status: 'lease-lost' }`, or `{ status: 'not-found' }` |
+
+`terminalStatus` is `'completed'`, `'failed'`, or `'superseded'`.
+`heartbeat` still returns `'applied'` or `'lease-lost'`.
+Store terminal receipts by claim token and operation so a later claim cannot erase an ambiguous write's result.
+For `coalesce: 'latest'`, replace only the pending follower payload.
+Never replace the active payload.
+These direct lifecycle APIs exist for migration and backend integration. Application handlers must use managed execution.
 
 ## Testing your jobs
 
-The backend is an interface, so your job logic never has to touch Mongo in a unit test.
+The backend is an interface, so job logic does not need MongoDB in a unit test.
 
 ```typescript
 import { DummyBackend, JobQueue } from 'durabl'
 
-const backend = new DummyBackend() // records, doesn't execute
+const backend = new DummyBackend()
 const queue = new JobQueue(backend)
 
-await myService.doThing() // calls queue.enqueue under the hood
+await myService.doThing()
 
 expect(backend.jobs).toHaveLength(1)
 expect(backend.jobs[0].dedupeKey).toBe('thing:42')
 ```
 
-`ImmediateBackend` runs handlers synchronously on enqueue, which is handy for integration tests where you want side effects without a poll loop.
+`ImmediateBackend` uses the same `queue.process` API as production.
+Its `enqueue` call waits until the managed handler finishes.
+
+```typescript
+import { ImmediateBackend, JobQueue } from 'durabl'
+
+const backend = new ImmediateBackend()
+const queue = new JobQueue(backend)
+
+queue.process('welcome-email', sendWelcomeEmailJob)
+await queue.enqueue('welcome-email', { userId: 'u_123' })
+```
 
 ### Testing orchestrations (`durabl/testing`)
 
@@ -180,47 +292,184 @@ expect(t.steps.map((s) => s.name)).toEqual(['create-sub', 'sync'])
 ## API sketch
 
 ```typescript
-class JobQueue {
-  enqueue<T>(type, data, options?): Promise<string | null>
-  claimOrEnqueue<T>(type, data, options?): Promise<JobHandle<T> | null>
-  process<T>(type, handler, config?): void
-  getStats(type?): Promise<QueueStats>
+declare class JobQueue {
+  constructor(backend: IJobQueueBackend, logger?: Logger, options?: JobQueueOptions)
+  enqueue(type: string, data: unknown, options?: EnqueueOptions): Promise<string | null>
+  claimOrEnqueue<T>(type: string, data: T, options?: EnqueueOptions): Promise<JobHandle<T> | null>
+  runClaimed<T>(handle: JobHandle<T>, handler: JobHandler<T>, options?: RunClaimedOptions): Promise<void>
+  process<T>(type: string, handler: JobHandler<T>, config?: ProcessorConfig): void
+  hasOutstanding(type: string, dedupeKey: string): Promise<boolean>
+  getStats(type?: string): Promise<QueueStats>
   startup(): Promise<void>
-  startReaper(intervalMs?): void   // sweep with the queue's visibilityTimeoutMs
+  startReaper(intervalMs?: number): Promise<StartReaperResult>
   stopReaper(): void
-  shutdown(timeoutMs?): Promise<void>
+  shutdown(timeoutMs?: number): Promise<void>
+  installSignalHandlers(options?: { signals?: NodeJS.Signals[]; timeoutMs?: number }): () => void
+  get draining(): Promise<void> | null
 }
 
-interface EnqueueOptions {
-  priority?: number       // lower = higher priority. default 0
-  delay?: number          // ms before claimable. default 0
-  maxAttempts?: number    // default 3
-  dedupeKey?: string
-  dedupeScope?: 'pending' | 'pending+active' // default 'pending+active'
-  // Retry backoff — spaces failed attempts so a fast-failing handler can't
-  // burn every attempt in milliseconds, and an outage doesn't become an
-  // instant-retry storm.
-  backoff?: 'exponential' | 'fixed' // default 'exponential' (full jitter)
-  backoffDelay?: number   // base/floor ms. default 1000
-  backoffMaxDelay?: number // cap ms. default 60000
+type JobHandler<T> = (job: Job<T>, ctx: JobContext) => void | Promise<void>
+declare class FatalJobError extends Error {
+  constructor(message: string, options?: ErrorOptions)
+}
+
+
+interface JobContext {
+  signal: AbortSignal
+  log(message: string): void
+}
+
+interface RunClaimedOptions {
+  maxDrains?: number // additional same-key claims. default 10
 }
 
 interface ProcessorConfig {
-  concurrency?: number    // default 1
-  pollInterval?: number   // default 5000 (60000 when change streams are on)
+  concurrency?: number
+  pollInterval?: number
+  heartbeatIntervalMs?: number
 }
+
+interface EnqueueOptions {
+  priority?: number
+  delay?: number
+  maxAttempts?: number
+  dedupeKey?: string
+  dedupeScope?: 'pending' | 'pending+active'
+  coalesce?: 'latest'
+  backoff?: 'exponential' | 'fixed'
+  backoffDelay?: number
+  backoffMaxDelay?: number
+}
+
+type StartReaperResult =
+  | { status: 'started'; recovered: number | null }
+  | { status: 'already-running' }
+
+interface JobHandle<T> extends Job<T> {
+  status: 'active'
+  complete(): Promise<CompleteJobResult>
+  fail(reason: string): Promise<FailJobResult>
+  failFatal(reason: string): Promise<FailFatalJobResult>
+  heartbeat(): Promise<'applied' | 'lease-lost'>
+  release(): Promise<ReleaseJobResult>
+  log(message: string): void
+}
+
+type AlreadyTerminalJobResult = {
+  status: 'already-terminal'
+  terminalStatus: 'completed' | 'failed' | 'superseded'
+}
+
+type CompleteJobResult =
+  | { status: 'completed' }
+  | AlreadyTerminalJobResult
+  | { status: 'lease-lost' }
+  | { status: 'not-found' }
+
+type FailJobResult =
+  | { status: 'retry-scheduled' }
+  | { status: 'failed-terminal' }
+  | { status: 'superseded' }
+  | AlreadyTerminalJobResult
+  | { status: 'lease-lost' }
+  | { status: 'not-found' }
+
+type FailFatalJobResult =
+  | { status: 'failed-terminal' }
+  | AlreadyTerminalJobResult
+  | { status: 'lease-lost' }
+  | { status: 'not-found' }
+
+type ReleaseJobResult =
+  | { status: 'released' }
+  | { status: 'superseded' }
+  | AlreadyTerminalJobResult
+  | { status: 'lease-lost' }
+  | { status: 'not-found' }
 
 interface QueueStats {
   pending: number
   active: number
   completed: number
   failed: number
-  oldestPendingRunAt?: Date | null // oldest *due* pending job, null if none
-  oldestPendingLagMs?: number      // how far past due it is. 0 if none
+  superseded: number
+  oldestPendingRunAt: Date | null
+  oldestPendingLagMs: number
 }
 ```
 
-The handler receives a `JobContext` with `complete()`, `fail(reason)`, `failFatal(reason)`, `log(message)`, and `heartbeat()`.
+Handlers receive a plain `Job` and a `JobContext`. They never receive lifecycle methods.
+`JobHandle` is a low-level migration and backend integration API.
+Pass a direct handle to `runClaimed` for normal application work.
+
+### Outstanding state
+
+`hasOutstanding(type, dedupeKey)` reports whether a matching job is pending or active.
+The result is advisory because another process can change the state immediately.
+Use it for health checks, status displays, and diagnostics.
+Do not use it for check-then-enqueue coordination. Dedupe writes provide that guarantee.
+
+### Global queue configuration
+
+`setGlobalBackend` captures the backend, logger, and queue options for the default queue.
+`createJobQueue` uses that configuration and applies explicit overrides.
+
+```typescript
+interface JobQueueOptions {
+  visibilityTimeoutMs?: number
+  onJobEvent?: JobEventSink
+}
+
+type GlobalQueueOptions = JobQueueOptions & { logger?: Logger }
+
+function setGlobalBackend(
+  backend: IJobQueueBackend,
+  options?: GlobalQueueOptions,
+): void
+
+function getDefaultQueue(): JobQueue
+
+function createJobQueue(
+  backend?: IJobQueueBackend,
+  overrides?: GlobalQueueOptions,
+): JobQueue
+
+function withGlobalQueue<T>(
+  backend: IJobQueueBackend,
+  callback: () => T | Promise<T>,
+): Promise<T>
+function withGlobalQueue<T>(
+  backend: IJobQueueBackend,
+  options: GlobalQueueOptions,
+  callback: () => T | Promise<T>,
+): Promise<T>
+
+setGlobalBackend(backend, {
+  logger,
+  visibilityTimeoutMs: 300_000,
+  onJobEvent,
+})
+
+const defaultQueue = getDefaultQueue()
+const workerQueue = createJobQueue()
+const otherQueue = createJobQueue(otherBackend, {
+  visibilityTimeoutMs: 60_000,
+})
+```
+
+Use `withGlobalQueue` for a temporary global scope:
+
+```typescript
+await withGlobalQueue(testBackend, { logger: testLogger }, async () => {
+  await getDefaultQueue().enqueue('test-job', {})
+})
+```
+
+Pass the callback as the second argument to use default queue options.
+
+`withGlobalQueue` rejects overlapping scopes.
+It restores the exact prior backend, options, and queue objects.
+It shuts down only the temporary queue.
 
 ### Metrics
 
@@ -242,6 +491,9 @@ const queue = new JobQueue(backend, logger, {
           type: e.type,
         })
         break
+      case 'superseded':
+        statsd.increment('jobs.superseded', { type: e.type })
+        break
       case 'lease-lost':
         statsd.increment('jobs.lease_lost', { type: e.type, op: e.op })
         break
@@ -254,36 +506,34 @@ const queue = new JobQueue(backend, logger, {
 })
 ```
 
-Kinds: `claimed`, `completed`, `failed`, `fail-fatal`, `lease-lost`,
-`reaper-recovered`. The sink is synchronous and fire-and-forget — if it throws,
-the error is logged and the job is unaffected. Omitting it costs nothing.
+Kinds: `claimed`, `completed`, `failed`, `superseded`, `fail-fatal`,
+`lease-lost`, `reaper-recovered`, `reaper-error`, and `shutdown-released`.
+The sink is synchronous and fire-and-forget. A sink error does not affect the job.
 
 Don't build dashboards by matching durabl's log messages. Those strings are not
 an API and will change.
 
 ### Deployment: drain on SIGTERM
 
-Call this, or `shutdown()` from your own signal handler:
+Install the signal handlers, or call `shutdown()` from the host shutdown hook:
 
 ```typescript
 queue.installSignalHandlers({ timeoutMs: 20_000 })
 ```
 
-Skipping it is expensive and invisible. In-flight jobs die mid-handler, sit
-`active` until the visibility timeout expires (5 minutes by default), burn an
-attempt each, and then **re-run their side effects from the top**. If your
-handlers write to external systems, every deploy is a source of duplicate
-writes. Nothing logs an error, because from the queue's point of view nothing
-went wrong — a worker simply stopped talking.
+`shutdown()` fences new claims and managed runs before it snapshots active work.
+`claimOrEnqueue()` and `runClaimed()` reject after shutdown starts. If a backend claim loses the race, Durabl releases or supersedes it before rejecting.
+Shutdown waits for managed runs until the timeout. It then aborts each remaining `ctx.signal` and stops its heartbeat.
+It releases each remaining claim to the due pending queue without consuming an attempt.
+If a pending follower blocks release, shutdown marks the old claim `superseded` because the follower already preserves the work.
+Release writes have a separate one-second bound, so a broken backend cannot block shutdown.
 
-The drain budget must fit inside your platform's kill deadline. If the platform
-sends SIGKILL 30s after SIGTERM, a 60s budget buys you nothing.
+The timeout must fit inside the platform kill deadline.
+If the platform sends `SIGKILL` after 30 seconds, use a timeout of less than 30 seconds.
 
-`installSignalHandlers` does **not** call `process.exit()` — exiting is your
-call, and a library that exits on your behalf is unusable inside a framework
-with its own shutdown sequence. Await `queue.draining` (or `shutdown()`
-directly) and exit when you're ready. It returns an uninstall function, and
-removes only the listeners it added.
+`installSignalHandlers` does not call `process.exit()`.
+Await `queue.draining`, or call `shutdown()` from the host lifecycle.
+The returned uninstall function removes only the listeners that Durabl added.
 
 ### What to alert on
 
@@ -297,7 +547,7 @@ processor that was never registered, a poll loop stalled behind contention.
 
 ```typescript
 const { pending, oldestPendingLagMs } = await queue.getStats('pushSync')
-if ((oldestPendingLagMs ?? 0) > 5 * 60_000) pageSomeone({ pending })
+if (oldestPendingLagMs > 5 * 60_000) pageSomeone({ pending })
 ```
 
 Jobs scheduled for the future are excluded on purpose: something deliberately
@@ -394,34 +644,23 @@ The change-stream suite self-skips if `MONGO_URL` points at a standalone (non-re
 
 ## Operating it
 
-Most of what follows was learned running this in production. None of it is
-obvious from the API, and each item has a failure mode attached.
+**Run the reaper on one process.** Await `queue.startReaper()` and inspect the immediate recovery result.
+Without a reaper, a dead worker can hold a dedupe key forever.
+Several reapers are safe because sweeps are idempotent, but they add redundant work.
 
-**Run the reaper on exactly one process.** `queue.startReaper()`. Without it, a
-job whose worker died stays `active` forever — and if it holds a `dedupeKey`
-under the default `pending+active` scope, it blocks every future job for that key
-permanently. Running it on several processes is harmless (the sweeps are
-idempotent), just redundant.
+**Configure the visibility timeout in one place.** Set `visibilityTimeoutMs` on `JobQueue`.
+The queue sizes managed heartbeats from this value and passes it to `startReaper()`.
+Do not schedule `backend.recoverStuckJobs(...)` with another value.
 
-**Configure the visibility timeout in one place.** `visibilityTimeoutMs` on the
-`JobQueue` constructor is the single source of truth: the `Orchestrator` sizes
-its heartbeat from it and `startReaper()` passes it to the backend. If you call
-`backend.recoverStuckJobs(...)` directly with your own constant, the two drift,
-and the symptom is jobs getting reclaimed mid-flight while the handler is still
-running — near the top of the list of things you do not want to debug in
-production.
+**Enqueue everywhere, process where intended.** Construct the backend on every instance that enqueues jobs.
+Call `process()` only on worker instances.
 
-**Enqueue everywhere, process where you mean to.** Construct the backend on every
-instance so `enqueue()` works, but call `process()` only on the instances meant to
-do the work — otherwise every web server becomes a worker.
+**Return or throw from handlers.** A successful return completes the job.
+An `Error` schedules a retry or terminal failure. `FatalJobError` records a terminal failure immediately.
+Use `ctx.signal` to stop external work after shutdown or lease loss.
 
-**Handlers must reach a terminal call.** A handler that returns without
-`ctx.complete()` leaves the job `active`; the reaper reclaims it, it runs again,
-and its side effects repeat until `maxAttempts` is spent. The terminal error then
-says "stalled", which points away from the real cause. Always complete or fail.
-
-**Alert on backlog age, drain on SIGTERM.** See the two sections above. These are
-the two things most likely to be missing from a working-looking deployment.
+**Drain on SIGTERM.** A bounded shutdown releases managed claims that exceed the grace period.
+This prevents a deploy from leaving those claims active until the visibility timeout.
 
 **Turning on change streams changes pickup latency for scheduled jobs.** With
 push active the poll interval becomes a 60s safety net, so a job with a future
