@@ -5,14 +5,14 @@
  *    surfaced as an unhandled rejection, which Node's default
  *    `--unhandled-rejections=throw` turns into a dead worker: one flaky log
  *    write took down the process.
- *  - `ctx.heartbeat()` was the only lifecycle write with no lease fence, so a
- *    zombie worker kept renewing a lease another worker now held.
+ *  - Automatic heartbeats must carry the claim token and abort the handler
+ *    signal when another worker owns the job or the job becomes terminal.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { DummyBackend } from '../src/backends/DummyBackend'
 import { JobQueue } from '../src/JobQueue'
-import type { Job, JobContext, LifecycleWriteResult } from '../src/types'
+import type { Job, JobContext } from '../src/types'
 
 import { silentLogger } from './testLogger'
 import { waitUntil } from './waitUntil'
@@ -114,46 +114,53 @@ describe('JobContext', () => {
     })
   })
 
-  describe('heartbeat()', () => {
-    it('applies while this worker still holds the lease', async () => {
+  describe('automatic heartbeat', () => {
+    it('uses this worker claim token while the lease remains live', async () => {
       const backend = new DummyBackend()
-      const queue = new JobQueue(backend, silentLogger)
+      const heartbeat = vi.spyOn(backend, 'heartbeat')
+      const queue = new JobQueue(backend, silentLogger, {
+        visibilityTimeoutMs: 30,
+      })
       queues.push(queue)
 
-      const { ctx, release } = await withRunningJob(queue)
-      const res: LifecycleWriteResult = await ctx.heartbeat()
-      release()
+      const { job, release } = await withRunningJob(queue)
+      await waitUntil(() => heartbeat.mock.calls.length > 0)
 
-      expect(res).toBe('applied')
+      expect(job.claimToken).toEqual(expect.any(String))
+      expect(heartbeat).toHaveBeenCalledWith(job.id, job.claimToken)
+      release()
     })
 
-    it('reports lease-lost, and renews nothing, once another worker owns the job', async () => {
+    it('aborts the handler signal once another worker owns the job', async () => {
       const backend = new DummyBackend()
-      const queue = new JobQueue(backend, silentLogger)
+      const queue = new JobQueue(backend, silentLogger, {
+        visibilityTimeoutMs: 30,
+      })
       queues.push(queue)
 
       const { ctx, job, release } = await withRunningJob(queue)
-      // Another worker reclaims the job: same id, fresh claim token.
-      backend.jobs.find((j) => j.id === job.id)!.claimToken = 'new-owner-token'
+      backend.jobs.find((candidate) => candidate.id === job.id)!.claimToken =
+        'new-owner-token'
+      await waitUntil(() => ctx.signal.aborted)
 
-      const res = await ctx.heartbeat()
+      expect(ctx.signal.aborted).toBe(true)
       release()
-
-      expect(res).toBe('lease-lost')
     })
 
-    it('reports lease-lost once the job is no longer active', async () => {
+    it('aborts the handler signal once the job becomes terminal', async () => {
       const backend = new DummyBackend()
-      const queue = new JobQueue(backend, silentLogger)
+      const queue = new JobQueue(backend, silentLogger, {
+        visibilityTimeoutMs: 30,
+      })
       queues.push(queue)
 
       const { ctx, job, release } = await withRunningJob(queue)
-      backend.jobs.find((j) => j.id === job.id)!.status = 'failed'
+      backend.jobs.find((candidate) => candidate.id === job.id)!.status =
+        'failed'
+      await waitUntil(() => ctx.signal.aborted)
 
-      const res = await ctx.heartbeat()
+      expect(ctx.signal.aborted).toBe(true)
       release()
-
-      expect(res).toBe('lease-lost')
     })
   })
 })

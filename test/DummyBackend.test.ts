@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { DummyBackend } from '../src/backends/DummyBackend'
+import type {
+  CompleteJobResult,
+  FailFatalJobResult,
+  FailJobResult,
+} from '../src/types'
 
 describe('DummyBackend', () => {
   let backend: DummyBackend
@@ -72,17 +77,19 @@ describe('DummyBackend', () => {
       expect(backend.jobs.length).toBe(1)
     })
 
-    it('handle.complete() marks job as completed', async () => {
+    it('handle.complete() returns the completed result', async () => {
       const handle = await backend.claimOrEnqueue('job', {})
-      await handle!.complete()
+      const result: CompleteJobResult = await handle!.complete()
 
+      expect(result).toEqual({ status: 'completed' })
       expect(backend.jobs[0].status).toBe('completed')
     })
 
-    it('handle.fail() marks job as failed', async () => {
-      const handle = await backend.claimOrEnqueue('job', {})
-      await handle!.fail('something broke')
+    it('handle.fail() returns the terminal failure result', async () => {
+      const handle = await backend.claimOrEnqueue('job', {}, { maxAttempts: 1 })
+      const result: FailJobResult = await handle!.fail('something broke')
 
+      expect(result).toEqual({ status: 'failed-terminal' })
       expect(backend.jobs[0].status).toBe('failed')
       expect(backend.jobs[0].logs).toContain('Failed: something broke')
     })
@@ -97,13 +104,14 @@ describe('DummyBackend', () => {
     // Regression: the handle mutated status directly with no lease fence, so a
     // stale handle whose job had been reclaimed (new token) could still clobber
     // it — MongoJobQueue.createHandle fences on the token.
-    it('a stale handle is a fenced no-op after the job is reclaimed', async () => {
+    it('a stale handle reports lease loss after the job is reclaimed', async () => {
       const handle = await backend.claimOrEnqueue('job', {})
       const stored = backend.jobs.find((j) => j.id === handle!.id)!
       // Another worker reclaims: new token, still active.
       stored.claimToken = 'new-owner-token'
 
-      await handle!.complete()
+      const result: CompleteJobResult = await handle!.complete()
+      expect(result).toEqual({ status: 'lease-lost' })
       expect(stored.status).toBe('active') // stale handle did not complete it
     })
 
@@ -185,43 +193,95 @@ describe('DummyBackend', () => {
     })
   })
 
-  describe('complete()', () => {
-    it('marks job as completed', async () => {
+  describe('lifecycle results', () => {
+    it('complete() reports an unfenced admin completion', async () => {
       await backend.enqueue('job', {})
       const job = await backend.claimNext('job')
-      await backend.complete(job!.id)
+      const result: CompleteJobResult = await backend.complete(job!.id)
 
+      expect(result).toEqual({ status: 'completed' })
       expect(backend.jobs[0].status).toBe('completed')
     })
-  })
 
-  describe('fail()', () => {
-    it('returns job to pending if attempts remain', async () => {
+    it('fail() reports a scheduled retry', async () => {
       await backend.enqueue('job', {}, { maxAttempts: 3 })
       const job = await backend.claimNext('job')
-      await backend.fail(job!.id, 'error')
+      const result: FailJobResult = await backend.fail(
+        job!.id,
+        'error',
+        job!.claimToken,
+      )
 
+      expect(result).toEqual({ status: 'retry-scheduled' })
       expect(backend.jobs[0].status).toBe('pending')
       expect(backend.jobs[0].attempt).toBe(1)
     })
 
-    it('marks job as failed when max attempts reached', async () => {
+    it('fail() reports a terminal failure when attempts are exhausted', async () => {
       await backend.enqueue('job', {}, { maxAttempts: 1 })
       const job = await backend.claimNext('job')
-      await backend.fail(job!.id, 'error')
+      const result: FailJobResult = await backend.fail(
+        job!.id,
+        'error',
+        job!.claimToken,
+      )
 
+      expect(result).toEqual({ status: 'failed-terminal' })
       expect(backend.jobs[0].status).toBe('failed')
     })
-  })
 
-  describe('failFatal()', () => {
-    it('marks job as failed immediately', async () => {
+    it('failFatal() reports an immediate terminal failure', async () => {
       await backend.enqueue('job', {}, { maxAttempts: 10 })
       const job = await backend.claimNext('job')
-      await backend.failFatal(job!.id, 'fatal error')
+      const result: FailFatalJobResult = await backend.failFatal(
+        job!.id,
+        'fatal error',
+        job!.claimToken,
+      )
 
+      expect(result).toEqual({ status: 'failed-terminal' })
       expect(backend.jobs[0].status).toBe('failed')
       expect(backend.jobs[0].logs).toContain('Fatal: fatal error')
+    })
+
+    it('reports the stored completed status to later failure operations', async () => {
+      await backend.enqueue('job', {})
+      const job = await backend.claimNext('job')
+      await backend.complete(job!.id, job!.claimToken)
+
+      expect(await backend.fail(job!.id, 'late', job!.claimToken)).toEqual({
+        status: 'already-terminal',
+        terminalStatus: 'completed',
+      })
+      expect(
+        await backend.failFatal(job!.id, 'late', job!.claimToken),
+      ).toEqual({
+        status: 'already-terminal',
+        terminalStatus: 'completed',
+      })
+    })
+
+    it('reports the stored failed status to a later completion', async () => {
+      await backend.enqueue('job', {})
+      const job = await backend.claimNext('job')
+      await backend.failFatal(job!.id, 'fatal', job!.claimToken)
+
+      expect(await backend.complete(job!.id, job!.claimToken)).toEqual({
+        status: 'already-terminal',
+        terminalStatus: 'failed',
+      })
+    })
+
+    it('distinguishes a missing job from a lost lease', async () => {
+      expect(await backend.complete('missing', 'token')).toEqual({
+        status: 'not-found',
+      })
+      expect(await backend.fail('missing', 'error', 'token')).toEqual({
+        status: 'not-found',
+      })
+      expect(await backend.failFatal('missing', 'fatal', 'token')).toEqual({
+        status: 'not-found',
+      })
     })
   })
 
@@ -286,6 +346,7 @@ describe('DummyBackend', () => {
         active: 1,
         completed: 1,
         failed: 0,
+        superseded: 0,
         // Backlog age — the one pending job is already due.
         oldestPendingRunAt: expect.any(Date),
         oldestPendingLagMs: expect.any(Number),
@@ -347,7 +408,7 @@ describe('DummyBackend', () => {
     it('a zombie fail() with a stale token does not clobber the reclaimed job', async () => {
       const { id, staleToken } = await claimThenReclaim()
       const res = await backend.fail(id, 'zombie says boom', staleToken)
-      expect(res).toBe('lease-lost')
+      expect(res).toEqual({ status: 'lease-lost' })
       const stored = backend.jobs.find((j) => j.id === id)!
       expect(stored.status).toBe('active') // still owned by the new worker
       expect(stored.logs).toHaveLength(0) // nothing destructive happened
@@ -358,7 +419,7 @@ describe('DummyBackend', () => {
     it('a zombie failFatal() with a stale token does not clobber the reclaimed job', async () => {
       const { id, staleToken } = await claimThenReclaim()
       const res = await backend.failFatal(id, 'zombie fatal', staleToken)
-      expect(res).toBe('lease-lost')
+      expect(res).toEqual({ status: 'lease-lost' })
       const stored = backend.jobs.find((j) => j.id === id)!
       expect(stored.status).toBe('active')
       expect(stored.logs).toHaveLength(0)
@@ -367,23 +428,25 @@ describe('DummyBackend', () => {
     it('a zombie complete() with a stale token does not complete the reclaimed job', async () => {
       const { id, staleToken } = await claimThenReclaim()
       const res = await backend.complete(id, staleToken)
-      expect(res).toBe('lease-lost')
+      expect(res).toEqual({ status: 'lease-lost' })
       expect(backend.jobs.find((j) => j.id === id)!.status).toBe('active')
     })
 
     it('fenced writes with the live token still apply', async () => {
       await backend.enqueue('t', {})
       const job = await backend.claimNext('t')
-      expect(await backend.complete(job!.id, job!.claimToken)).toBe('applied')
+      expect(await backend.complete(job!.id, job!.claimToken)).toEqual({
+        status: 'completed',
+      })
       expect(backend.jobs.find((j) => j.id === job!.id)!.status).toBe(
         'completed',
       )
     })
 
-    it('unfenced writes (no token) keep legacy behavior and report applied', async () => {
+    it('unfenced writes keep admin behavior', async () => {
       await backend.enqueue('t', {})
       const job = await backend.claimNext('t')
-      expect(await backend.complete(job!.id)).toBe('applied')
+      expect(await backend.complete(job!.id)).toEqual({ status: 'completed' })
       expect(backend.jobs.find((j) => j.id === job!.id)!.status).toBe(
         'completed',
       )

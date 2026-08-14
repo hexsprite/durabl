@@ -3,11 +3,15 @@ import { describe, expect, it } from 'vitest'
 import type { IJobQueueBackend } from '../src/backends/IJobQueueBackend'
 import { JobQueue } from '../src/JobQueue'
 import type {
+  CompleteJobResult,
+  FailFatalJobResult,
+  FailJobResult,
   Job,
   JobHandle,
   JobStatus,
   LifecycleWriteResult,
   QueueStats,
+  ReleaseJobResult,
 } from '../src/types'
 
 /**
@@ -59,24 +63,43 @@ class MiniBackend implements IJobQueueBackend {
     job.attempt++
     return job as Job<T>
   }
-  async complete(): Promise<LifecycleWriteResult> {
-    return 'applied'
+  async claimNextByKey<T>(): Promise<JobHandle<T> | null> {
+    return null
   }
-  async fail(): Promise<LifecycleWriteResult> {
-    return 'applied'
+  async complete(): Promise<CompleteJobResult> {
+    return { status: 'completed' }
   }
-  async failFatal(): Promise<LifecycleWriteResult> {
-    return 'applied'
+  async fail(): Promise<FailJobResult> {
+    return { status: 'retry-scheduled' }
+  }
+  async failFatal(): Promise<FailFatalJobResult> {
+    return { status: 'failed-terminal' }
+  }
+  async release(): Promise<ReleaseJobResult> {
+    return { status: 'released' }
   }
   async log(): Promise<void> {}
   async heartbeat(): Promise<LifecycleWriteResult> {
     return 'applied'
   }
+  async hasOutstanding(type: string, dedupeKey: string): Promise<boolean> {
+    return this.pending.some(
+      (job) => job.type === type && job.dedupeKey === dedupeKey,
+    )
+  }
   async findOne<T>(): Promise<Job<T> | null> {
     return null
   }
   async getStats(): Promise<QueueStats> {
-    return { pending: this.pending.length, active: 0, completed: 0, failed: 0 }
+    return {
+      pending: 0,
+      active: 0,
+      completed: 0,
+      failed: 0,
+      superseded: 0,
+      oldestPendingRunAt: null,
+      oldestPendingLagMs: 0,
+    }
   }
   async startup(): Promise<void> {}
   async shutdown(): Promise<void> {}

@@ -137,7 +137,7 @@ describe('job collection indexes', () => {
     it('indexes both branches of the cleanup $or', async () => {
       const names = (await collection.listIndexes().toArray()).map((i) => i.name)
       expect(names).toContain('cleanup_completed_idx')
-      expect(names).toContain('cleanup_failed_idx')
+      expect(names).toContain('cleanup_failed_v2_idx')
     })
 
     it('plans the cleanup filter without a collection scan', async () => {
@@ -150,24 +150,50 @@ describe('job collection indexes', () => {
       const cutoff = new Date(Date.now() + 60_000) // everything is "old"
       const explain = await collection
         .find({
-          status: { $in: ['completed', 'failed'] },
-          $or: [{ completedAt: { $lt: cutoff } }, { failedAt: { $lt: cutoff } }],
+          $or: [
+            { status: 'completed', completedAt: { $lt: cutoff } },
+            {
+              status: { $in: ['failed', 'superseded'] },
+              failedAt: { $lt: cutoff },
+            },
+          ],
         })
         .explain('queryPlanner')
 
       expect(JSON.stringify(explain)).not.toContain('"stage":"COLLSCAN"')
     })
 
-    it('still deletes exactly the aged terminal jobs', async () => {
+    it('deletes aged completed and superseded jobs only', async () => {
       const keep = await backend.enqueue('keep', {})
-      const drop = await backend.enqueue('drop', {})
-      await backend.claimNext('drop')
-      await backend.complete(drop!)
+      const completed = await backend.enqueue('completed', {})
+      await backend.claimNext('completed')
+      await backend.complete(completed!)
 
-      const removed = await backend.cleanupOldJobs(-1) // cutoff in the future
-      expect(removed).toBe(1)
+      const superseded = await backend.claimOrEnqueue(
+        'superseded',
+        { version: 1 },
+        {
+          dedupeKey: 'same',
+          dedupeScope: 'pending',
+          coalesce: 'latest',
+        },
+      )
+      await backend.enqueue(
+        'superseded',
+        { version: 2 },
+        {
+          dedupeKey: 'same',
+          dedupeScope: 'pending',
+          coalesce: 'latest',
+        },
+      )
+      await superseded!.fail('stale')
+
+      const removed = await backend.cleanupOldJobs(-1)
+      expect(removed).toBe(2)
       expect(await collection.findOne({ _id: keep! })).not.toBeNull()
-      expect(await collection.findOne({ _id: drop! })).toBeNull()
+      expect(await collection.findOne({ _id: completed! })).toBeNull()
+      expect(await collection.findOne({ _id: superseded!.id })).toBeNull()
     })
   })
 })

@@ -26,7 +26,7 @@ describe('JobQueue.shutdown()', () => {
 
     const queue = new JobQueue(new DummyBackend(), silentLogger)
     // Long enough that a leaked timer is unmistakable rather than a race.
-    queue.process('slowpoll', async (_job, ctx) => ctx.complete(), {
+    queue.process('slowpoll', async () => {}, {
       pollInterval: 300000,
     })
     await waitUntil(() => timerCount() > before)
@@ -38,7 +38,7 @@ describe('JobQueue.shutdown()', () => {
 
   it('returns promptly instead of waiting out the poll interval', async () => {
     const queue = new JobQueue(new DummyBackend(), silentLogger)
-    queue.process('slowpoll', async (_job, ctx) => ctx.complete(), {
+    queue.process('slowpoll', async () => {}, {
       pollInterval: 300000,
     })
     await waitUntil(() => timerCount() > 0)
@@ -54,7 +54,7 @@ describe('JobQueue.shutdown()', () => {
 
     const queue = new JobQueue(new DummyBackend(), silentLogger)
     for (const type of ['a', 'b', 'c']) {
-      queue.process(type, async (_job, ctx) => ctx.complete(), {
+      queue.process(type, async () => {}, {
         pollInterval: 300000,
       })
     }
@@ -76,11 +76,10 @@ describe('JobQueue.shutdown()', () => {
       release = resolve
     })
 
-    queue.process('drainme', async (_job, ctx) => {
+    queue.process('drainme', async () => {
       started = true
       await parked
       finished = true
-      await ctx.complete()
     })
     await queue.enqueue('drainme', {})
     await waitUntil(() => started)
@@ -97,7 +96,7 @@ describe('JobQueue.shutdown()', () => {
 
   it('is safe to call twice', async () => {
     const queue = new JobQueue(new DummyBackend(), silentLogger)
-    queue.process('slowpoll', async (_job, ctx) => ctx.complete(), {
+    queue.process('slowpoll', async () => {}, {
       pollInterval: 300000,
     })
 

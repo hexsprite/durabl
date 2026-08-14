@@ -180,9 +180,8 @@ describe('JobQueue.installSignalHandlers', () => {
     // Short poll interval: the default is 5s, which would outlast this test.
     queue.process(
       'sync',
-      async (_j, ctx) => {
+      async () => {
         await gate
-        await ctx.complete()
       },
       { pollInterval: 5 },
     )

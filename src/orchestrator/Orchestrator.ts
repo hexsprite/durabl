@@ -7,15 +7,16 @@
 import type { JobQueue } from '../JobQueue'
 import {
   HeartbeatConfigConflict,
+  LeaseLostError,
   isFatalOrchestrationError,
   MaxDurationExceeded,
   OrchestrationUnsupportedError,
   OrchestratorTypeConflict,
 } from '../journal/errors'
 import { defaultLogger, type Logger } from '../logger'
-import type { Job, JobContext } from '../types'
+import { FatalJobError, type Job, type JobContext } from '../types'
 
-import { buildContext, LeaseLostError, startHeartbeat } from './context'
+import { buildContext } from './context'
 import type { OrchestratorConfig, OrchestratorFn } from './types'
 
 interface ResolvedConfig {
@@ -84,6 +85,7 @@ export class Orchestrator {
         ...(resolved.pollInterval !== undefined
           ? { pollInterval: resolved.pollInterval }
           : {}),
+        heartbeatIntervalMs: resolved.heartbeatIntervalMs,
       })
     } catch (err) {
       // JobQueue.process throws "already registered" for a duplicate type.
@@ -127,24 +129,27 @@ export class Orchestrator {
     return async (job, ctx) => {
       const claimToken = job.claimToken
       if (!claimToken) {
-        // Backend must mint a claim token on claim for fencing to work. This
-        // is a backend-capability defect, not a transient failure — every
-        // retry would hit it again and burn every attempt, so fail fatally on
-        // the first one. (ctx.failFatal is itself lease-fenced upstream, but
-        // with no token here the write is unfenced by construction.)
+        // Backend must mint a claim token for fencing. Retrying cannot repair a
+        // backend capability defect, so let the queue record a fatal failure.
         const err = new OrchestrationUnsupportedError('claimToken')
         this.log.error(
           { jobId: job.id, type },
           `orchestrator '${type}' claimed a job with no claimToken; backend must mint one`,
         )
-        await ctx.failFatal(err.message)
-        return
+        throw new FatalJobError(err.message)
       }
 
       const steps = await this.queue.readSteps(job.id)
       // Run-level abort: fired on lease loss or maxDurationMs so the body (and
       // any in-flight step signal chained to it) stops instead of orphaning.
       const runController = new AbortController()
+      const abortRun = () => {
+        if (!runController.signal.aborted) {
+          runController.abort(ctx.signal.reason)
+        }
+      }
+      if (ctx.signal.aborted) abortRun()
+      else ctx.signal.addEventListener('abort', abortRun, { once: true })
       const octx = buildContext({
         journal: this.queue,
         job,
@@ -155,48 +160,8 @@ export class Orchestrator {
         runController,
       })
 
-      const heart = startHeartbeat(
-        this.queue,
-        job.id,
-        claimToken,
-        config.heartbeatIntervalMs,
-        (err) =>
-          this.log.warn(
-            { err, jobId: job.id },
-            'heartbeat failed; will retry next tick',
-          ),
-        () => {
-          this.log.warn(
-            { jobId: job.id },
-            'lease lost — job reclaimed; aborting run',
-          )
-          if (!runController.signal.aborted) {
-            runController.abort(new LeaseLostError())
-          }
-        },
-      )
-
       try {
         await this.runBody(fn, job, octx, config.maxDurationMs, runController)
-
-        // Stop the heartbeat BEFORE completing. Otherwise a tick already in
-        // flight when the status flips to 'completed' reads 'lease-lost' and
-        // fires a spurious 'lease lost — aborting run' warn + run abort on an
-        // already-finished run. (startHeartbeat also re-checks its stopped flag
-        // after the await, so a tick that resolves post-stop is a no-op.)
-        heart.stop()
-
-        const done = await this.queue.completeClaimed(job.id, claimToken)
-        if (done === 'lease-lost') {
-          // A different token owns this job now — it was genuinely reclaimed
-          // by another worker (a reaper-failed job under OUR token would have
-          // matched via the active|failed filter and completed). Yield — do
-          // NOT throw: the reclaimed copy is the live run.
-          this.log.warn(
-            { jobId: job.id },
-            'job reclaimed by another worker before completion; yielding',
-          )
-        }
       } catch (err) {
         if (err instanceof LeaseLostError) {
           this.log.warn(
@@ -211,17 +176,12 @@ export class Orchestrator {
             { err, jobId: job.id, type },
             'orchestration failed fatally',
           )
-          // Stop before failFatal for the same reason as the completion path:
-          // don't let an in-flight tick race the status write into a spurious
-          // lease-loss.
-          heart.stop()
-          await ctx.failFatal(reason)
-          return
+          throw new FatalJobError(reason, { cause: err })
         }
         // Normal throw → processJob.fail() → jittered backoff → resume.
         throw err
       } finally {
-        heart.stop()
+        ctx.signal.removeEventListener('abort', abortRun)
       }
     }
   }

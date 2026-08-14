@@ -5,7 +5,12 @@
  * work with any {@link IJobQueueBackend} implementation.
  */
 
-export type JobStatus = 'pending' | 'active' | 'completed' | 'failed'
+export type JobStatus =
+  | 'pending'
+  | 'active'
+  | 'completed'
+  | 'failed'
+  | 'superseded'
 
 /**
  * Controls duplicate job prevention behavior.
@@ -48,13 +53,54 @@ export interface StepRecord {
   ts: Date
 }
 
-/**
- * Result of a lifecycle write (`complete`/`fail`/`failFatal`). When the caller
- * supplies a `claimToken`, the write is fenced: a stale token (job reclaimed by
- * another worker) yields `'lease-lost'` and the job is NOT modified. Unfenced
- * calls (no token) always report `'applied'`.
- */
+/** Common result when a terminal write cannot apply to a live claim. */
+export type TerminalWriteMissResult =
+  | {
+      status: 'already-terminal'
+      terminalStatus: 'completed' | 'failed' | 'superseded'
+    }
+  | { status: 'lease-lost' }
+  | { status: 'not-found' }
+
+/** Result of marking a job successfully completed. */
+export type CompleteJobResult =
+  | { status: 'completed' }
+  | TerminalWriteMissResult
+
+/** Result of failing a job, with retry behavior based on its attempt count. */
+export type FailJobResult =
+  | { status: 'retry-scheduled' }
+  | { status: 'failed-terminal' }
+  | { status: 'superseded' }
+  | TerminalWriteMissResult
+
+/** Result of failing a job without allowing another retry. */
+export type FailFatalJobResult =
+  | { status: 'failed-terminal' }
+  | TerminalWriteMissResult
+
+/** Result of a heartbeat lifecycle write. */
 export type LifecycleWriteResult = 'applied' | 'lease-lost'
+
+/** Result of releasing a live claim back to the due pending queue. */
+export type ReleaseJobResult =
+  | { status: 'released' }
+  | { status: 'superseded' }
+  | TerminalWriteMissResult
+
+/** Options for queue-owned execution of an already claimed job. */
+export interface RunClaimedOptions {
+  /** Additional same-key jobs to claim after the initial job. Default: 10. */
+  maxDrains?: number
+}
+
+/** Throw from a handler when retrying the job cannot succeed. */
+export class FatalJobError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'FatalJobError'
+  }
+}
 
 /**
  * Result of a lease-fenced conditional step append. §3.6.
@@ -101,51 +147,38 @@ export interface Job<T = unknown> {
 }
 
 /**
- * Handle returned by claimOrEnqueue() for inline job execution.
- * Allows caller to complete/fail the job after running their code.
+ * Active claim with lease-fenced lifecycle operations.
+ *
+ * The queue owns these operations while it invokes a handler. Handlers receive
+ * a plain {@link Job} plus {@link JobContext}, never this handle.
  */
-export interface JobHandle<T = unknown> {
-  id: string
-  data: T
-  complete(): Promise<void>
-  fail(reason: string): Promise<void>
+export interface JobHandle<T = unknown> extends Job<T> {
+  status: 'active'
+  complete(): Promise<CompleteJobResult>
+  fail(reason: string): Promise<FailJobResult>
+  failFatal(reason: string): Promise<FailFatalJobResult>
+  heartbeat(): Promise<LifecycleWriteResult>
+  release(): Promise<ReleaseJobResult>
   log(message: string): void
 }
 
-/**
- * Context passed to job handlers in process() callbacks.
- */
+/** Context passed to job handlers. The queue owns every lifecycle transition. */
 export interface JobContext {
-  /** Mark job as successfully completed */
-  complete(): Promise<void>
-  /** Mark job as failed (will retry if attempts remain) */
-  fail(reason: string): Promise<void>
-  /** Mark job as permanently failed (no retry) */
-  failFatal(reason: string): Promise<void>
+  /** Aborted when shutdown or lease loss cancels this claim. */
+  signal: AbortSignal
   /**
-   * Add log entry to job.
-   *
-   * Fire-and-forget by design — the write is not awaited, so a failed log
-   * write never fails the job. It is reported through the queue's logger
-   * rather than surfacing as an unhandled rejection.
+   * Add a log entry without making a failed log write fail the job.
    */
   log(message: string): void
-  /**
-   * Extend the lease (prevents the reaper's visibility timeout from
-   * reclaiming this job).
-   *
-   * Lease-fenced like every other lifecycle write: returns `'lease-lost'`,
-   * and writes nothing, once another worker owns the job. A handler that sees
-   * `'lease-lost'` should stop — its work is being redone elsewhere and any
-   * further side effect is a duplicate.
-   */
-  heartbeat(): Promise<LifecycleWriteResult>
 }
 
 /**
  * Job handler function signature for process()
  */
-export type JobHandler<T> = (job: Job<T>, ctx: JobContext) => Promise<void>
+export type JobHandler<T> = (
+  job: Job<T>,
+  ctx: JobContext,
+) => void | Promise<void>
 
 /**
  * Options for enqueue() and claimOrEnqueue()
@@ -161,6 +194,22 @@ export interface EnqueueOptions extends BackoffConfig {
   dedupeKey?: string
   /** Scope for dedupe check. Default: 'pending+active' */
   dedupeScope?: DedupeScope
+  /**
+   * Replace the payload of an existing pending follower.
+   * Only valid with `dedupeKey` and `dedupeScope: 'pending'`.
+   */
+  coalesce?: 'latest'
+}
+
+/** Reject invalid latest-payload coalescing before a backend can mutate storage. */
+export function assertValidLatestCoalescing(
+  options: EnqueueOptions = {},
+): void {
+  if (options.coalesce !== 'latest') return
+  if (options.dedupeKey && options.dedupeScope === 'pending') return
+  throw new Error(
+    "coalesce: 'latest' requires dedupeKey and dedupeScope: 'pending'",
+  )
 }
 
 /**
@@ -171,6 +220,8 @@ export interface ProcessorConfig {
   concurrency?: number
   /** Milliseconds between poll cycles. Default: 5000 */
   pollInterval?: number
+  /** Milliseconds between managed lease heartbeats. Default: visibility / 3. */
+  heartbeatIntervalMs?: number
 }
 
 /**
@@ -185,6 +236,7 @@ export interface QueueStats {
   active: number
   completed: number
   failed: number
+  superseded: number
   /**
    * `runAt` of the oldest job that is pending **and already due**, or `null`
    * when nothing is waiting.
@@ -193,14 +245,46 @@ export interface QueueStats {
    * delayed until next week is not backlog, and counting it would peg the metric
    * permanently red and make it useless.
    */
-  oldestPendingRunAt?: Date | null
+  oldestPendingRunAt: Date | null
   /**
    * How far past its `runAt` the oldest due pending job is, in ms. `0` when the
    * queue is empty or nothing is overdue. Floored at 0 so clock skew cannot
    * produce a negative lag.
    */
-  oldestPendingLagMs?: number
+  oldestPendingLagMs: number
 }
+
+/** One lifecycle acknowledgement retained for exact ambiguous-write recovery. */
+export type TerminalReceipt =
+  | {
+      claimToken: string | null
+      operation: 'complete'
+      result: { status: 'completed' }
+    }
+  | {
+      claimToken: string | null
+      operation: 'fail'
+      result:
+        | { status: 'retry-scheduled' }
+        | { status: 'failed-terminal' }
+        | { status: 'superseded' }
+    }
+  | {
+      claimToken: string | null
+      operation: 'failFatal'
+      result: { status: 'failed-terminal' }
+    }
+  | {
+      claimToken: string | null
+      operation: 'release'
+      result: { status: 'released' } | { status: 'superseded' }
+    }
+
+/** Receipts indexed by encoded claim token, then lifecycle operation. */
+export type TerminalReceipts = Record<
+  string,
+  Partial<Record<TerminalReceipt['operation'], TerminalReceipt['result']>>
+>
 
 /**
  * Internal job document structure (with MongoDB _id)
@@ -227,6 +311,8 @@ export interface JobDoc<T = unknown> {
   logs: Array<{ timestamp: Date; message: string }>
   /** Per-claim lease nonce (see {@link Job.claimToken}). */
   claimToken?: string
+  /** Per-claim receipts retained across later claims and terminal writes. */
+  terminalReceipts?: TerminalReceipts
   /** Embedded step journal for durable orchestration. §3.2. */
   steps?: StepRecord[]
   /**
@@ -268,6 +354,11 @@ export function jobDocToJob<T>(
   }
 }
 
+/** Result of starting the queue's stuck-job reaper. */
+export type StartReaperResult =
+  | { status: 'started'; recovered: number | null }
+  | { status: 'already-running' }
+
 /**
  * A queue lifecycle event, for metrics.
  *
@@ -296,6 +387,13 @@ export type JobEvent =
       terminal: boolean
       reason: string
     }
+  | {
+      kind: 'superseded'
+      type: string
+      jobId: string
+      durationMs: number
+      reason: string
+    }
   | { kind: 'fail-fatal'; type: string; jobId: string; reason: string }
   | {
       kind: 'lease-lost'
@@ -310,6 +408,12 @@ export type JobEvent =
       /** Sweep hit the batch cap, so more work is waiting. */
       saturated: boolean
     }
+  | {
+      kind: 'reaper-error'
+      phase: 'startup' | 'periodic'
+      message: string
+    }
+  | { kind: 'shutdown-released'; type: string; jobId: string }
 
 /** Sink for {@link JobEvent}s. Synchronous and fire-and-forget. */
 export type JobEventSink = (event: JobEvent) => void

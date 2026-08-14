@@ -9,26 +9,36 @@
 import type {
   AppendStepResult,
   CompleteClaimedResult,
+  CompleteJobResult,
   EnqueueOptions,
+  FailFatalJobResult,
+  FailJobResult,
   HeartbeatClaimedResult,
   Job,
   JobHandle,
   LifecycleWriteResult,
   QueueStats,
+  ReleaseJobResult,
   StepRecord,
 } from '../types'
 
+/** @internal Queue-to-inline-backend processor registration capability. */
+export const registerInlineProcessor = Symbol('durabl.registerInlineProcessor')
+
+/** @internal Managed callback installed by {@link JobQueue.process}. */
+export type InlineProcessor = (job: JobHandle<unknown>) => Promise<void>
+
 export interface IJobQueueBackend {
   /**
-   * True for backends that execute enqueued jobs *inline* through their own
-   * handler registry (see `ImmediateBackend.registerHandler`) instead of the
-   * {@link JobQueue.process} poll loop. An {@link Orchestrator} registers its
-   * durable wrapper via `queue.process()`, which such a backend never invokes —
-   * so an orchestration would silently sit `active` forever. `JobQueue` reads
-   * this flag to refuse orchestration construction against an inline backend.
-   * Detect-by-presence (absent/false = processor-driven, orchestration-capable).
+   * True for backends that execute enqueued jobs inline through the internal
+   * {@link registerInlineProcessor} capability instead of the poll loop.
+   * {@link JobQueue} reads this flag to refuse durable orchestration, whose
+   * wrapper requires the normal claim processor.
    */
   readonly executesInline?: boolean
+
+  /** @internal Register the queue-owned managed callback for an inline backend. */
+  [registerInlineProcessor]?(type: string, processor: InlineProcessor): void
 
   /**
    * Add a job to the queue.
@@ -42,8 +52,9 @@ export interface IJobQueueBackend {
 
   /**
    * Atomically create and claim a job for immediate inline execution.
-   * Used for the coalescing pattern (distributed-lock replacement).
-   * @returns JobHandle if claimed, null if job already exists
+   * With latest coalescing, keep the active payload immutable and atomically
+   * create or replace one pending follower's data.
+   * @returns JobHandle if claimed, null if another job holds the dedupe slot
    */
   claimOrEnqueue<T>(
     type: string,
@@ -59,38 +70,54 @@ export interface IJobQueueBackend {
   claimNext<T>(type: string): Promise<Job<T> | null>
 
   /**
+   * Atomically claim the next due pending job for one type and dedupe key.
+   * Used to drain one coalesced follower after its active predecessor commits.
+   */
+  claimNextByKey<T>(
+    type: string,
+    dedupeKey: string,
+  ): Promise<JobHandle<T> | null>
+
+  /**
    * Mark job as successfully completed.
    *
    * When `claimToken` is provided the write is lease-fenced: it only applies
-   * if the job is still `active` under that token. A miss returns
-   * `'lease-lost'` and modifies nothing — a zombie worker can never clobber a
-   * job reclaimed by another worker.
+   * if the job is still `active` under that token. A miss returns a
+   * `lease-lost` result and modifies nothing. A zombie worker can never clobber
+   * a job reclaimed by another worker.
    */
-  complete(jobId: string, claimToken?: string): Promise<LifecycleWriteResult>
+  complete(jobId: string, claimToken?: string): Promise<CompleteJobResult>
 
   /**
    * Mark job as failed. Will retry if attempts remain.
    *
    * When `claimToken` is provided the write is lease-fenced (see
-   * {@link complete}); a miss returns `'lease-lost'` and modifies nothing.
+   * {@link complete}); a miss returns a `lease-lost` result and modifies nothing.
    */
   fail(
     jobId: string,
     reason: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult>
+  ): Promise<FailJobResult>
 
   /**
    * Mark job as permanently failed. No retry.
    *
    * When `claimToken` is provided the write is lease-fenced (see
-   * {@link complete}); a miss returns `'lease-lost'` and modifies nothing.
+   * {@link complete}); a miss returns a `lease-lost` result and modifies nothing.
    */
   failFatal(
     jobId: string,
     reason: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult>
+  ): Promise<FailFatalJobResult>
+
+
+  /**
+   * Return a live claim to the due pending queue without recording a failure.
+   * A supplied claim token fences the write against replacement owners.
+   */
+  release(jobId: string, claimToken?: string): Promise<ReleaseJobResult>
 
   /**
    * Add a log entry to the job.
@@ -112,6 +139,9 @@ export interface IJobQueueBackend {
     jobId: string,
     claimToken?: string,
   ): Promise<LifecycleWriteResult>
+
+  /** Return whether this type and dedupe key has a pending or active job. */
+  hasOutstanding(type: string, dedupeKey: string): Promise<boolean>
 
   /**
    * Find a job by query. Use for utilities like expiring stale jobs.

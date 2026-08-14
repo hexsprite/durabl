@@ -24,28 +24,38 @@ import {
   DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
   sortBySeq,
 } from '../journal/serialize'
+import { assertValidLatestCoalescing } from '../types'
 import type {
   AppendStepResult,
   CompleteClaimedResult,
+  CompleteJobResult,
   EnqueueOptions,
+  FailFatalJobResult,
+  FailJobResult,
   HeartbeatClaimedResult,
   Job,
-  JobContext,
   JobHandle,
-  JobHandler,
   LifecycleWriteResult,
+  ReleaseJobResult,
+  TerminalWriteMissResult,
   QueueStats,
   StepRecord,
 } from '../types'
 
 import { backlogAge } from './backlogAge'
-import type { IJobQueueBackend } from './IJobQueueBackend'
+import {
+  registerInlineProcessor,
+  type IJobQueueBackend,
+  type InlineProcessor,
+} from './IJobQueueBackend'
 
 /** Internal job record: public {@link Job} plus the off-public step journal
  *  and its running byte total. Structurally satisfies {@link JournalableJob}. */
 type ImmediateJob<T = unknown> = Job<T> & {
   steps: StepRecord[]
   journalBytes: number
+  /** Distinguishes a lifecycle failure from a reaper race in `complete()`. */
+  failedByLifecycleWrite?: boolean
 }
 
 export class ImmediateBackend implements IJobQueueBackend {
@@ -53,19 +63,56 @@ export class ImmediateBackend implements IJobQueueBackend {
    *  Signals `JobQueue` to refuse orchestrations (which need `process()`). */
   readonly executesInline = true
 
-  private handlers: Map<string, JobHandler<unknown>> = new Map()
+  private processors: Map<string, InlineProcessor> = new Map()
   private jobs: Map<string, ImmediateJob> = new Map()
   private idCounter = 0
-  private activeDedupeKeys: Set<string> = new Set()
+  private activeDedupeKeys: Set<string> = new Set();
 
-  /** Register a handler for a job type. Must be called before enqueue(). */
-  registerHandler<T>(type: string, handler: JobHandler<T>): void {
-    this.handlers.set(type, handler as JobHandler<unknown>)
+  [registerInlineProcessor](type: string, processor: InlineProcessor): void {
+    this.processors.set(type, processor)
   }
 
   private generateId(): string {
     this.idCounter++
     return `immediate-${this.idCounter}`
+  }
+
+  private toJob<T>(job: ImmediateJob<T>, includeClaimToken = false): Job<T> {
+    const {
+      steps: _steps,
+      journalBytes: _journalBytes,
+      failedByLifecycleWrite: _failedByLifecycleWrite,
+      claimToken,
+      ...publicJob
+    } = job
+    return {
+      ...publicJob,
+      ...(includeClaimToken ? { claimToken } : {}),
+    }
+  }
+
+  private createHandle<T>(job: ImmediateJob<T>): JobHandle<T> {
+    const claimToken = job.claimToken
+    return {
+      ...this.toJob(job, true),
+      status: 'active',
+      complete: () => this.complete(job.id, claimToken),
+      fail: (reason: string) => this.fail(job.id, reason, claimToken),
+      failFatal: (reason: string) =>
+        this.failFatal(job.id, reason, claimToken),
+      heartbeat: () => this.heartbeat(job.id, claimToken),
+      release: () => this.release(job.id, claimToken),
+      log: (message: string) => {
+        void this.log(job.id, message)
+      },
+    }
+  }
+
+  private markClaimed(job: ImmediateJob): void {
+    job.status = 'active'
+    job.attempt++
+    job.claimedAt = new Date()
+    job.claimToken = randomUUID()
   }
 
   private getDedupeSetKey(
@@ -75,10 +122,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     return `${dedupeScope}:${dedupeKey}`
   }
 
-  /** Free a job's dedupe reservation. `enqueue` reserves the key up front, so
-   *  every terminal transition must release it or the key blocks all future
-   *  enqueues forever. The inline `createContext` path frees it directly; the
-   *  orchestrator completion path (`completeClaimed`) must do the same. */
+  /** Free the reservation after a terminal lifecycle transition. */
   private releaseDedupeKey(job: Job): void {
     if (!job.dedupeKey || !job.dedupeScope) return
     this.activeDedupeKeys.delete(
@@ -122,42 +166,10 @@ export class ImmediateBackend implements IJobQueueBackend {
     }
 
     this.jobs.set(jobId, job)
-    await this.executeHandler(job, options.dedupeKey, dedupeScope)
+    const processor = this.processors.get(type)
+    if (processor) await processor(this.createHandle(job))
 
     return jobId
-  }
-
-  private async executeHandler(
-    job: Job,
-    dedupeKey: string | undefined,
-    dedupeScope: 'pending' | 'pending+active',
-  ): Promise<void> {
-    const handler = this.handlers.get(job.type)
-    if (!handler) return
-
-    const ctx = this.createContext(job.id, dedupeKey, dedupeScope, job.claimToken)
-    try {
-      await handler(job, ctx)
-    } catch (err) {
-      this.handleExecutionError(job.id, dedupeKey, dedupeScope, err)
-    }
-  }
-
-  private handleExecutionError(
-    jobId: string,
-    dedupeKey: string | undefined,
-    dedupeScope: 'pending' | 'pending+active',
-    err: unknown,
-  ): void {
-    const storedJob = this.jobs.get(jobId)
-    if (storedJob && storedJob.status === 'active') {
-      storedJob.status = 'failed'
-      storedJob.failReason = err instanceof Error ? err.message : String(err)
-    }
-    if (dedupeKey) {
-      const key = this.getDedupeSetKey(dedupeKey, dedupeScope)
-      this.activeDedupeKeys.delete(key)
-    }
   }
 
   async claimOrEnqueue<T>(
@@ -165,23 +177,45 @@ export class ImmediateBackend implements IJobQueueBackend {
     data: T,
     options: EnqueueOptions = {},
   ): Promise<JobHandle<T> | null> {
+    assertValidLatestCoalescing(options)
     const dedupeScope = options.dedupeScope ?? 'pending+active'
 
     if (options.dedupeKey) {
+      let activeExists = false
       for (const job of this.jobs.values()) {
         if (job.dedupeKey !== options.dedupeKey) continue
-        // A run is already queued — don't start another now.
-        if (job.status === 'pending') return null
-        // Stand-in for Mongo's unique partial indexes: at most one active run
-        // per key+scope. Without this an un-completed handle did not stop the
-        // next caller from getting one too.
-        if (job.status === 'active' && job.dedupeScope === dedupeScope) {
-          // Deliberate divergence from MongoJobQueue: it queues one follow-up
-          // here. This backend executes on enqueue, so "queue a follow-up"
-          // would mean running the very job we are coalescing away, inline and
-          // immediately. Returning null is the honest inline equivalent.
+        if (job.status === 'pending') {
+          if (options.coalesce === 'latest' && job.type === type) {
+            job.data = data
+          }
           return null
         }
+        if (job.status === 'active' && job.dedupeScope === dedupeScope) {
+          activeExists = true
+        }
+      }
+
+      if (activeExists) {
+        if (dedupeScope === 'pending') {
+          const createdAt = new Date()
+          const follower: ImmediateJob<T> = {
+            id: this.generateId(),
+            type,
+            data,
+            status: 'pending',
+            attempt: 0,
+            maxAttempts: options.maxAttempts ?? 3,
+            priority: options.priority ?? 0,
+            dedupeKey: options.dedupeKey,
+            dedupeScope,
+            runAt: createdAt,
+            createdAt,
+            steps: [],
+            journalBytes: 0,
+          }
+          this.jobs.set(follower.id, follower)
+        }
+        return null
       }
     }
 
@@ -205,134 +239,230 @@ export class ImmediateBackend implements IJobQueueBackend {
     }
 
     this.jobs.set(jobId, job)
-
-    // Fence the handle with the claim token minted above, mirroring
-    // MongoJobQueue.createHandle: a stale handle whose job was reclaimed by
-    // another worker (new token) becomes a no-op instead of clobbering it.
-    const { claimToken } = job
-
-    // Return handle for caller to execute inline
-    return {
-      id: jobId,
-      data,
-      complete: async () => {
-        await this.complete(jobId, claimToken)
-      },
-      fail: async (reason: string) => {
-        await this.fail(jobId, reason, claimToken)
-      },
-      log: (message: string) => {
-        void this.log(jobId, message)
-      },
+    if (job.dedupeKey && job.dedupeScope) {
+      this.activeDedupeKeys.add(
+        this.getDedupeSetKey(job.dedupeKey, job.dedupeScope),
+      )
     }
+
+    return this.createHandle(job)
   }
 
   async claimNext<T>(type: string): Promise<Job<T> | null> {
+    const activeSlots = new Set<string>()
     for (const job of this.jobs.values()) {
-      if (job.type === type && job.status === 'pending') {
-        job.status = 'active'
-        job.attempt++
-        job.claimedAt = new Date()
-        job.claimToken = randomUUID()
-        return job as Job<T>
+      if (job.status === 'active' && job.dedupeKey && job.dedupeScope) {
+        activeSlots.add(this.getDedupeSetKey(job.dedupeKey, job.dedupeScope))
       }
     }
-    return null
+    const job = [...this.jobs.values()]
+      .filter(
+        (candidate) =>
+          candidate.type === type &&
+          candidate.status === 'pending' &&
+          candidate.runAt.getTime() <= Date.now() &&
+          !(
+            candidate.dedupeKey &&
+            candidate.dedupeScope &&
+            activeSlots.has(
+              this.getDedupeSetKey(
+                candidate.dedupeKey,
+                candidate.dedupeScope,
+              ),
+            )
+          ),
+      )
+      .sort(
+        (a, b) =>
+          a.priority - b.priority || a.runAt.getTime() - b.runAt.getTime(),
+      )[0] as ImmediateJob<T> | undefined
+    if (!job) return null
+    this.markClaimed(job)
+    return this.toJob(job, true)
   }
 
-  private createContext(
-    jobId: string,
-    dedupeKey: string | undefined,
-    dedupeScope: 'pending' | 'pending+active',
-    claimToken?: string,
-  ): JobContext {
-    return {
-      complete: async () => {
-        await this.complete(jobId, claimToken)
-        if (dedupeKey) {
-          this.activeDedupeKeys.delete(
-            this.getDedupeSetKey(dedupeKey, dedupeScope),
-          )
-        }
-      },
-      fail: async (reason: string) => {
-        await this.fail(jobId, reason, claimToken)
-        if (dedupeKey) {
-          this.activeDedupeKeys.delete(
-            this.getDedupeSetKey(dedupeKey, dedupeScope),
-          )
-        }
-      },
-      failFatal: async (reason: string) => {
-        await this.failFatal(jobId, reason, claimToken)
-        if (dedupeKey) {
-          this.activeDedupeKeys.delete(
-            this.getDedupeSetKey(dedupeKey, dedupeScope),
-          )
-        }
-      },
-      log: (message: string) => {
-        // Safe to leave uncaught: this backend's `log` is a synchronous
-        // in-memory byte-count update and has no failure mode. The Mongo path
-        // needs a catch (see JobQueue.createContext); this one does not.
-        void this.log(jobId, message)
-      },
-      heartbeat: () => this.heartbeat(jobId, claimToken),
-    }
+  async claimNextByKey<T>(
+    type: string,
+    dedupeKey: string,
+  ): Promise<JobHandle<T> | null> {
+    const job = [...this.jobs.values()]
+      .filter(
+        (candidate) =>
+          candidate.type === type &&
+          candidate.dedupeKey === dedupeKey &&
+          candidate.status === 'pending' &&
+          candidate.runAt.getTime() <= Date.now(),
+      )
+      .sort(
+        (a, b) =>
+          a.priority - b.priority || a.runAt.getTime() - b.runAt.getTime(),
+      )[0] as ImmediateJob<T> | undefined
+    if (!job) return null
+    const blocked = [...this.jobs.values()].some(
+      (candidate) =>
+        candidate !== job &&
+        candidate.status === 'active' &&
+        candidate.dedupeKey === dedupeKey &&
+        candidate.dedupeScope === job.dedupeScope,
+    )
+    if (blocked) return null
+    this.markClaimed(job)
+    return this.createHandle(job)
   }
+
+
 
   /** Fence check mirroring Mongo's fenced lifecycle filter: with a token the
    * write only applies to an `active` job still holding that token. */
   private fenceMiss(job: Job | undefined, claimToken?: string): boolean {
-    if (!claimToken) return false
+    if (claimToken === undefined) return false
     return !job || job.status !== 'active' || job.claimToken !== claimToken
+  }
+
+  private terminalTransitionMiss(
+    job: Job,
+    claimToken?: string,
+  ): TerminalWriteMissResult | null {
+    if (
+      job.status === 'completed' ||
+      job.status === 'failed' ||
+      job.status === 'superseded'
+    ) {
+      return { status: 'already-terminal', terminalStatus: job.status }
+    }
+    if (this.fenceMiss(job, claimToken)) return { status: 'lease-lost' }
+    return null
   }
 
   async complete(
     jobId: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
+  ): Promise<CompleteJobResult> {
     const job = this.jobs.get(jobId)
-    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
-    if (job) {
+    if (!job) return { status: 'not-found' }
+    if (
+      job.status === 'failed' &&
+      !job.failedByLifecycleWrite &&
+      claimToken !== undefined &&
+      job.claimToken === claimToken
+    ) {
       job.status = 'completed'
       job.completedAt = new Date()
+      delete job.failedAt
+      delete job.failReason
+      return { status: 'completed' }
     }
-    return 'applied'
+    const miss = this.terminalTransitionMiss(job, claimToken)
+    if (miss) return miss
+
+    job.status = 'completed'
+    job.completedAt = new Date()
+    this.releaseDedupeKey(job)
+    return { status: 'completed' }
   }
 
   async fail(
     jobId: string,
     reason: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
+  ): Promise<FailJobResult> {
     const job = this.jobs.get(jobId)
-    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
-    if (job) {
-      job.failReason = reason
-      if (job.attempt >= job.maxAttempts) {
-        job.status = 'failed'
-        job.failedAt = new Date()
-      } else {
-        job.status = 'pending' // Back to pending for retry
+    if (!job) return { status: 'not-found' }
+    const miss = this.terminalTransitionMiss(job, claimToken)
+    if (miss) return miss
+
+    job.failReason = reason
+    let hasPendingFollower = false
+    if (job.dedupeKey && job.dedupeScope === 'pending') {
+      for (const candidate of this.jobs.values()) {
+        if (
+          candidate.dedupeKey === job.dedupeKey &&
+          candidate.dedupeScope === job.dedupeScope &&
+          candidate.status === 'pending'
+        ) {
+          hasPendingFollower = true
+          break
+        }
       }
     }
-    return 'applied'
+    if (hasPendingFollower) {
+      job.status = 'superseded'
+      job.failedAt = new Date()
+      this.releaseDedupeKey(job)
+      return { status: 'superseded' }
+    }
+    if (job.attempt >= job.maxAttempts) {
+      job.status = 'failed'
+      job.failedAt = new Date()
+      job.failedByLifecycleWrite = true
+      this.releaseDedupeKey(job)
+      return { status: 'failed-terminal' }
+    }
+    job.status = 'pending'
+    return { status: 'retry-scheduled' }
   }
 
   async failFatal(
     jobId: string,
     reason: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
+  ): Promise<FailFatalJobResult> {
     const job = this.jobs.get(jobId)
-    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
-    if (job) {
-      job.status = 'failed'
-      job.failReason = reason
-      job.failedAt = new Date()
+    if (!job) return { status: 'not-found' }
+    const miss = this.terminalTransitionMiss(job, claimToken)
+    if (miss) return miss
+
+    job.status = 'failed'
+    job.failReason = reason
+    job.failedAt = new Date()
+    job.failedByLifecycleWrite = true
+    this.releaseDedupeKey(job)
+    return { status: 'failed-terminal' }
+  }
+
+  async release(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<ReleaseJobResult> {
+    const job = this.jobs.get(jobId)
+    if (!job) return { status: 'not-found' }
+    if (
+      job.status === 'completed' ||
+      job.status === 'failed' ||
+      job.status === 'superseded'
+    ) {
+      return { status: 'already-terminal', terminalStatus: job.status }
     }
-    return 'applied'
+    if (
+      job.status !== 'active' ||
+      (claimToken !== undefined && job.claimToken !== claimToken)
+    ) {
+      return { status: 'lease-lost' }
+    }
+    const blocked =
+      job.dedupeKey !== undefined &&
+      job.dedupeScope !== undefined &&
+      [...this.jobs.values()].some(
+        (candidate) =>
+          candidate !== job &&
+          candidate.status === 'pending' &&
+          candidate.dedupeKey === job.dedupeKey &&
+          candidate.dedupeScope === job.dedupeScope,
+      )
+    if (blocked) {
+      job.status = 'superseded'
+      job.failReason =
+        'released: a queued follow-up already covers this work'
+      job.failedAt = new Date()
+      this.releaseDedupeKey(job)
+      return { status: 'superseded' }
+    }
+
+    job.status = 'pending'
+    job.runAt = new Date()
+    delete job.claimedAt
+    delete job.claimToken
+    return { status: 'released' }
   }
 
   /**
@@ -412,18 +542,23 @@ export class ImmediateBackend implements IJobQueueBackend {
     })
   }
 
+  async hasOutstanding(type: string, dedupeKey: string): Promise<boolean> {
+    for (const job of this.jobs.values()) {
+      if (
+        job.type === type &&
+        job.dedupeKey === dedupeKey &&
+        (job.status === 'pending' || job.status === 'active')
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
     for (const job of this.jobs.values()) {
       if (this.matchesQuery(job, query)) {
-        // General read view: strip the live fencing claimToken (and internal
-        // journal fields) — only the claim path may see the token.
-        const {
-          claimToken: _claimToken,
-          steps: _steps,
-          journalBytes: _journalBytes,
-          ...publicView
-        } = job
-        return publicView as Job<T>
+        return this.toJob(job as ImmediateJob<T>)
       }
     }
     return null
@@ -462,6 +597,7 @@ export class ImmediateBackend implements IJobQueueBackend {
       active: jobs.filter((j) => j.status === 'active').length,
       completed: jobs.filter((j) => j.status === 'completed').length,
       failed: jobs.filter((j) => j.status === 'failed').length,
+      superseded: jobs.filter((j) => j.status === 'superseded').length,
       ...backlogAge(jobs),
     }
   }
@@ -485,13 +621,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     this.jobs.clear()
     this.activeDedupeKeys.clear()
     this.idCounter = 0
-    // Note: handlers are NOT cleared - they're typically set up once
+    // Processor registration survives storage resets.
   }
 
-  /**
-   * Clear registered handlers
-   */
-  clearHandlers(): void {
-    this.handlers.clear()
-  }
 }

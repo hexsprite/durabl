@@ -12,9 +12,8 @@
  *
  * const queue = new JobQueue(backend)
  *
- * queue.process<{ userId: string }>('welcome-email', async (job, ctx) => {
+ * queue.process<{ userId: string }>('welcome-email', async (job) => {
  *   await sendWelcomeEmail(job.data.userId)
- *   await ctx.complete()
  * })
  *
  * await queue.enqueue('welcome-email', { userId }, {
@@ -30,15 +29,20 @@ export {
   getDefaultQueue,
   getGlobalBackend,
   setGlobalBackend,
+  withGlobalQueue,
 } from './JobQueue'
-export type { JobQueueOptions } from './JobQueue'
+export type { GlobalQueueOptions, JobQueueOptions } from './JobQueue'
 
 // Types
+export { FatalJobError } from './types'
 export type {
   AppendStepResult,
   CompleteClaimedResult,
+  CompleteJobResult,
   DedupeScope,
   EnqueueOptions,
+  FailFatalJobResult,
+  FailJobResult,
   HeartbeatClaimedResult,
   Job,
   JobContext,
@@ -49,9 +53,13 @@ export type {
   JobHandler,
   JobStatus,
   LifecycleWriteResult,
+  ReleaseJobResult,
+  TerminalWriteMissResult,
+  RunClaimedOptions,
   ProcessorConfig,
   QueueStats,
   StepRecord,
+  StartReaperResult,
 } from './types'
 
 // Durable-execution orchestrator (step-level resume)

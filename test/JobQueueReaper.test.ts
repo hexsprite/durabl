@@ -10,10 +10,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DummyBackend } from '../src/backends/DummyBackend'
 import { ImmediateBackend } from '../src/backends/ImmediateBackend'
 import { JobQueue } from '../src/JobQueue'
+import type { Logger } from '../src/logger'
+import type { JobEvent } from '../src/types'
 import { silentLogger } from './testLogger'
 
 let backend: DummyBackend
 let queue: JobQueue
+
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (reason?: unknown) => void
+} {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -26,73 +42,230 @@ afterEach(async () => {
   await queue.shutdown(100)
 })
 
-describe('JobQueue.startReaper (du-jt0)', () => {
-  // Regression: recoverStuckJobs was operator-invoked with its own
-  // visibilityTimeoutMs param (default 300000) that only matched the queue's
-  // configured value by coincidence. The reaper must sweep with the queue's
-  // value — the same one the Orchestrator sizes heartbeats from.
-  it('sweeps with the queue-configured visibilityTimeoutMs, not an independent default', async () => {
-    queue.startReaper(1000)
+describe('JobQueue.startReaper (du-jt0, du-zcz.4)', () => {
+  it('runs an immediate sweep with the queue visibility timeout before arming the timer', async () => {
+    backend.recoverStuckJobs = async (visibilityTimeoutMs?: number) => {
+      backend.recoverStuckJobsCalls.push(visibilityTimeoutMs)
+      return 7
+    }
 
-    await vi.advanceTimersByTimeAsync(3000)
+    const starting = queue.startReaper(1000)
 
+    expect(backend.recoverStuckJobsCalls).toEqual([12345])
+    expect(vi.getTimerCount()).toBe(0)
+    await expect(starting).resolves.toEqual({
+      status: 'started',
+      recovered: 7,
+    })
+    expect(vi.getTimerCount()).toBe(1)
+  })
+
+  it('returns recovered null after a failed startup sweep, reports the error, and keeps running', async () => {
+    const events: JobEvent[] = []
+    const error = vi.fn()
+    const logger: Logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error,
+      child: () => logger,
+    }
+    backend.recoverStuckJobs = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('startup broke'))
+      .mockResolvedValueOnce(2)
+    queue = new JobQueue(backend, logger, {
+      visibilityTimeoutMs: 12345,
+      onJobEvent: (event) => events.push(event),
+    })
+
+    await expect(queue.startReaper(1000)).resolves.toEqual({
+      status: 'started',
+      recovered: null,
+    })
+
+    expect(error).toHaveBeenCalledTimes(1)
+    expect(events).toEqual([
+      {
+        kind: 'reaper-error',
+        phase: 'startup',
+        message: 'startup broke',
+      },
+    ])
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(backend.recoverStuckJobs).toHaveBeenCalledTimes(2)
+    expect(events[1]).toEqual({
+      kind: 'reaper-recovered',
+      handled: 2,
+      saturated: false,
+    })
+  })
+
+  it('reports periodic errors separately and retries on the next interval', async () => {
+    const events: JobEvent[] = []
+    backend.recoverStuckJobs = vi
+      .fn()
+      .mockResolvedValueOnce(0)
+      .mockRejectedValueOnce(new Error('periodic broke'))
+      .mockResolvedValueOnce(0)
+    queue = new JobQueue(backend, silentLogger, {
+      visibilityTimeoutMs: 12345,
+      onJobEvent: (event) => events.push(event),
+    })
+    await queue.startReaper(1000)
+
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(events).toEqual([
+      {
+        kind: 'reaper-error',
+        phase: 'periodic',
+        message: 'periodic broke',
+      },
+    ])
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(backend.recoverStuckJobs).toHaveBeenCalledTimes(3)
+  })
+
+  it('rejects an unsupported backend without sweeping or arming a timer', async () => {
+    const unsupportedQueue = new JobQueue(
+      new ImmediateBackend(),
+      silentLogger,
+    )
+
+    await expect(unsupportedQueue.startReaper()).rejects.toThrow(
+      /recoverStuckJobs/,
+    )
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('shares one startup promise and result between concurrent callers', async () => {
+    const sweep = deferred<number>()
+    backend.recoverStuckJobs = vi.fn(() => sweep.promise)
+
+    const first = queue.startReaper(1000)
+    const second = queue.startReaper(2000)
+
+    expect(second).toBe(first)
+    expect(backend.recoverStuckJobs).toHaveBeenCalledTimes(1)
+
+    sweep.resolve(4)
+    await expect(first).resolves.toEqual({
+      status: 'started',
+      recovered: 4,
+    })
+    await expect(second).resolves.toEqual({
+      status: 'started',
+      recovered: 4,
+    })
+    expect(vi.getTimerCount()).toBe(1)
+  })
+
+  it('reports already-running after startup has settled', async () => {
+    await expect(queue.startReaper(1000)).resolves.toEqual({
+      status: 'started',
+      recovered: 0,
+    })
+
+    await expect(queue.startReaper(2000)).resolves.toEqual({
+      status: 'already-running',
+    })
+    expect(backend.recoverStuckJobsCalls).toEqual([12345])
+    expect(vi.getTimerCount()).toBe(1)
+  })
+
+  it('does not arm a timer when shutdown happens during the startup sweep', async () => {
+    const sweep = deferred<number>()
+    backend.recoverStuckJobs = vi.fn(() => sweep.promise)
+
+    const starting = queue.startReaper(1000)
+    const shuttingDown = queue.shutdown(100)
+    sweep.resolve(0)
+    await Promise.all([starting, shuttingDown])
+
+    expect(backend.recoverStuckJobs).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(backend.recoverStuckJobs).toHaveBeenCalledTimes(1)
+  })
+
+  it('never overlaps the immediate sweep with periodic sweeps', async () => {
+    const startupSweep = deferred<number>()
+    const periodicSweep = deferred<number>()
+    let call = 0
+    backend.recoverStuckJobs = async (visibilityTimeoutMs?: number) => {
+      backend.recoverStuckJobsCalls.push(visibilityTimeoutMs)
+      call += 1
+      if (call === 1) return startupSweep.promise
+      if (call === 2) return periodicSweep.promise
+      return 0
+    }
+
+    const starting = queue.startReaper(1000)
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(backend.recoverStuckJobsCalls).toEqual([12345])
+
+    startupSweep.resolve(0)
+    await starting
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(backend.recoverStuckJobsCalls).toEqual([12345, 12345])
+
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(backend.recoverStuckJobsCalls).toEqual([12345, 12345])
+
+    periodicSweep.resolve(0)
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(1000)
     expect(backend.recoverStuckJobsCalls).toEqual([12345, 12345, 12345])
   })
 
-  it('shutdown() stops the reaper so no sweeps fire afterwards', async () => {
-    queue.startReaper(1000)
+  it('emits normal and saturated recovery events for successful sweeps', async () => {
+    const events: JobEvent[] = []
+    backend.recoverStuckJobs = vi
+      .fn()
+      .mockResolvedValueOnce(3)
+      .mockResolvedValueOnce(1000)
+    queue = new JobQueue(backend, silentLogger, {
+      visibilityTimeoutMs: 12345,
+      onJobEvent: (event) => events.push(event),
+    })
+
+    await queue.startReaper(1000)
     await vi.advanceTimersByTimeAsync(1000)
-    expect(backend.recoverStuckJobsCalls).toHaveLength(1)
 
-    await queue.shutdown(100)
-    await vi.advanceTimersByTimeAsync(5000)
-
-    expect(backend.recoverStuckJobsCalls).toHaveLength(1)
+    expect(events).toEqual([
+      {
+        kind: 'reaper-recovered',
+        handled: 3,
+        saturated: false,
+      },
+      {
+        kind: 'reaper-recovered',
+        handled: 1000,
+        saturated: true,
+      },
+    ])
   })
 
-  it('stopReaper() stops sweeps and is safe to call twice', async () => {
-    queue.startReaper(1000)
-    await vi.advanceTimersByTimeAsync(1000)
+  it('stopReaper() stops periodic sweeps and is safe to call twice', async () => {
+    await queue.startReaper(1000)
+    expect(backend.recoverStuckJobsCalls).toEqual([12345])
 
     queue.stopReaper()
     queue.stopReaper()
     await vi.advanceTimersByTimeAsync(5000)
 
-    expect(backend.recoverStuckJobsCalls).toHaveLength(1)
+    expect(backend.recoverStuckJobsCalls).toEqual([12345])
   })
 
-  it('is idempotent: a second startReaper() does not double the sweeps', async () => {
-    queue.startReaper(1000)
-    queue.startReaper(1000)
-
-    await vi.advanceTimersByTimeAsync(1000)
-
-    expect(backend.recoverStuckJobsCalls).toHaveLength(1)
-  })
-
-  it('keeps sweeping after a failed sweep (transient backend error)', async () => {
-    backend.recoverStuckJobs = async (visibilityTimeoutMs?: number) => {
-      backend.recoverStuckJobsCalls.push(visibilityTimeoutMs)
-      if (backend.recoverStuckJobsCalls.length === 1) {
-        throw new Error('transient')
-      }
-      return 0
-    }
-    queue.startReaper(1000)
-
-    await vi.advanceTimersByTimeAsync(2000)
-
-    expect(backend.recoverStuckJobsCalls).toEqual([12345, 12345])
-  })
-
-  it('throws when the backend does not implement recoverStuckJobs', () => {
-    const q = new JobQueue(new ImmediateBackend(), silentLogger)
-    expect(() => q.startReaper()).toThrow(/recoverStuckJobs/)
-  })
-
-  it('rejects a non-positive sweep interval', () => {
-    expect(() => queue.startReaper(0)).toThrow(/intervalMs/)
-    expect(() => queue.startReaper(-1)).toThrow(/intervalMs/)
+  it('rejects a non-positive sweep interval', async () => {
+    await expect(queue.startReaper(0)).rejects.toThrow(/intervalMs/)
+    await expect(queue.startReaper(-1)).rejects.toThrow(/intervalMs/)
   })
 })
 

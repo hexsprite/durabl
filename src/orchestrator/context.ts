@@ -4,7 +4,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto'
 
-import { StepTimeout } from '../journal/errors'
+import { LeaseLostError, StepTimeout } from '../journal/errors'
 import { assertStepMatches, fromStored, toStored } from '../journal/serialize'
 import type {
   AppendStepResult,
@@ -98,13 +98,6 @@ interface BuildContextArgs<T> {
   runController: AbortController
 }
 
-/** Sentinel thrown internally when the lease is lost; mapped to a retry. */
-export class LeaseLostError extends Error {
-  constructor() {
-    super('orchestrator lease lost')
-    this.name = 'LeaseLostError'
-  }
-}
 
 /**
  * Build the durable context for one run. `seq` is assigned synchronously at each
@@ -281,55 +274,3 @@ export function runWithTimeout<R>(
   })
 }
 
-/** Result of {@link startHeartbeat}. */
-export interface HeartbeatHandle {
-  stop(): void
-}
-
-/**
- * Self-scheduling, awaited, error-caught lease renewer. Never overlaps (the next
- * tick is scheduled only after the previous write settles), never an unhandled
- * rejection, re-armed until stopped. A `'lease-lost'` result means another
- * worker owns the job: the loop stops for good (renewing a foreign lease is
- * pointless) and `onLeaseLost` fires exactly once so the caller can abort the
- * orphaned run. Transient errors (thrown) warn and re-arm. §7.2.
- */
-export function startHeartbeat(
-  journal: StepJournalPort,
-  jobId: string,
-  claimToken: string,
-  intervalMs: number,
-  onWarn: (err: unknown) => void,
-  onLeaseLost: () => void,
-): HeartbeatHandle {
-  let stopped = false
-  let timer: ReturnType<typeof setTimeout>
-
-  const tick = async (): Promise<void> => {
-    if (stopped) return
-    try {
-      const res = await journal.heartbeatClaimed(jobId, claimToken)
-      // stop() may have fired while this write was in flight (the run completed
-      // or failed and set the status): honor it so a post-stop 'lease-lost'
-      // read is ignored instead of aborting an already-finished run.
-      if (stopped) return
-      if (res === 'lease-lost') {
-        stopped = true
-        onLeaseLost()
-        return
-      }
-    } catch (err) {
-      if (stopped) return
-      onWarn(err)
-    }
-    if (!stopped) timer = setTimeout(() => void tick(), intervalMs)
-  }
-
-  timer = setTimeout(() => void tick(), intervalMs)
-  return {
-    stop() {
-      stopped = true
-      clearTimeout(timer)
-    },
-  }
-}

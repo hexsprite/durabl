@@ -1,8 +1,15 @@
 /** JobQueue - main API wrapping a backend with processor loop management. */
 import { defaultLogger, type Logger } from './logger'
 
-import type { IJobQueueBackend } from './backends/IJobQueueBackend'
-import { OrchestrationUnsupportedError } from './journal/errors'
+import {
+  registerInlineProcessor,
+  type IJobQueueBackend,
+} from './backends/IJobQueueBackend'
+import {
+  LeaseLostError,
+  OrchestrationUnsupportedError,
+} from './journal/errors'
+import { assertValidLatestCoalescing, FatalJobError } from './types'
 import type {
   AppendStepResult,
   CompleteClaimedResult,
@@ -17,7 +24,11 @@ import type {
   ProcessorConfig,
   QueueStats,
   StepRecord,
+  RunClaimedOptions,
+  StartReaperResult,
 } from './types'
+
+type InlineSlotWaiter = (acquired: boolean) => void
 
 /** An in-flight {@link JobQueue.sleep}, tracked so shutdown can cancel it. */
 interface PendingSleep {
@@ -31,9 +42,23 @@ interface ProcessorState {
   config: Required<ProcessorConfig>
   running: boolean
   activeCount: number
+  inlineSlotWaiters: InlineSlotWaiter[]
   /** Current backoff delay after errors (resets on success) */
   backoffMs: number
 }
+
+interface ManagedRun {
+  handle: JobHandle<unknown>
+  controller: AbortController
+  stopHeartbeat: () => void
+  settled: Promise<void>
+  resolveSettled: () => void
+}
+
+type ManagedExecutionResult =
+  | { status: 'completed' }
+  | { status: 'superseded'; handlerError: unknown }
+  | { status: 'stopped' }
 
 const MIN_BACKOFF_MS = 1000
 const MAX_BACKOFF_MS = 60000
@@ -44,6 +69,9 @@ const PUSH_POLL_INTERVAL_MS = 60000
 const DEFAULT_VISIBILITY_TIMEOUT_MS = 300000
 /** Default cadence for the built-in reaper timer ({@link JobQueue.startReaper}). */
 const DEFAULT_REAPER_INTERVAL_MS = 60000
+const DEFAULT_MAX_DRAINS = 10
+/** Maximum wait for all post-abort release writes during shutdown. */
+const SHUTDOWN_RELEASE_WAIT_MS = 1000
 /**
  * Recovered-count at which a sweep is assumed to have hit the backend's batch
  * cap. Mirrors `DEFAULT_REAPER_BATCH_SIZE` in MongoJobQueue; a full batch means
@@ -73,6 +101,9 @@ export interface JobQueueOptions {
   onJobEvent?: JobEventSink
 }
 
+/** Options captured with the global backend. */
+export type GlobalQueueOptions = JobQueueOptions & { logger?: Logger }
+
 export class JobQueue {
   private backend: IJobQueueBackend
   private log: Logger
@@ -86,10 +117,14 @@ export class JobQueue {
    * `startReaper()` call mid-sweep would start a parallel loop.
    */
   private reaperActive = false
+  /** Shared by callers while the immediate startup sweep is in flight. */
+  private reaperStarting: Promise<StartReaperResult> | null = null
   /** Poll-loop sleeps currently parked; cleared by {@link shutdown}. */
   private pendingSleeps: Set<PendingSleep> = new Set()
   /** In-flight drain started by {@link installSignalHandlers}, if any. */
   private signalDrain: Promise<void> | null = null
+  /** Claims currently owned by queue-managed handler execution. */
+  private managedRuns: Set<ManagedRun> = new Set()
   /** Metrics sink, if configured. */
   private onJobEvent?: JobEventSink
   /** Reaper visibility timeout this queue is operated with (§7.1). */
@@ -129,8 +164,8 @@ export class JobQueue {
     options?: EnqueueOptions,
   ): Promise<string | null> {
     const jobId = await this.backend.enqueue(type, data, options)
-    // If a local processor has capacity, try to run immediately.
-    if (jobId) this.tryProcessNext(type)
+    // Inline backends already awaited their registered managed callback.
+    if (jobId && !this.backend.executesInline) this.tryProcessNext(type)
     return jobId
   }
 
@@ -140,10 +175,39 @@ export class JobQueue {
     data: T,
     options?: EnqueueOptions,
   ): Promise<JobHandle<T> | null> {
-    return this.backend.claimOrEnqueue(type, data, options)
+    assertValidLatestCoalescing(options)
+    this.assertRunAdmission()
+    const handle = await this.backend.claimOrEnqueue(type, data, options)
+    if (handle && !this.runAdmissionOpen()) {
+      await this.rejectClaimAfterShutdown(handle)
+    }
+    return handle
   }
 
-  /** Register a job processor for a type. Starts a polling loop. */
+  /**
+   * Execute a live claim under queue-owned lifecycle management.
+   *
+   * A successful return or superseded failure can claim one pending follower
+   * with the same key. The chain preserves and later throws the first
+   * superseded handler error after newer work runs.
+   */
+  async runClaimed<T>(
+    initial: JobHandle<T>,
+    handler: JobHandler<T>,
+    options: RunClaimedOptions = {},
+  ): Promise<void> {
+    if (!this.runAdmissionOpen()) {
+      await this.rejectClaimAfterShutdown(initial)
+    }
+    const maxDrains = options.maxDrains ?? DEFAULT_MAX_DRAINS
+    this.assertValidMaxDrains(maxDrains)
+    await this.executeManagedChain(initial, handler, maxDrains)
+  }
+
+  /**
+   * Register a managed processor. Inline backends invoke it during enqueue;
+   * other backends start a polling loop.
+   */
   process<T>(
     type: string,
     handler: JobHandler<T>,
@@ -163,13 +227,42 @@ export class JobQueue {
       config: {
         concurrency: config.concurrency ?? 1,
         pollInterval: config.pollInterval ?? defaultPollInterval,
+        heartbeatIntervalMs:
+          config.heartbeatIntervalMs ??
+          Math.max(1, Math.floor(this.visibilityTimeoutMs / 3)),
       },
       running: true,
       activeCount: 0,
       backoffMs: 0,
+      inlineSlotWaiters: [],
+    }
+
+    const register = this.backend[registerInlineProcessor]
+    if (this.backend.executesInline && !register) {
+      throw new Error('inline backend does not expose managed processor registration')
     }
 
     this.processors.set(type, state)
+    if (register) {
+      register.call(this.backend, type, async (job) => {
+        const acquired = await this.acquireInlineSlot(state)
+        if (!acquired) {
+          await this.releaseForShutdown(job)
+          return
+        }
+        try {
+          await this.executeManagedChain(
+            job,
+            state.handler,
+            DEFAULT_MAX_DRAINS,
+            state.config.heartbeatIntervalMs,
+          )
+        } finally {
+          this.releaseInlineSlot(state)
+        }
+      })
+      return
+    }
     void this.startProcessorLoop(state)
   }
 
@@ -246,25 +339,26 @@ export class JobQueue {
     return this.backend.getStats(type)
   }
 
+  /** Return whether this type and dedupe key has a pending or active job. */
+  async hasOutstanding(type: string, dedupeKey: string): Promise<boolean> {
+    return this.backend.hasOutstanding(type, dedupeKey)
+  }
+
   // --- Durable-orchestration journal passthroughs (§3.5) --------------------
   // Thin delegations so an Orchestrator depends only on JobQueue and never
   // reaches around it to the backend. Each throws OrchestrationUnsupportedError
   // if the backend lacks the capability.
 
-  /** Throw if the backend cannot host durable orchestrations — either because
-   * it executes jobs inline (bypassing the `process()` loop the wrapper needs)
-   * or because it lacks one of the four journal methods. The
-   * {@link Orchestrator} constructor calls this. */
+  /** Throw if the backend cannot host durable orchestrations. */
   assertJournalCapable(): void {
-    // An inline backend runs its own handler registry on enqueue and never
-    // drives queue.process() processors, so an orchestration wrapper would
-    // never execute — the job would sit 'active' forever. Fail loud instead.
+    // Inline execution has no durable handoff after enqueue returns, so it
+    // cannot model orchestration crash recovery even though process callbacks
+    // now share the managed lifecycle path.
     if (this.backend.executesInline) {
       throw new OrchestrationUnsupportedError(
         'executesInline',
-        'backend executes jobs inline on enqueue and never runs queue.process() ' +
-          'processors, so it cannot host durable orchestrations — use DummyBackend ' +
-          'for orchestration unit tests',
+        'backend executes jobs inline during enqueue, so it cannot host durable ' +
+          'orchestrations — use DummyBackend for orchestration unit tests',
       )
     }
     if (typeof this.backend.readSteps !== 'function') {
@@ -325,68 +419,95 @@ export class JobQueue {
   }
 
   /**
-   * Start the stuck-job reaper: periodically invoke the backend's
-   * `recoverStuckJobs()` with **this queue's** `visibilityTimeoutMs`, so the
-   * value the {@link Orchestrator} sizes heartbeats from and the value the
-   * reaper enforces can never drift apart (§7.1). Run this on exactly one
-   * process (or accept redundant-but-harmless sweeps on several).
+   * Start the stuck-job reaper with one immediate recovery, then periodic
+   * non-overlapping sweeps.
    *
-   * The timer is `unref`'d — it won't keep the process alive — and is cleared
-   * by {@link stopReaper} / {@link shutdown}.
+   * The queue's `visibilityTimeoutMs` is the single lease-window source of
+   * truth. A startup sweep failure is reported but does not disable later
+   * sweeps. The timer is unref'd and cleared by {@link stopReaper} or
+   * {@link shutdown}.
    *
-   * @param intervalMs sweep cadence. Default: 60000.
-   * @throws if the backend does not implement `recoverStuckJobs`.
+   * @param intervalMs sweep cadence after the immediate recovery. Default: 60000.
    */
-  startReaper(intervalMs = DEFAULT_REAPER_INTERVAL_MS): void {
+  startReaper(
+    intervalMs = DEFAULT_REAPER_INTERVAL_MS,
+  ): Promise<StartReaperResult> {
     if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
-      throw new Error(
-        `startReaper intervalMs must be a positive finite number of milliseconds, got ${intervalMs}`,
+      return Promise.reject(
+        new Error(
+          `startReaper intervalMs must be a positive finite number of milliseconds, got ${intervalMs}`,
+        ),
       )
     }
     if (typeof this.backend.recoverStuckJobs !== 'function') {
-      throw new Error(
-        'startReaper: backend does not implement recoverStuckJobs',
+      return Promise.reject(
+        new Error('startReaper: backend does not implement recoverStuckJobs'),
       )
     }
-    if (this.reaperActive) return // already running — idempotent
+    if (this.reaperStarting) return this.reaperStarting
+    if (this.reaperActive) {
+      return Promise.resolve({ status: 'already-running' })
+    }
+
     this.reaperActive = true
 
-    // Self-scheduling, not setInterval: the next sweep is armed only once the
-    // previous one settles. A setInterval fires on the clock regardless, so a
-    // sweep that outlasts its interval — exactly what happens after a mass
-    // worker death, when the stuck set is largest — overlapped with the next
-    // one and multiplied the cursor work at the worst possible moment.
-    // (Same shape as `startHeartbeat` in orchestrator/context.ts.)
+    // Self-scheduling, not setInterval: each periodic sweep settles before the
+    // next timer is armed, so a slow backend can never overlap its own sweep.
     const tick = async (): Promise<void> => {
       if (!this.reaperActive || this.isShuttingDown) return
-      try {
-        const handled = await this.backend.recoverStuckJobs!(
-          this.visibilityTimeoutMs,
-        )
-        if (handled > 0) {
-          this.log.warn({ handled }, 'reaper recovered stuck jobs')
-          // `saturated` means the sweep hit its batch cap, so more is waiting —
-          // the difference between a blip and a backlog an operator must watch.
-          this.emit({
-            kind: 'reaper-recovered',
-            handled,
-            saturated: handled >= REAPER_SATURATION_HINT,
-          })
-        }
-      } catch (err) {
-        this.log.error({ err }, 'reaper sweep failed; will retry next tick')
-      }
-      // stopReaper()/shutdown() may have run while the sweep was in flight.
+      await this.runReaperSweep('periodic')
       if (!this.reaperActive || this.isShuttingDown) return
       this.armReaper(tick, intervalMs)
     }
 
-    this.armReaper(tick, intervalMs)
+    const starting = this.runReaperSweep('startup')
+      .then<StartReaperResult>((recovered) => {
+        // stopReaper()/shutdown() may have run while startup was in flight.
+        if (this.reaperActive && !this.isShuttingDown) {
+          this.armReaper(tick, intervalMs)
+        }
+        return { status: 'started', recovered }
+      })
+      .finally(() => {
+        this.reaperStarting = null
+      })
+
+    this.reaperStarting = starting
+    return starting
+  }
+
+  /** Run one recovery sweep and isolate backend failures from the reaper loop. */
+  private async runReaperSweep(
+    phase: 'startup' | 'periodic',
+  ): Promise<number | null> {
+    try {
+      const handled = await this.backend.recoverStuckJobs!(
+        this.visibilityTimeoutMs,
+      )
+      if (handled > 0) {
+        this.log.warn({ handled }, 'reaper recovered stuck jobs')
+        this.emit({
+          kind: 'reaper-recovered',
+          handled,
+          saturated: handled >= REAPER_SATURATION_HINT,
+        })
+      }
+      return handled
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.log.error(
+        { err, phase },
+        'reaper sweep failed; will retry next interval',
+      )
+      this.emit({ kind: 'reaper-error', phase, message })
+      return null
+    }
   }
 
   /** Arm the next reaper tick. Unref'd — the reaper never keeps a process alive. */
   private armReaper(tick: () => Promise<void>, intervalMs: number): void {
     const timer = setTimeout(() => {
+      this.reaperTimer = null
       void tick()
     }, intervalMs)
     timer.unref?.()
@@ -475,40 +596,120 @@ export class JobQueue {
     return this.signalDrain
   }
 
-  /** Graceful shutdown. Stops processors and waits for active jobs. */
+  /**
+   * Stop claims immediately, allow a grace period, then cancel and release any
+   * remaining managed claims. Release writes get a separate fixed one-second
+   * bound so a broken backend cannot hang process shutdown.
+   */
   async shutdown(timeoutMs = 30000): Promise<void> {
     this.isShuttingDown = true
-
     this.stopReaper()
 
-    // Stop accepting new push notifications immediately
     if (this.unsubscribePush) {
       this.unsubscribePush()
       this.unsubscribePush = null
     }
-
-    // Stop all processors
     for (const state of this.processors.values()) {
       state.running = false
+      this.cancelInlineSlotWaiters(state)
     }
-
-    // Wake every parked poll loop so it exits now instead of at the end of its
-    // current interval — and, more importantly, so its timer stops holding the
-    // event loop open after this method resolves.
     this.cancelPendingSleeps()
 
-    // Wait for active jobs to complete
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      let activeCount = 0
-      for (const state of this.processors.values()) {
-        activeCount += state.activeCount
+    const active = [...this.managedRuns]
+    if (active.length > 0) {
+      const graceMs =
+        Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0
+      await this.waitWithin(
+        Promise.all(active.map((run) => run.settled)).then(() => undefined),
+        graceMs,
+      )
+    }
+
+    const remaining = [...this.managedRuns]
+    if (remaining.length > 0) {
+      for (const run of remaining) {
+        run.stopHeartbeat()
+        if (!run.controller.signal.aborted) {
+          run.controller.abort(new Error('job queue shutdown'))
+        }
       }
-      if (activeCount === 0) break
-      await this.sleep(100)
+
+      const releases = remaining.map(async (run) => {
+        try {
+          await this.releaseForShutdown(run.handle)
+        } catch (err) {
+          this.log.warn(
+            { err, jobId: run.handle.id },
+            'failed to release job during shutdown',
+          )
+        }
+      })
+      await this.waitWithin(
+        Promise.allSettled(releases).then(() => undefined),
+        SHUTDOWN_RELEASE_WAIT_MS,
+      )
     }
 
     await this.backend.shutdown(timeoutMs)
+  }
+
+  private acquireInlineSlot(state: ProcessorState): Promise<boolean> {
+    if (!state.running || this.isShuttingDown) return Promise.resolve(false)
+    if (state.activeCount < state.config.concurrency) {
+      state.activeCount++
+      return Promise.resolve(true)
+    }
+    return new Promise((resolve) => {
+      state.inlineSlotWaiters.push(resolve)
+    })
+  }
+
+  private releaseInlineSlot(state: ProcessorState): void {
+    state.activeCount--
+    while (state.inlineSlotWaiters.length > 0) {
+      const waiter = state.inlineSlotWaiters.shift()
+      if (!waiter) return
+      if (!state.running || this.isShuttingDown) {
+        waiter(false)
+        continue
+      }
+      state.activeCount++
+      waiter(true)
+      return
+    }
+  }
+
+  private cancelInlineSlotWaiters(state: ProcessorState): void {
+    for (const waiter of state.inlineSlotWaiters.splice(0)) waiter(false)
+  }
+
+  private async releaseForShutdown(handle: JobHandle<unknown>): Promise<void> {
+    const result = await handle.release()
+    if (result.status === 'superseded') {
+      this.emit({
+        kind: 'superseded',
+        type: handle.type,
+        jobId: handle.id,
+        durationMs: Math.max(
+          0,
+          Date.now() - (handle.claimedAt?.getTime() ?? Date.now()),
+        ),
+        reason: 'queued follow-up already covers this work',
+      })
+      return
+    }
+    if (result.status !== 'released') {
+      this.log.warn(
+        { jobId: handle.id, result },
+        'job release did not apply during shutdown',
+      )
+      return
+    }
+    this.emit({
+      kind: 'shutdown-released',
+      type: handle.type,
+      jobId: handle.id,
+    })
   }
 
   /**
@@ -533,55 +734,19 @@ export class JobQueue {
     }
   }
 
-  /**
-   * Process a single job
-   */
+  /** Run one processor claim through the shared managed execution chain. */
   private async processJob(state: ProcessorState, job: Job): Promise<void> {
-    const ctx = this.createContext(job)
-    // Claim-to-terminal duration. Measured here rather than from `claimedAt` so
-    // it reflects this worker's handling time, not clock skew between hosts.
-    const startedAt = Date.now()
-    this.emit({
-      kind: 'claimed',
-      type: job.type,
-      jobId: job.id,
-      attempt: job.attempt,
-    })
-
     try {
-      await state.handler(job, ctx)
-      this.emit({
-        kind: 'completed',
-        type: job.type,
-        jobId: job.id,
-        durationMs: Date.now() - startedAt,
-      })
+      await this.executeManagedChain(
+        this.createHandle(job),
+        state.handler,
+        DEFAULT_MAX_DRAINS,
+        state.config.heartbeatIntervalMs,
+      )
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err)
-      // `terminal` distinguishes a retry from a give-up, which is the whole
-      // point of charting this: a flaky job that recovers is not an incident.
-      this.emit({
-        kind: 'failed',
-        type: job.type,
-        jobId: job.id,
-        durationMs: Date.now() - startedAt,
-        attempt: job.attempt,
-        maxAttempts: job.maxAttempts,
-        terminal: job.attempt >= job.maxAttempts,
-        reason,
-      })
-      try {
-        // Fenced with the claim token from *this* claim: if the job was
-        // reclaimed (reaper → another worker), the fail must not clobber the
-        // live owner's copy. On a fence miss, do nothing and do not retry.
-        const res = await this.backend.fail(job.id, reason, job.claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(job.id, 'fail', job.type)
-      } catch (failErr) {
-        this.log.error({ failErr, jobId: job.id }, 'error marking job as failed')
-      }
+      this.log.error({ err, jobId: job.id, type: job.type }, 'job handler failed')
     } finally {
       state.activeCount--
-      // Try to pick up next job now that we have capacity
       this.tryProcessNext(state.type)
     }
   }
@@ -605,46 +770,365 @@ export class JobQueue {
   private warnLeaseLost(jobId: string, op: string, type?: string): void {
     this.log.warn(
       { jobId, op },
-      'lease lost; skipping fail/complete — job owned by another worker',
+      'lease lost; skipping lifecycle write — job owned by another worker',
     )
     if (type) this.emit({ kind: 'lease-lost', type, jobId, op })
   }
 
-  /**
-   * Create JobContext for handler. All lifecycle writes are fenced with the
-   * claim token from this claim (when the backend minted one), so a zombie
-   * worker can never complete/fail a job that another worker now owns.
-   */
-  private createContext(job: Job): JobContext {
-    const { id: jobId, claimToken, type } = job
+  /** Bind a raw processor claim to the backend's fenced lifecycle methods. */
+  private createHandle<T>(job: Job<T>): JobHandle<T> {
+    const claimToken = job.claimToken
     return {
-      complete: async () => {
-        const res = await this.backend.complete(jobId, claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'complete', type)
-      },
-      fail: async (reason: string) => {
-        const res = await this.backend.fail(jobId, reason, claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'fail', type)
-      },
-      failFatal: async (reason: string) => {
-        const res = await this.backend.failFatal(jobId, reason, claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'failFatal', type)
-        else this.emit({ kind: 'fail-fatal', type, jobId, reason })
-      },
+      ...job,
+      status: 'active',
+      complete: () => this.backend.complete(job.id, claimToken),
+      fail: (reason: string) =>
+        this.backend.fail(job.id, reason, claimToken),
+      failFatal: (reason: string) =>
+        this.backend.failFatal(job.id, reason, claimToken),
+      heartbeat: () => this.backend.heartbeat(job.id, claimToken),
+      release: () => this.backend.release(job.id, claimToken),
       log: (message: string) => {
-        // Fire-and-forget, but never unhandled: a rejected job-log write with
-        // no catch takes the whole worker down under Node's default
-        // --unhandled-rejections=throw. A lost log line is not worth a
-        // process; report it and carry on.
-        this.backend.log(jobId, message).catch((err: unknown) => {
-          this.log.warn({ err, jobId }, 'failed to write job log entry')
+        this.backend.log(job.id, message).catch((err: unknown) => {
+          this.log.warn({ err, jobId: job.id }, 'failed to write job log entry')
         })
       },
-      heartbeat: async () => {
-        const res = await this.backend.heartbeat(jobId, claimToken)
-        if (res === 'lease-lost') this.warnLeaseLost(jobId, 'heartbeat', type)
-        return res
-      },
+    }
+  }
+
+  /** Strip every lifecycle method before exposing a claim to a handler. */
+  private jobView<T>(handle: JobHandle<T>): Job<T> {
+    return {
+      id: handle.id,
+      type: handle.type,
+      data: handle.data,
+      status: handle.status,
+      attempt: handle.attempt,
+      maxAttempts: handle.maxAttempts,
+      priority: handle.priority,
+      dedupeKey: handle.dedupeKey,
+      dedupeScope: handle.dedupeScope,
+      runAt: handle.runAt,
+      createdAt: handle.createdAt,
+      claimedAt: handle.claimedAt,
+      completedAt: handle.completedAt,
+      failedAt: handle.failedAt,
+      failReason: handle.failReason,
+      claimToken: handle.claimToken,
+    }
+  }
+
+  private runAdmissionOpen(): boolean {
+    return !this.isShuttingDown
+  }
+
+  private shutdownAdmissionError(cause?: unknown): Error {
+    return new Error('JobQueue is shutting down; no new runs are accepted', {
+      cause,
+    })
+  }
+
+  private assertRunAdmission(): void {
+    if (!this.runAdmissionOpen()) throw this.shutdownAdmissionError()
+  }
+
+  private async rejectClaimAfterShutdown<T>(
+    handle: JobHandle<T>,
+  ): Promise<never> {
+    try {
+      await this.releaseForShutdown(handle)
+    } catch (err) {
+      this.log.warn(
+        { err, jobId: handle.id },
+        'failed to release claim rejected during shutdown',
+      )
+      throw this.shutdownAdmissionError(err)
+    }
+    throw this.shutdownAdmissionError()
+  }
+
+  private assertValidMaxDrains(maxDrains: number): void {
+    if (
+      !Number.isFinite(maxDrains) ||
+      maxDrains < 0 ||
+      !Number.isInteger(maxDrains)
+    ) {
+      throw new Error(
+        `maxDrains must be a non-negative finite integer, got ${maxDrains}`,
+      )
+    }
+  }
+
+  private async executeManagedChain<T>(
+    initial: JobHandle<T>,
+    handler: JobHandler<T>,
+    maxDrains: number,
+    heartbeatIntervalMs?: number,
+  ): Promise<void> {
+    let current: JobHandle<T> | null = initial
+    let drains = 0
+    let preservedError: { value: unknown } | null = null
+
+    while (current) {
+      let result: ManagedExecutionResult
+      try {
+        result = await this.executeManaged(
+          current,
+          handler,
+          heartbeatIntervalMs,
+        )
+      } catch (err) {
+        if (preservedError) throw preservedError.value
+        throw err
+      }
+
+      if (result.status === 'superseded' && !preservedError) {
+        preservedError = { value: result.handlerError }
+      }
+      if (
+        result.status === 'stopped' ||
+        !current.dedupeKey ||
+        drains >= maxDrains ||
+        !this.runAdmissionOpen()
+      ) {
+        break
+      }
+
+      let follower: JobHandle<T> | null
+      try {
+        follower = await this.backend.claimNextByKey<T>(
+          current.type,
+          current.dedupeKey,
+        )
+      } catch (err) {
+        if (preservedError) throw preservedError.value
+        throw err
+      }
+      if (!follower) break
+      current = follower
+      drains++
+    }
+
+    if (preservedError) throw preservedError.value
+  }
+
+  private beginManagedRun<T>(handle: JobHandle<T>): ManagedRun | null {
+    if (!this.runAdmissionOpen()) return null
+
+    const controller = new AbortController()
+    let resolveSettled!: () => void
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve
+    })
+    const run: ManagedRun = {
+      handle: handle as JobHandle<unknown>,
+      controller,
+      stopHeartbeat: () => undefined,
+      settled,
+      resolveSettled,
+    }
+    this.managedRuns.add(run)
+    return run
+  }
+
+  private async executeManaged<T>(
+    handle: JobHandle<T>,
+    handler: JobHandler<T>,
+    heartbeatIntervalMs?: number,
+  ): Promise<ManagedExecutionResult> {
+    const run = this.beginManagedRun(handle)
+    if (!run) return this.rejectClaimAfterShutdown(handle)
+
+    run.stopHeartbeat = this.startManagedHeartbeat(run, heartbeatIntervalMs)
+
+    const startedAt = Date.now()
+    this.emit({
+      kind: 'claimed',
+      type: handle.type,
+      jobId: handle.id,
+      attempt: handle.attempt,
+    })
+    const context: JobContext = {
+      signal: run.controller.signal,
+      log: (message) => handle.log(message),
+    }
+
+    try {
+      try {
+        await handler(this.jobView(handle), context)
+      } catch (handlerError) {
+        run.stopHeartbeat()
+        if (run.controller.signal.aborted) throw handlerError
+
+        const reason =
+          handlerError instanceof Error
+            ? handlerError.message
+            : String(handlerError)
+        const fatal = handlerError instanceof FatalJobError
+        try {
+          if (fatal) {
+            const result = await handle.failFatal(reason)
+            if (result.status === 'lease-lost') {
+              this.loseLease(run, 'failFatal')
+            } else if (result.status === 'failed-terminal') {
+              this.emit({
+                kind: 'fail-fatal',
+                type: handle.type,
+                jobId: handle.id,
+                reason,
+              })
+            }
+          } else {
+            const result = await handle.fail(reason)
+            if (result.status === 'lease-lost') {
+              this.loseLease(run, 'fail')
+            } else if (result.status === 'superseded') {
+              this.emit({
+                kind: 'superseded',
+                type: handle.type,
+                jobId: handle.id,
+                durationMs: Date.now() - startedAt,
+                reason,
+              })
+              return { status: 'superseded', handlerError }
+            } else if (
+              result.status === 'retry-scheduled' ||
+              result.status === 'failed-terminal'
+            ) {
+              this.emit({
+                kind: 'failed',
+                type: handle.type,
+                jobId: handle.id,
+                durationMs: Date.now() - startedAt,
+                attempt: handle.attempt,
+                maxAttempts: handle.maxAttempts,
+                terminal: result.status === 'failed-terminal',
+                reason,
+              })
+            }
+          }
+        } catch (recordingError) {
+          throw new AggregateError(
+            [handlerError, recordingError],
+            'handler and failure recording both failed',
+          )
+        }
+        throw handlerError
+      }
+
+      run.stopHeartbeat()
+      if (run.controller.signal.aborted) return { status: 'stopped' }
+      const result = await handle.complete()
+      if (result.status === 'lease-lost') {
+        this.loseLease(run, 'complete')
+        return { status: 'stopped' }
+      }
+      if (result.status !== 'completed') return { status: 'stopped' }
+      this.emit({
+        kind: 'completed',
+        type: handle.type,
+        jobId: handle.id,
+        durationMs: Date.now() - startedAt,
+      })
+      return { status: 'completed' }
+    } finally {
+      run.stopHeartbeat()
+      this.managedRuns.delete(run)
+      run.resolveSettled()
+    }
+  }
+
+  private loseLease(run: ManagedRun, operation: string): void {
+    run.stopHeartbeat()
+    if (!run.controller.signal.aborted) {
+      run.controller.abort(new LeaseLostError(operation))
+    }
+    this.warnLeaseLost(run.handle.id, operation, run.handle.type)
+  }
+
+  /**
+   * Self-schedule heartbeats and enforce the local lease deadline independently.
+   * A failed or hung renewal never lets the handler run past the last confirmed
+   * lease window.
+   */
+  private startManagedHeartbeat(
+    run: ManagedRun,
+    intervalOverride?: number,
+  ): () => void {
+    const intervalMs =
+      intervalOverride ??
+      Math.max(1, Math.floor(this.visibilityTimeoutMs / 3))
+    let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null
+    let deadlineAt =
+      (run.handle.claimedAt?.getTime() ?? Date.now()) +
+      this.visibilityTimeoutMs
+    let stopped = false
+
+    const stop = (): void => {
+      if (stopped) return
+      stopped = true
+      if (heartbeatTimer) clearTimeout(heartbeatTimer)
+      if (deadlineTimer) clearTimeout(deadlineTimer)
+      heartbeatTimer = null
+      deadlineTimer = null
+      run.controller.signal.removeEventListener('abort', stop)
+    }
+    const armDeadline = (): void => {
+      if (stopped || run.controller.signal.aborted) return
+      if (deadlineTimer) clearTimeout(deadlineTimer)
+      deadlineTimer = setTimeout(
+        () => this.loseLease(run, 'heartbeat-deadline'),
+        Math.max(0, deadlineAt - Date.now()),
+      )
+      deadlineTimer.unref?.()
+    }
+    const scheduleHeartbeat = (): void => {
+      if (stopped || run.controller.signal.aborted) return
+      heartbeatTimer = setTimeout(() => {
+        heartbeatTimer = null
+        void beat()
+      }, intervalMs)
+      heartbeatTimer.unref?.()
+    }
+    const beat = async (): Promise<void> => {
+      if (stopped || run.controller.signal.aborted) return
+      try {
+        const result = await run.handle.heartbeat()
+        if (stopped || run.controller.signal.aborted) return
+        if (result === 'lease-lost') {
+          this.loseLease(run, 'heartbeat')
+          return
+        }
+        deadlineAt = Date.now() + this.visibilityTimeoutMs
+        armDeadline()
+      } catch (err) {
+        this.log.warn(
+          { err, jobId: run.handle.id },
+          'failed to heartbeat active job',
+        )
+      }
+      scheduleHeartbeat()
+    }
+
+    run.controller.signal.addEventListener('abort', stop, { once: true })
+    armDeadline()
+    scheduleHeartbeat()
+    return stop
+  }
+
+  /** Await work for at most ms and always clear the bound timer. */
+  private async waitWithin(work: Promise<void>, ms: number): Promise<void> {
+    if (ms <= 0) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms)
+      timer.unref?.()
+    })
+    try {
+      await Promise.race([work, timeout])
+    } finally {
+      clearTimeout(timer)
     }
   }
 
@@ -683,11 +1167,26 @@ export class JobQueue {
 
 let globalBackend: IJobQueueBackend | null = null
 let defaultQueue: JobQueue | null = null
+let globalQueueOptions: GlobalQueueOptions = {}
+let globalQueueScopeActive = false
 
-/** Set the global backend (call in startup or test setup). */
-export function setGlobalBackend(backend: IJobQueueBackend): void {
+function configuredQueue(
+  backend: IJobQueueBackend,
+  options: GlobalQueueOptions,
+): JobQueue {
+  const { logger = defaultLogger, ...queueOptions } = options
+  return new JobQueue(backend, logger, queueOptions)
+}
+
+/** Set the global backend and options (call in startup or test setup). */
+export function setGlobalBackend(
+  backend: IJobQueueBackend,
+  options: GlobalQueueOptions = {},
+): void {
+  const queue = configuredQueue(backend, options)
   globalBackend = backend
-  defaultQueue = new JobQueue(backend)
+  globalQueueOptions = options
+  defaultQueue = queue
 }
 
 /** Get the global backend. */
@@ -703,10 +1202,57 @@ export function getDefaultQueue(): JobQueue {
   return defaultQueue
 }
 
-/** Create a new JobQueue with the global backend. */
-export function createJobQueue(): JobQueue {
-  if (!globalBackend) {
+/** Create a JobQueue from the captured global config and explicit overrides. */
+export function createJobQueue(
+  backend?: IJobQueueBackend,
+  overrides: GlobalQueueOptions = {},
+): JobQueue {
+  const selectedBackend = backend ?? globalBackend
+  if (!selectedBackend) {
     throw new Error('JobQueue backend not set. Call setGlobalBackend() first.')
   }
-  return new JobQueue(globalBackend)
+  return configuredQueue(selectedBackend, {
+    ...globalQueueOptions,
+    ...overrides,
+  })
+}
+
+/**
+ * Run a callback with a temporary global queue, then restore the exact prior
+ * global state and shut down only the temporary queue.
+ */
+export async function withGlobalQueue<T>(
+  backend: IJobQueueBackend,
+  ...scope:
+    | [callback: () => T | Promise<T>]
+    | [options: GlobalQueueOptions, callback: () => T | Promise<T>]
+): Promise<T> {
+  const options = scope.length === 1 ? {} : scope[0]
+  const callback = scope.length === 1 ? scope[0] : scope[1]
+  if (globalQueueScopeActive) {
+    throw new Error('A global JobQueue scope is already active.')
+  }
+
+  globalQueueScopeActive = true
+  const priorBackend = globalBackend
+  const priorQueue = defaultQueue
+  const priorOptions = globalQueueOptions
+  let temporaryQueue: JobQueue | null = null
+
+  try {
+    temporaryQueue = configuredQueue(backend, options)
+    globalBackend = backend
+    globalQueueOptions = options
+    defaultQueue = temporaryQueue
+    return await callback()
+  } finally {
+    globalBackend = priorBackend
+    globalQueueOptions = priorOptions
+    defaultQueue = priorQueue
+    try {
+      if (temporaryQueue) await temporaryQueue.shutdown()
+    } finally {
+      globalQueueScopeActive = false
+    }
+  }
 }

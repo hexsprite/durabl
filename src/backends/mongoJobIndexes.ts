@@ -11,7 +11,7 @@ import type { JobDoc } from '../types'
  * *after* their replacement exists, so a live deployment never runs a moment
  * without a usable index on the claim path.
  */
-const LEGACY_INDEX_NAMES = ['claim_next_idx']
+const LEGACY_INDEX_NAMES = ['claim_next_idx', 'cleanup_failed_idx']
 
 export async function createJobIndexes(
   collection: Collection<JobDoc>,
@@ -90,11 +90,10 @@ export async function createJobIndexes(
     { name: 'visibility_timeout_idx' },
   )
   /**
-   * Retention sweep (`cleanupOldJobs`) filters
-   * `{ status: { $in: ['completed','failed'] }, $or: [{completedAt},{failedAt}] }`.
-   * A single compound index cannot serve an `$or`; Mongo needs one index per
-   * branch to plan an index union instead of scanning every terminal document —
-   * which on a busy queue is most of the collection. Partial filters keep both
+   * Retention sweep (`cleanupOldJobs`) filters completed jobs by `completedAt`
+   * and failed/superseded jobs by `failedAt`. A single compound index cannot
+   * serve the `$or`; Mongo needs one index per branch to plan an index union
+   * instead of scanning every terminal document. Partial filters keep both
    * indexes off the hot pending/active working set.
    */
   await collection.createIndex(
@@ -107,8 +106,10 @@ export async function createJobIndexes(
   await collection.createIndex(
     { failedAt: 1 },
     {
-      name: 'cleanup_failed_idx',
-      partialFilterExpression: { status: 'failed' },
+      name: 'cleanup_failed_v2_idx',
+      partialFilterExpression: {
+        status: { $in: ['failed', 'superseded'] },
+      },
     },
   )
 

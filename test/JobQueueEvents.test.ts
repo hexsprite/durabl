@@ -12,7 +12,13 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { IJobQueueBackend } from '../src/backends/IJobQueueBackend'
 import { JobQueue } from '../src/JobQueue'
-import type { Job, JobEvent, JobHandle, QueueStats } from '../src/types'
+import {
+  FatalJobError,
+  type Job,
+  type JobEvent,
+  type JobHandle,
+  type QueueStats,
+} from '../src/types'
 
 const silent = {
   child: () => silent,
@@ -41,9 +47,9 @@ function makeBackend(over: Partial<IJobQueueBackend> = {}): IJobQueueBackend {
     enqueue: vi.fn().mockResolvedValue('id'),
     claimOrEnqueue: vi.fn().mockResolvedValue(null as JobHandle | null),
     claimNext: vi.fn().mockResolvedValue(null as Job | null),
-    complete: vi.fn().mockResolvedValue('applied'),
-    fail: vi.fn().mockResolvedValue('applied'),
-    failFatal: vi.fn().mockResolvedValue('applied'),
+    complete: vi.fn().mockResolvedValue({ status: 'completed' }),
+    fail: vi.fn().mockResolvedValue({ status: 'retry-scheduled' }),
+    failFatal: vi.fn().mockResolvedValue({ status: 'failed-terminal' }),
     log: vi.fn().mockResolvedValue(undefined),
     heartbeat: vi.fn().mockResolvedValue('applied'),
     getStats: vi.fn().mockResolvedValue({
@@ -84,16 +90,13 @@ async function runOne(
 
 describe('JobQueue onJobEvent', () => {
   it('emits claimed then completed for a successful job', async () => {
-    const { events } = await runOne(async (_j, ctx) => {
-      await ctx.complete()
-    })
+    const { events } = await runOne(async () => {})
     expect(events.map((e) => e.kind)).toEqual(['claimed', 'completed'])
   })
 
   it('reports a plausible duration on completion', async () => {
-    const { events } = await runOne(async (_j, ctx) => {
+    const { events } = await runOne(async () => {
       await new Promise((r) => setTimeout(r, 20))
-      await ctx.complete()
     })
     const done = events.find((e) => e.kind === 'completed')
     expect(done && 'durationMs' in done && done.durationMs).toBeGreaterThanOrEqual(15)
@@ -114,9 +117,9 @@ describe('JobQueue onJobEvent', () => {
       claimNext: vi.fn().mockImplementation(async () => {
         if (served) return null
         served = true
-        // Last attempt: this failure ends the job.
-        return aJob({ attempt: 3, maxAttempts: 3 })
+        return aJob()
       }),
+      fail: vi.fn().mockResolvedValue({ status: 'failed-terminal' }),
     })
     const queue = new JobQueue(backend, silent, {
       onJobEvent: (e) => events.push(e),
@@ -137,8 +140,8 @@ describe('JobQueue onJobEvent', () => {
   })
 
   it('emits fail-fatal when a handler gives up explicitly', async () => {
-    const { events } = await runOne(async (_j, ctx) => {
-      await ctx.failFatal('poison payload')
+    const { events } = await runOne(async () => {
+      throw new FatalJobError('poison payload')
     })
     expect(events.find((e) => e.kind === 'fail-fatal')).toMatchObject({
       kind: 'fail-fatal',
@@ -148,10 +151,8 @@ describe('JobQueue onJobEvent', () => {
 
   it('emits lease-lost with the operation that discovered it', async () => {
     const { events } = await runOne(
-      async (_j, ctx) => {
-        await ctx.complete()
-      },
-      { complete: vi.fn().mockResolvedValue('lease-lost') },
+      async () => {},
+      { complete: vi.fn().mockResolvedValue({ status: 'lease-lost' }) },
     )
     expect(events.find((e) => e.kind === 'lease-lost')).toMatchObject({
       kind: 'lease-lost',
@@ -175,9 +176,7 @@ describe('JobQueue onJobEvent', () => {
     })
     queue.process(
       'sync',
-      async (_j, ctx) => {
-        await ctx.complete()
-      },
+      async () => {},
       { pollInterval: 5 },
     )
     await new Promise((r) => setTimeout(r, 60))
@@ -200,9 +199,7 @@ describe('JobQueue onJobEvent', () => {
     const queue = new JobQueue(backend, silent)
     queue.process(
       'sync',
-      async (_j, ctx) => {
-        await ctx.complete()
-      },
+      async () => {},
       { pollInterval: 5 },
     )
     await new Promise((r) => setTimeout(r, 60))
@@ -219,7 +216,7 @@ describe('JobQueue onJobEvent', () => {
     const queue = new JobQueue(backend, silent, {
       onJobEvent: (e) => events.push(e),
     })
-    queue.startReaper(5)
+    await queue.startReaper(5)
     await new Promise((r) => setTimeout(r, 40))
     queue.stopReaper()
 

@@ -72,7 +72,7 @@ describe('MongoJobQueue logs[] bounding', () => {
 
     const res = await backend.fail(id, 'gave up', claimed!.claimToken)
 
-    expect(res).toBe('applied')
+    expect(res).toEqual({ status: 'failed-terminal' })
     const doc = await collection.findOne({ _id: id })
     expect(doc!.status).toBe('failed')
     expect(doc!.failReason).toBe('gave up')

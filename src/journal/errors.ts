@@ -18,6 +18,18 @@ export class NonRetryable extends Error {
   }
 }
 
+/** Sentinel used to abort queue-managed work after lease ownership is lost. */
+export class LeaseLostError extends Error {
+  constructor(operation?: string) {
+    super(
+      operation
+        ? `job lease lost during ${operation}`
+        : 'orchestrator lease lost',
+    )
+    this.name = 'LeaseLostError'
+  }
+}
+
 /**
  * A resumed orchestrator called `step()` at a sequence whose journaled record
  * has a different name — the control path diverged from the recorded run.

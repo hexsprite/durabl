@@ -15,10 +15,14 @@ import {
   truncateLogMessage,
 } from '../journal/serialize'
 import {
+  assertValidLatestCoalescing,
   type AppendStepResult,
   type CompleteClaimedResult,
+  type CompleteJobResult,
   type DedupeScope,
   type EnqueueOptions,
+  type FailFatalJobResult,
+  type FailJobResult,
   type HeartbeatClaimedResult,
   type Job,
   type JobDoc,
@@ -26,7 +30,10 @@ import {
   type JobHandle,
   type JobStatus,
   type LifecycleWriteResult,
+  type ReleaseJobResult,
   type QueueStats,
+  type TerminalReceipt,
+  type TerminalWriteMissResult,
   type StepRecord,
 } from '../types'
 
@@ -82,6 +89,40 @@ const DEFAULT_REAPER_BATCH_SIZE = 1000
  * the meantime is claimable then.
  */
 const MAX_DEDUPE_SKIPS = 20
+/** Maximum upsert retries after a concurrent pending-follower insert wins. */
+const MAX_LATEST_COALESCE_ATTEMPTS = 3
+
+/** Fields returned by hot claim reads; journals and receipts can be megabytes. */
+const CLAIMED_JOB_PROJECTION = {
+  _id: 1,
+  type: 1,
+  data: 1,
+  status: 1,
+  attempt: 1,
+  maxAttempts: 1,
+  priority: 1,
+  dedupeKey: 1,
+  dedupeScope: 1,
+  runAt: 1,
+  createdAt: 1,
+  claimedAt: 1,
+  completedAt: 1,
+  failedAt: 1,
+  failReason: 1,
+  claimToken: 1,
+} as const
+
+/** Fields needed to choose a retry transition and its delay. */
+const RETRY_JOB_PROJECTION = {
+  _id: 1,
+  attempt: 1,
+  maxAttempts: 1,
+  dedupeKey: 1,
+  dedupeScope: 1,
+  backoff: 1,
+  backoffDelay: 1,
+  backoffMaxDelay: 1,
+} as const
 
 /**
  * The `dedupeKey` a duplicate-key error was raised on, or `null` if this is not
@@ -249,19 +290,14 @@ export class MongoJobQueue implements IJobQueueBackend {
   /**
    * Create+claim a job for inline execution.
    *
-   * Mutual exclusion is enforced by the unique partial indexes, never by the
-   * pre-read below — that read is a cheap short-circuit only, and being a
-   * check-then-act it cannot be the guarantee. Under `dedupeScope: 'pending'`
-   * the `dedupe_active_idx` index is what makes "at most one active run per
-   * key" true; without it every concurrent caller inserted its own `active`
-   * doc and they all ran at once.
+   * Mutual exclusion comes from the unique partial indexes. In latest mode, an
+   * atomic pending update replaces only `data`; an upsert creates the follower
+   * if no pending job remains. The active document is never updated.
    *
-   * Losing the race is not the same as having nothing to do. Under
-   * `'pending'` — the single-flight coalescing scope — a caller who finds a
-   * run already active queues exactly one follow-up (capped by
-   * `dedupe_pending_idx`) and returns `null`, so the work that arrived during
-   * the active run is not silently dropped. Under `'pending+active'` a
-   * duplicate means "this job already exists"; nothing is queued.
+   * A duplicate active insert means another caller holds the slot. Pending
+   * scope queues one follower, capped by `dedupe_pending_idx`. Latest mode
+   * updates that follower's payload; legacy mode keeps its first payload.
+   * Pending+active scope creates no follower.
    *
    * @returns a handle when this caller won the slot, `null` otherwise.
    */
@@ -270,11 +306,22 @@ export class MongoJobQueue implements IJobQueueBackend {
     data: T,
     options: EnqueueOptions = {},
   ): Promise<JobHandle<T> | null> {
+    assertValidLatestCoalescing(options)
     const now = new Date()
     const dedupeScope: DedupeScope = options.dedupeScope ?? 'pending+active'
 
-    // Short-circuit: a run is already queued, so don't start another now.
-    if (options.dedupeKey) {
+    if (options.coalesce === 'latest') {
+      const replaced = await this.collection.updateOne(
+        {
+          type,
+          dedupeKey: options.dedupeKey,
+          dedupeScope: 'pending',
+          status: 'pending',
+        },
+        { $set: { data } },
+      )
+      if (replaced.matchedCount === 1) return null
+    } else if (options.dedupeKey) {
       const pending = await this.collection.findOne({
         dedupeKey: options.dedupeKey,
         status: 'pending',
@@ -305,17 +352,78 @@ export class MongoJobQueue implements IJobQueueBackend {
 
     try {
       await this.collection.insertOne(doc as JobDoc)
-      return this.createHandle(doc._id, data, doc.claimToken)
+      return this.createHandle(jobDocToJob(doc, true))
     } catch (err) {
-      if (!this.isDuplicateKeyError(err)) throw err
-      // Another caller holds the active slot. Under the coalescing scope,
-      // queue at most one follow-up so this request still gets served after
-      // the in-flight run finishes; `enqueue` returns null (a no-op) when one
-      // is already queued.
-      if (options.dedupeKey && dedupeScope === 'pending') {
-        await this.enqueue(type, data, options)
+      const duplicateKey = dedupeKeyFromDuplicateError(err)
+      if (!options.dedupeKey || duplicateKey !== options.dedupeKey) throw err
+      if (dedupeScope === 'pending') {
+        if (options.coalesce === 'latest') {
+          await this.upsertLatestFollower(
+            type,
+            data,
+            options.dedupeKey,
+            options,
+          )
+        } else {
+          await this.enqueue(type, data, options)
+        }
       }
       return null
+    }
+  }
+
+  private async upsertLatestFollower<T>(
+    type: string,
+    data: T,
+    dedupeKey: string,
+    options: EnqueueOptions,
+  ): Promise<void> {
+    const createdAt = new Date()
+    const runAt = options.delay
+      ? new Date(createdAt.getTime() + options.delay)
+      : createdAt
+    const followerId = randomUUID()
+
+    for (
+      let attempt = 1;
+      attempt <= MAX_LATEST_COALESCE_ATTEMPTS;
+      attempt++
+    ) {
+      try {
+        await this.collection.updateOne(
+          { type, dedupeKey, dedupeScope: 'pending', status: 'pending' },
+          {
+            $set: { data },
+            $setOnInsert: {
+              _id: followerId,
+              type,
+              status: 'pending' as JobStatus,
+              priority: options.priority ?? 0,
+              attempt: 0,
+              maxAttempts: options.maxAttempts ?? 3,
+              dedupeKey,
+              dedupeScope: 'pending' as DedupeScope,
+              backoff: options.backoff,
+              backoffDelay: options.backoffDelay,
+              backoffMaxDelay: options.backoffMaxDelay,
+              runAt,
+              createdAt,
+              logs: [],
+              journalBytes: 0,
+            },
+          },
+          { upsert: true },
+        )
+        return
+      } catch (err) {
+        if (dedupeKeyFromDuplicateError(err) !== dedupeKey) throw err
+        const holder = await this.collection.findOne(
+          { dedupeKey, dedupeScope: 'pending', status: 'pending' },
+          { projection: { type: 1 } },
+        )
+        if (holder && holder.type !== type) return
+        if (attempt === MAX_LATEST_COALESCE_ATTEMPTS) throw err
+      }
     }
   }
 
@@ -350,7 +458,11 @@ export class MongoJobQueue implements IJobQueueBackend {
             },
             $inc: { attempt: 1 },
           },
-          { sort: { priority: 1, runAt: 1 }, returnDocument: 'after' },
+          {
+            sort: { priority: 1, runAt: 1 },
+            returnDocument: 'after',
+            projection: CLAIMED_JOB_PROJECTION,
+          },
         )
         // includeClaimToken: the claim path is the one reader allowed to see the
         // live fencing token (processJob fences lifecycle writes with it).
@@ -381,6 +493,42 @@ export class MongoJobQueue implements IJobQueueBackend {
       'claimNext yielded: dedupe-blocked candidates exceeded skip budget',
     )
     return null
+  }
+
+  async claimNextByKey<T>(
+    type: string,
+    dedupeKey: string,
+  ): Promise<JobHandle<T> | null> {
+    const now = new Date()
+    try {
+      const doc = await this.collection.findOneAndUpdate(
+        {
+          type,
+          dedupeKey,
+          status: 'pending',
+          runAt: { $lte: now },
+        },
+        {
+          $set: {
+            status: 'active' as JobStatus,
+            claimedAt: now,
+            claimToken: randomUUID(),
+          },
+          $inc: { attempt: 1 },
+        },
+        {
+          sort: { priority: 1, runAt: 1 },
+          returnDocument: 'after',
+          projection: CLAIMED_JOB_PROJECTION,
+        },
+      )
+      return doc
+        ? this.createHandle(jobDocToJob(doc as JobDoc<T>, true))
+        : null
+    } catch (err) {
+      if (this.isDuplicateKeyError(err)) return null
+      throw err
+    }
   }
 
   /**
@@ -418,85 +566,242 @@ export class MongoJobQueue implements IJobQueueBackend {
     jobId: string,
     claimToken?: string,
   ): Record<string, unknown> {
-    return claimToken
+    return claimToken !== undefined
       ? { _id: jobId, status: 'active' as JobStatus, claimToken }
       : { _id: jobId }
+  }
+
+  /** Terminal writes never overwrite an existing terminal state. */
+  private terminalTransitionFilter(
+    jobId: string,
+    claimToken?: string,
+  ): Filter<JobDoc> {
+    return claimToken !== undefined
+      ? { _id: jobId, status: 'active', claimToken }
+      : { _id: jobId, status: { $in: ['pending', 'active'] } }
+  }
+
+  private async classifyTerminalMiss(
+    jobId: string,
+  ): Promise<TerminalWriteMissResult> {
+    const job = await this.collection.findOne(
+      { _id: jobId },
+      { projection: { status: 1 } },
+    )
+    if (!job) return { status: 'not-found' }
+    if (
+      job.status === 'completed' ||
+      job.status === 'failed' ||
+      job.status === 'superseded'
+    ) {
+      return { status: 'already-terminal', terminalStatus: job.status }
+    }
+    return { status: 'lease-lost' }
+  }
+
+  private terminalReceiptKey(claimToken: string | undefined): string {
+    return claimToken === undefined
+      ? 'unfenced'
+      : `token_${Buffer.from(claimToken).toString('base64url')}`
+  }
+
+  private terminalReceiptPath(
+    claimToken: string | undefined,
+    operation: TerminalReceipt['operation'],
+  ): string {
+    return `terminalReceipts.${this.terminalReceiptKey(claimToken)}.${operation}`
+  }
+
+  private terminalReceiptWrite(
+    receipt: TerminalReceipt,
+  ): Record<string, TerminalReceipt['result']> {
+    return {
+      [this.terminalReceiptPath(
+        receipt.claimToken ?? undefined,
+        receipt.operation,
+      )]: receipt.result,
+    }
+  }
+
+  private async reconcileTerminalReceipt<
+    R extends
+      | CompleteJobResult
+      | FailJobResult
+      | FailFatalJobResult
+      | ReleaseJobResult,
+  >(
+    jobId: string,
+    claimToken: string | undefined,
+    operation: TerminalReceipt['operation'],
+  ): Promise<R | null> {
+    const key = this.terminalReceiptKey(claimToken)
+    const path = this.terminalReceiptPath(claimToken, operation)
+    const job = await this.collection.findOne(
+      { _id: jobId },
+      { projection: { [path]: 1 } },
+    )
+    const result = job?.terminalReceipts?.[key]?.[operation]
+    return (result as R | undefined) ?? null
   }
 
   async complete(
     jobId: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
-    const res = await this.collection.updateOne(
-      this.lifecycleFilter(jobId, claimToken),
-      {
-        $set: { status: 'completed' as JobStatus, completedAt: new Date() },
-      },
-    )
-    return claimToken && res.matchedCount !== 1 ? 'lease-lost' : 'applied'
+  ): Promise<CompleteJobResult> {
+    const filter =
+      claimToken === undefined
+        ? this.terminalTransitionFilter(jobId, claimToken)
+        : {
+            _id: jobId,
+            claimToken,
+            $or: [
+              { status: 'active' as JobStatus },
+              {
+                status: 'failed' as JobStatus,
+                [`terminalReceipts.${this.terminalReceiptKey(claimToken)}`]: {
+                  $exists: false,
+                },
+              },
+            ],
+          }
+    const result = { status: 'completed' } as const
+    let matchedCount: number
+    try {
+      const write = await this.collection.updateOne(
+        filter,
+        {
+          $set: {
+            status: 'completed' as JobStatus,
+            completedAt: new Date(),
+            ...this.terminalReceiptWrite({
+              claimToken: claimToken ?? null,
+              operation: 'complete',
+              result,
+            }),
+          },
+          $unset: { failedAt: '', failReason: '' },
+        },
+      )
+      matchedCount = write.matchedCount
+    } catch (err) {
+      const reconciled =
+        await this.reconcileTerminalReceipt<CompleteJobResult>(
+          jobId,
+          claimToken,
+          'complete',
+        )
+      if (reconciled) return reconciled
+      throw err
+    }
+    return matchedCount === 1 ? result : this.classifyTerminalMiss(jobId)
   }
 
   async fail(
     jobId: string,
     reason: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
-    const filter = this.lifecycleFilter(jobId, claimToken)
-    const job = await this.collection.findOne(filter)
-    if (!job) return claimToken ? 'lease-lost' : 'applied'
+  ): Promise<FailJobResult> {
+    const filter = this.terminalTransitionFilter(jobId, claimToken)
+    const job = await this.collection.findOne(filter, {
+      projection: RETRY_JOB_PROJECTION,
+    })
+    if (!job) return this.classifyTerminalMiss(jobId)
 
     const now = new Date()
-    const exhausted = job.attempt >= job.maxAttempts
-
-    let matchedCount: number
-    if (exhausted) {
-      const res = await this.collection.updateOne(filter, {
-        $set: {
-          status: 'failed' as JobStatus,
-          failReason: reason,
-          failedAt: now,
+    if (job.dedupeKey && job.dedupeScope === 'pending') {
+      const follower = await this.collection.findOne(
+        {
+          dedupeKey: job.dedupeKey,
+          dedupeScope: 'pending',
+          status: 'pending',
         },
-        ...this.logWrite(`Failed: ${reason}`, now),
-      })
-      matchedCount = res.matchedCount
-    } else {
-      // Space the retry: push runAt into the future by a jittered backoff so
-      // a fast-failing handler can't burn every attempt in milliseconds and a
-      // downstream outage doesn't become an instant-retry storm.
-      const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
-      try {
-        const res = await this.collection.updateOne(filter, {
-          $set: { status: 'pending' as JobStatus, failReason: reason, runAt },
-          ...this.logWrite(`Attempt failed: ${reason}`, now),
-        })
-        matchedCount = res.matchedCount
-      } catch (err) {
-        if (dedupeKeyFromDuplicateError(err) === null) throw err
-        // Returning this job to `pending` would put two pending docs under one
-        // dedupe key, which `dedupe_pending_idx` forbids. That happens exactly
-        // in the case `dedupeScope: 'pending'` exists to allow: a follow-up was
-        // queued behind this run while it was active.
-        //
-        // The queued follow-up already represents the work, so retrying this
-        // document would duplicate it. Retire this one instead.
-        //
-        // It must not be left to propagate: `processJob` catches a failing
-        // `fail()`, logs, and moves on — leaving the job `active` forever. The
-        // reaper's requeue path performs the same write and would throw the
-        // same way, so nothing could ever recover it, and the job would hold
-        // its dedupeKey permanently.
-        matchedCount = await this.retireCoalesced(filter, reason, now)
+        { projection: { _id: 1 } },
+      )
+      if (follower) {
+        return this.supersedeFailedClaim(
+          filter,
+          jobId,
+          reason,
+          now,
+          claimToken,
+        )
       }
     }
-    return claimToken && matchedCount !== 1 ? 'lease-lost' : 'applied'
+    if (job.attempt >= job.maxAttempts) {
+      const result = { status: 'failed-terminal' } as const
+      let matchedCount: number
+      try {
+        const write = await this.collection.updateOne(filter, {
+          $set: {
+            status: 'failed' as JobStatus,
+            failReason: reason,
+            failedAt: now,
+            ...this.terminalReceiptWrite({
+              claimToken: claimToken ?? null,
+              operation: 'fail',
+              result,
+            }),
+          },
+          ...this.logWrite(`Failed: ${reason}`, now),
+        })
+        matchedCount = write.matchedCount
+      } catch (err) {
+        const reconciled = await this.reconcileTerminalReceipt<FailJobResult>(
+          jobId,
+          claimToken,
+          'fail',
+        )
+        if (reconciled) return reconciled
+        throw err
+      }
+      return matchedCount === 1 ? result : this.classifyTerminalMiss(jobId)
+    }
+
+    // Space the retry: push runAt into the future by a jittered backoff so
+    // a fast-failing handler cannot burn every attempt immediately.
+    const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
+    const retryResult = { status: 'retry-scheduled' } as const
+    let matchedCount: number
+    try {
+      const write = await this.collection.updateOne(filter, {
+        $set: {
+          status: 'pending' as JobStatus,
+          failReason: reason,
+          runAt,
+          ...this.terminalReceiptWrite({
+            claimToken: claimToken ?? null,
+            operation: 'fail',
+            result: retryResult,
+          }),
+        },
+        ...this.logWrite(`Attempt failed: ${reason}`, now),
+      })
+      matchedCount = write.matchedCount
+    } catch (err) {
+      const reconciled = await this.reconcileTerminalReceipt<FailJobResult>(
+        jobId,
+        claimToken,
+        'fail',
+      )
+      if (reconciled) return reconciled
+      if (dedupeKeyFromDuplicateError(err) === null) throw err
+
+      return this.supersedeFailedClaim(
+        filter,
+        jobId,
+        reason,
+        now,
+        claimToken,
+      )
+    }
+    return matchedCount === 1
+      ? retryResult
+      : this.classifyTerminalMiss(jobId)
   }
 
   /**
-   * Mark a job terminal because a pending job under the same dedupe key already
-   * covers its work. Used when a requeue would violate a dedupe index.
-   *
-   * Terminal rather than deleted: the failure stays observable, and the reason
-   * says why this attempt stopped so an operator does not read it as work lost.
+   * Mark a job superseded because a pending job under the same dedupe key
+   * already covers its work. Used when a requeue would violate a dedupe index.
    *
    * @returns matchedCount, so callers can apply the usual lease-fence check.
    */
@@ -504,37 +809,153 @@ export class MongoJobQueue implements IJobQueueBackend {
     filter: Filter<JobDoc>,
     reason: string,
     now: Date,
+    terminalReceipt?: TerminalReceipt,
   ): Promise<number> {
-    const note = `${reason} (coalesced: a queued follow-up already covers this work)`
+    const note = `${reason} (superseded: a queued follow-up already covers this work)`
     const res = await this.collection.updateOne(filter, {
       $set: {
-        status: 'failed' as JobStatus,
+        status: 'superseded' as JobStatus,
         failReason: note,
         failedAt: now,
+        ...(terminalReceipt
+          ? this.terminalReceiptWrite(terminalReceipt)
+          : {}),
       },
-      ...this.logWrite(`Attempt failed, coalesced: ${reason}`, now),
+      ...this.logWrite(`Superseded: ${reason}`, now),
     })
     return res.matchedCount
+  }
+
+  private async supersedeFailedClaim(
+    filter: Filter<JobDoc>,
+    jobId: string,
+    reason: string,
+    now: Date,
+    claimToken?: string,
+  ): Promise<FailJobResult> {
+    const result = { status: 'superseded' } as const
+    let matchedCount: number
+    try {
+      matchedCount = await this.retireCoalesced(filter, reason, now, {
+        claimToken: claimToken ?? null,
+        operation: 'fail',
+        result,
+      })
+    } catch (err) {
+      const reconciled = await this.reconcileTerminalReceipt<FailJobResult>(
+        jobId,
+        claimToken,
+        'fail',
+      )
+      if (reconciled) return reconciled
+      throw err
+    }
+    return matchedCount === 1 ? result : this.classifyTerminalMiss(jobId)
   }
 
   async failFatal(
     jobId: string,
     reason: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
+  ): Promise<FailFatalJobResult> {
+    const result = { status: 'failed-terminal' } as const
     const now = new Date()
-    const res = await this.collection.updateOne(
-      this.lifecycleFilter(jobId, claimToken),
-      {
-        $set: {
-          status: 'failed' as JobStatus,
-          failReason: reason,
-          failedAt: now,
+    let matchedCount: number
+    try {
+      const write = await this.collection.updateOne(
+        this.terminalTransitionFilter(jobId, claimToken),
+        {
+          $set: {
+            status: 'failed' as JobStatus,
+            failReason: reason,
+            failedAt: now,
+            ...this.terminalReceiptWrite({
+              claimToken: claimToken ?? null,
+              operation: 'failFatal',
+              result,
+            }),
+          },
+          ...this.logWrite(`Fatal: ${reason}`, now),
         },
-        ...this.logWrite(`Fatal: ${reason}`, now),
-      },
-    )
-    return claimToken && res.matchedCount !== 1 ? 'lease-lost' : 'applied'
+      )
+      matchedCount = write.matchedCount
+    } catch (err) {
+      const reconciled =
+        await this.reconcileTerminalReceipt<FailFatalJobResult>(
+          jobId,
+          claimToken,
+          'failFatal',
+        )
+      if (reconciled) return reconciled
+      throw err
+    }
+    return matchedCount === 1 ? result : this.classifyTerminalMiss(jobId)
+  }
+
+  async release(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<ReleaseJobResult> {
+    const filter: Filter<JobDoc> =
+      claimToken === undefined
+        ? { _id: jobId, status: 'active' }
+        : { _id: jobId, status: 'active', claimToken }
+    const released = { status: 'released' } as const
+    let matchedCount: number
+    try {
+      const write = await this.collection.updateOne(filter, {
+        $set: {
+          status: 'pending' as JobStatus,
+          runAt: new Date(),
+          ...this.terminalReceiptWrite({
+            claimToken: claimToken ?? null,
+            operation: 'release',
+            result: released,
+          }),
+        },
+        $unset: { claimedAt: '', claimToken: '' },
+      })
+      matchedCount = write.matchedCount
+    } catch (err) {
+      const reconciled =
+        await this.reconcileTerminalReceipt<ReleaseJobResult>(
+          jobId,
+          claimToken,
+          'release',
+        )
+      if (reconciled) return reconciled
+      if (dedupeKeyFromDuplicateError(err) === null) throw err
+
+      const superseded = { status: 'superseded' } as const
+      let retired: number
+      try {
+        retired = await this.retireCoalesced(
+          filter,
+          'Released',
+          new Date(),
+          {
+            claimToken: claimToken ?? null,
+            operation: 'release',
+            result: superseded,
+          },
+        )
+      } catch (retireErr) {
+        const retiredReceipt =
+          await this.reconcileTerminalReceipt<ReleaseJobResult>(
+            jobId,
+            claimToken,
+            'release',
+          )
+        if (retiredReceipt) return retiredReceipt
+        throw retireErr
+      }
+      return retired === 1
+        ? superseded
+        : this.classifyTerminalMiss(jobId)
+    }
+    if (matchedCount === 1) return released
+
+    return this.classifyTerminalMiss(jobId)
   }
 
   async log(jobId: string, message: string): Promise<void> {
@@ -722,6 +1143,18 @@ export class MongoJobQueue implements IJobQueueBackend {
     return res.matchedCount === 1 ? 'heartbeated' : 'lease-lost'
   }
 
+  async hasOutstanding(type: string, dedupeKey: string): Promise<boolean> {
+    const doc = await this.collection.findOne(
+      {
+        type,
+        dedupeKey,
+        status: { $in: ['pending', 'active'] satisfies JobStatus[] },
+      },
+      { projection: { _id: 1 } },
+    )
+    return doc !== null
+  }
+
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
     const doc = (await this.collection.findOne(query)) as JobDoc<T> | null
     // General read view: the live fencing claimToken is deliberately NOT
@@ -734,29 +1167,32 @@ export class MongoJobQueue implements IJobQueueBackend {
     const q = type ? { type } : {}
     const count = (s: JobStatus) =>
       this.collection.countDocuments({ ...q, status: s })
-    const [pending, active, completed, failed, oldest] = await Promise.all([
-      count('pending'),
-      count('active'),
-      count('completed'),
-      count('failed'),
-      // Backlog age. `runAt: {$lte: now}` keeps deliberately-delayed jobs out
-      // of the measurement — they are scheduled, not late. Sorting on `runAt`
-      // alone (not the claim order) is what makes this "oldest", and the
-      // `{type, status, priority, runAt}` claim index serves the predicate;
-      // no additional index is needed.
-      this.collection
-        .find({ ...q, status: 'pending', runAt: { $lte: now } })
-        .project<{ runAt: Date }>({ runAt: 1 })
-        .sort({ runAt: 1 })
-        .limit(1)
-        .next(),
-    ])
+    const [pending, active, completed, failed, superseded, oldest] =
+      await Promise.all([
+        count('pending'),
+        count('active'),
+        count('completed'),
+        count('failed'),
+        count('superseded'),
+        // Backlog age. `runAt: {$lte: now}` keeps deliberately-delayed jobs out
+        // of the measurement — they are scheduled, not late. Sorting on `runAt`
+        // alone (not the claim order) is what makes this "oldest", and the
+        // `{type, status, priority, runAt}` claim index serves the predicate;
+        // no additional index is needed.
+        this.collection
+          .find({ ...q, status: 'pending', runAt: { $lte: now } })
+          .project<{ runAt: Date }>({ runAt: 1 })
+          .sort({ runAt: 1 })
+          .limit(1)
+          .next(),
+      ])
     const oldestPendingRunAt = oldest?.runAt ?? null
     return {
       pending,
       active,
       completed,
       failed,
+      superseded,
       oldestPendingRunAt,
       oldestPendingLagMs: oldestPendingRunAt
         ? Math.max(0, now.getTime() - oldestPendingRunAt.getTime())
@@ -777,9 +1213,11 @@ export class MongoJobQueue implements IJobQueueBackend {
    *   backoff a handler that wedges the worker would stall → be recovered →
    *   re-claimed → wedge again *immediately*, pegging CPU/Mongo every
    *   visibility window (hot retry loop). The future `runAt` breaks the loop.
-   * - Retries exhausted (`attempt >= maxAttempts`) → terminal `failed`.
-   *   The old code resurrected these forever because it never checked the
-   *   cap.
+   * - A pending follower already covers the work → terminal `superseded`,
+   *   regardless of the old run's remaining attempts.
+   * - Retries exhausted (`attempt >= maxAttempts`) without a follower →
+   *   terminal `failed`. The old code resurrected these forever because it
+   *   never checked the cap.
    *
    * Recovery does not bump `attempt` — the subsequent re-claim does that, so
    * the count stays accurate.
@@ -809,6 +1247,7 @@ export class MongoJobQueue implements IJobQueueBackend {
         status: 'active',
         claimedAt: { $lt: cutoff },
       })
+      .project(RETRY_JOB_PROJECTION)
       // Oldest lease first: the jobs that have been stuck longest are the ones
       // most worth recovering when the batch cannot cover everything.
       .sort({ claimedAt: 1 })
@@ -818,6 +1257,28 @@ export class MongoJobQueue implements IJobQueueBackend {
     for await (const job of cursor) {
       const now = new Date()
       const exhausted = job.attempt >= job.maxAttempts
+      const hasPendingFollower =
+        exhausted &&
+        job.dedupeKey !== undefined &&
+        job.dedupeScope === 'pending' &&
+        (await this.collection.findOne(
+          {
+            dedupeKey: job.dedupeKey,
+            dedupeScope: 'pending',
+            status: 'pending',
+          },
+          { projection: { _id: 1 } },
+        )) !== null
+
+      if (hasPendingFollower) {
+        await this.retireCoalesced(
+          { _id: job._id, status: 'active' },
+          'Stalled',
+          now,
+        )
+        handled++
+        continue
+      }
 
       if (exhausted) {
         await this.collection.updateOne(
@@ -862,12 +1323,17 @@ export class MongoJobQueue implements IJobQueueBackend {
     return handled
   }
 
-  /** Clean up old completed/failed jobs. Default: 7 days. Returns count removed. */
+  /** Clean up old terminal jobs. Default: 7 days. Returns count removed. */
   async cleanupOldJobs(maxAgeMs = 7 * 24 * 60 * 60 * 1000): Promise<number> {
     const cutoff = new Date(Date.now() - maxAgeMs)
     const result = await this.collection.deleteMany({
-      status: { $in: ['completed', 'failed'] },
-      $or: [{ completedAt: { $lt: cutoff } }, { failedAt: { $lt: cutoff } }],
+      $or: [
+        { status: 'completed', completedAt: { $lt: cutoff } },
+        {
+          status: { $in: ['failed', 'superseded'] },
+          failedAt: { $lt: cutoff },
+        },
+      ],
     })
     return result.deletedCount
   }
@@ -880,25 +1346,20 @@ export class MongoJobQueue implements IJobQueueBackend {
     await this.collection.deleteMany({})
   }
 
-  private createHandle<T>(
-    jobId: string,
-    data: T,
-    claimToken?: string,
-  ): JobHandle<T> {
+  private createHandle<T>(job: Job<T>): JobHandle<T> {
+    const claimToken = job.claimToken
     return {
-      id: jobId,
-      data,
-      complete: async () => {
-        await this.complete(jobId, claimToken)
-      },
-      fail: async (reason: string) => {
-        await this.fail(jobId, reason, claimToken)
-      },
-      log: (msg: string) => {
-        // See JobQueue.createContext: an uncaught rejection here would kill
-        // the process over a dropped log line.
-        this.log(jobId, msg).catch((err: unknown) => {
-          this.logger.warn({ err, jobId }, 'failed to write job log entry')
+      ...job,
+      status: 'active',
+      complete: () => this.complete(job.id, claimToken),
+      fail: (reason: string) => this.fail(job.id, reason, claimToken),
+      failFatal: (reason: string) =>
+        this.failFatal(job.id, reason, claimToken),
+      heartbeat: () => this.heartbeat(job.id, claimToken),
+      release: () => this.release(job.id, claimToken),
+      log: (message: string) => {
+        this.log(job.id, message).catch((err: unknown) => {
+          this.logger.warn({ err, jobId: job.id }, 'failed to write job log entry')
         })
       },
     }

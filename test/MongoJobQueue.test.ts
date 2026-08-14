@@ -3,7 +3,12 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Collection, Db } from 'mongodb'
 
 import { MongoJobQueue } from '../src/backends/MongoJobQueue'
-import type { JobDoc } from '../src/types'
+import type {
+  CompleteJobResult,
+  FailFatalJobResult,
+  FailJobResult,
+  JobDoc,
+} from '../src/types'
 
 import { closeMongo, getMongo, uniqueCollectionName } from './mongoHelper'
 
@@ -106,18 +111,20 @@ describe('MongoJobQueue', () => {
       expect(handle).toBeNull()
     })
 
-    it('handle.complete() marks job completed', async () => {
+    it('handle.complete() returns the completed result', async () => {
       const handle = await backend.claimOrEnqueue('job', {})
-      await handle!.complete()
+      const result: CompleteJobResult = await handle!.complete()
 
+      expect(result).toEqual({ status: 'completed' })
       const job = await collection.findOne({ _id: handle!.id })
       expect(job!.status).toBe('completed')
     })
 
-    it('handle.fail() marks job failed when exhausted', async () => {
+    it('handle.fail() returns the terminal failure result', async () => {
       const handle = await backend.claimOrEnqueue('job', {}, { maxAttempts: 1 })
-      await handle!.fail('error')
+      const result: FailJobResult = await handle!.fail('error')
 
+      expect(result).toEqual({ status: 'failed-terminal' })
       const job = await collection.findOne({ _id: handle!.id })
       expect(job!.status).toBe('failed')
     })
@@ -177,18 +184,20 @@ describe('MongoJobQueue', () => {
     it('returns job to pending if attempts remain', async () => {
       const jobId = await backend.enqueue('job', {}, { maxAttempts: 3 })
       const job = await backend.claimNext('job')
-      await backend.fail(job!.id, 'error')
+      const result: FailJobResult = await backend.fail(job!.id, 'error')
 
+      expect(result).toEqual({ status: 'retry-scheduled' })
       const updated = await collection.findOne({ _id: jobId! })
       expect(updated!.status).toBe('pending')
       expect(updated!.attempt).toBe(1)
     })
 
-    it('marks job failed when max attempts reached', async () => {
+    it('marks job failed when max attempts are reached', async () => {
       const jobId = await backend.enqueue('job', {}, { maxAttempts: 1 })
       const job = await backend.claimNext('job')
-      await backend.fail(job!.id, 'error')
+      const result: FailJobResult = await backend.fail(job!.id, 'error')
 
+      expect(result).toEqual({ status: 'failed-terminal' })
       const updated = await collection.findOne({ _id: jobId! })
       expect(updated!.status).toBe('failed')
       expect(updated!.failReason).toBe('error')
@@ -235,11 +244,97 @@ describe('MongoJobQueue', () => {
     it('marks job failed immediately', async () => {
       const jobId = await backend.enqueue('job', {}, { maxAttempts: 10 })
       const job = await backend.claimNext('job')
-      await backend.failFatal(job!.id, 'fatal error')
+      const result: FailFatalJobResult = await backend.failFatal(
+        job!.id,
+        'fatal error',
+      )
 
+      expect(result).toEqual({ status: 'failed-terminal' })
       const updated = await collection.findOne({ _id: jobId! })
       expect(updated!.status).toBe('failed')
       expect(updated!.failReason).toBe('fatal error')
+    })
+  })
+
+  describe('terminal transition results and fencing', () => {
+    async function claimThenReclaim(): Promise<{
+      id: string
+      staleToken: string
+    }> {
+      await backend.enqueue('fenced', {})
+      const claimed = await backend.claimNext('fenced')
+      await collection.updateOne(
+        { _id: claimed!.id },
+        { $set: { claimToken: 'new-owner-token' } },
+      )
+      return { id: claimed!.id, staleToken: claimed!.claimToken! }
+    }
+
+    it('reports the stored completed status to later failure operations', async () => {
+      await backend.enqueue('job', {})
+      const job = await backend.claimNext('job')
+      await backend.complete(job!.id, job!.claimToken)
+
+      expect(await backend.fail(job!.id, 'late', job!.claimToken)).toEqual({
+        status: 'already-terminal',
+        terminalStatus: 'completed',
+      })
+      expect(
+        await backend.failFatal(job!.id, 'late', job!.claimToken),
+      ).toEqual({
+        status: 'already-terminal',
+        terminalStatus: 'completed',
+      })
+    })
+
+    it('reports the stored failed status to a later completion', async () => {
+      await backend.enqueue('job', {})
+      const job = await backend.claimNext('job')
+      await backend.failFatal(job!.id, 'fatal', job!.claimToken)
+
+      expect(await backend.complete(job!.id, job!.claimToken)).toEqual({
+        status: 'already-terminal',
+        terminalStatus: 'failed',
+      })
+    })
+
+    it('fences complete() with a stale claim token', async () => {
+      const { id, staleToken } = await claimThenReclaim()
+
+      expect(await backend.complete(id, staleToken)).toEqual({
+        status: 'lease-lost',
+      })
+      expect((await collection.findOne({ _id: id }))!.status).toBe('active')
+    })
+
+    it('fences fail() with a stale claim token', async () => {
+      const { id, staleToken } = await claimThenReclaim()
+
+      expect(await backend.fail(id, 'stale', staleToken)).toEqual({
+        status: 'lease-lost',
+      })
+      expect((await collection.findOne({ _id: id }))!.status).toBe('active')
+    })
+
+    it('fences failFatal() with a stale claim token', async () => {
+      const { id, staleToken } = await claimThenReclaim()
+
+      expect(await backend.failFatal(id, 'stale', staleToken)).toEqual({
+        status: 'lease-lost',
+      })
+      expect((await collection.findOne({ _id: id }))!.status).toBe('active')
+    })
+
+    it('reports missing jobs for every terminal operation', async () => {
+      expect(await backend.complete('missing', 'token')).toEqual({
+        status: 'not-found',
+      })
+      expect(await backend.fail('missing', 'error', 'token')).toEqual({
+        status: 'not-found',
+      })
+      expect(await backend.failFatal('missing', 'fatal', 'token')).toEqual({
+        status: 'not-found',
+      })
     })
   })
 

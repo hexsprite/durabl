@@ -38,11 +38,16 @@ function makeStubBackend(
     enqueue: vi.fn().mockResolvedValue('stub-id'),
     claimOrEnqueue: vi.fn().mockResolvedValue(null as JobHandle | null),
     claimNext: vi.fn().mockResolvedValue(null as Job | null),
-    complete: vi.fn().mockResolvedValue(undefined),
-    fail: vi.fn().mockResolvedValue(undefined),
-    failFatal: vi.fn().mockResolvedValue(undefined),
+    claimNextByKey: vi
+      .fn()
+      .mockResolvedValue(null) as unknown as IJobQueueBackend['claimNextByKey'],
+    complete: vi.fn().mockResolvedValue({ status: 'completed' }),
+    fail: vi.fn().mockResolvedValue({ status: 'retry-scheduled' }),
+    failFatal: vi.fn().mockResolvedValue({ status: 'failed-terminal' }),
+    release: vi.fn().mockResolvedValue({ status: 'released' }),
     log: vi.fn().mockResolvedValue(undefined),
-    heartbeat: vi.fn().mockResolvedValue(undefined),
+    heartbeat: vi.fn().mockResolvedValue('applied'),
+    hasOutstanding: vi.fn().mockResolvedValue(false),
     findOne: vi.fn().mockResolvedValue(null as Job | null),
     getStats: vi.fn().mockResolvedValue({
       pending: 0,

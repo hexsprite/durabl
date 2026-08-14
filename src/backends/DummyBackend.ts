@@ -19,15 +19,21 @@ import {
   sortBySeq,
   truncateLogMessage,
 } from '../journal/serialize'
+import { assertValidLatestCoalescing } from '../types'
 import type {
   AppendStepResult,
   CompleteClaimedResult,
+  CompleteJobResult,
   EnqueueOptions,
+  FailFatalJobResult,
+  FailJobResult,
   HeartbeatClaimedResult,
   Job,
   JobHandle,
   JobStatus,
   LifecycleWriteResult,
+  ReleaseJobResult,
+  TerminalWriteMissResult,
   QueueStats,
   StepRecord,
 } from '../types'
@@ -46,17 +52,15 @@ interface RecordedJob<T = unknown> {
   dedupeKey?: string
   dedupeScope?: 'pending' | 'pending+active'
   createdAt: Date
-  /**
-   * When the job becomes due (`createdAt + delay`). Recorded so `getStats`
-   * can report backlog age the same way the Mongo backend does.
-   *
-   * NOTE: `claimNext` here does NOT filter on it — a delayed job is claimable
-   * immediately in this backend, unlike Mongo. That divergence predates this
-   * field and is tracked separately; see du-dum (shared InMemoryJobStore).
-   */
+  /** When the job becomes due (`createdAt + delay`). */
   runAt: Date
   logs: string[]
   claimToken?: string
+  claimedAt?: Date
+  failedAt?: Date
+  failReason?: string
+  /** Distinguishes a lifecycle failure from a reaper race in `complete()`. */
+  failedByLifecycleWrite?: boolean
   steps: StepRecord[]
   /** Running approximate byte size of steps + logs (mirrors Mongo's field). */
   journalBytes: number
@@ -97,6 +101,50 @@ export class DummyBackend implements IJobQueueBackend {
   private generateId(): string {
     this.idCounter++
     return `dummy-${this.idCounter}`
+  }
+
+  /** Build the public view shared by every claim path. */
+  private toJob<T>(job: RecordedJob<T>, includeClaimToken = false): Job<T> {
+    return {
+      id: job.id,
+      type: job.type,
+      data: job.data,
+      status: job.status,
+      attempt: job.attempt,
+      maxAttempts: job.maxAttempts,
+      priority: job.priority,
+      dedupeKey: job.dedupeKey,
+      dedupeScope: job.dedupeScope,
+      runAt: job.runAt,
+      createdAt: job.createdAt,
+      claimedAt: job.claimedAt,
+      ...(includeClaimToken ? { claimToken: job.claimToken } : {}),
+    }
+  }
+
+  /** Bind a claim's lifecycle methods to its immutable lease token. */
+  private createHandle<T>(job: RecordedJob<T>): JobHandle<T> {
+    const claimToken = job.claimToken
+    return {
+      ...this.toJob(job, true),
+      status: 'active',
+      complete: () => this.complete(job.id, claimToken),
+      fail: (reason: string) => this.fail(job.id, reason, claimToken),
+      failFatal: (reason: string) =>
+        this.failFatal(job.id, reason, claimToken),
+      heartbeat: () => this.heartbeat(job.id, claimToken),
+      release: () => this.release(job.id, claimToken),
+      log: (message: string) => {
+        void this.log(job.id, message)
+      },
+    }
+  }
+
+  private markClaimed(job: RecordedJob): void {
+    job.status = 'active'
+    job.attempt++
+    job.claimedAt = new Date()
+    job.claimToken = randomUUID()
   }
 
   /**
@@ -167,6 +215,7 @@ export class DummyBackend implements IJobQueueBackend {
     data: T,
     options: EnqueueOptions = {},
   ): Promise<JobHandle<T> | null> {
+    assertValidLatestCoalescing(options)
     const dedupeScope = options.dedupeScope ?? 'pending+active'
 
     if (options.dedupeKey) {
@@ -175,7 +224,12 @@ export class DummyBackend implements IJobQueueBackend {
         (job) =>
           job.dedupeKey === options.dedupeKey && job.status === 'pending',
       )
-      if (pending) return null
+      if (pending) {
+        if (options.coalesce === 'latest' && pending.type === type) {
+          pending.data = data
+        }
+        return null
+      }
 
       // Stand-in for the unique partial indexes: a job already holds the
       // active slot for this key+scope.
@@ -210,6 +264,7 @@ export class DummyBackend implements IJobQueueBackend {
       createdAt: claimedAt,
       // Claimed inline at creation, so it was due the moment it existed.
       runAt: claimedAt,
+      claimedAt,
       logs: [],
       claimToken: randomUUID(),
       steps: [],
@@ -218,27 +273,7 @@ export class DummyBackend implements IJobQueueBackend {
 
     this.jobs.push(job)
 
-    // Fence the handle with the token minted above, mirroring
-    // MongoJobQueue.createHandle: once the job is reclaimed (new token), a
-    // stale handle's complete/fail is a no-op and cannot clobber the new owner.
-    const { claimToken } = job
-
-    return {
-      id: job.id,
-      data,
-      complete: async () => {
-        if (this.fenceMiss(job, claimToken)) return
-        job.status = 'completed'
-      },
-      fail: async (reason: string) => {
-        if (this.fenceMiss(job, claimToken)) return
-        job.status = 'failed'
-        job.logs.push(`Failed: ${reason}`)
-      },
-      log: (message: string) => {
-        job.logs.push(message)
-      },
-    }
+    return this.createHandle(job)
   }
 
   async claimNext<T>(type: string): Promise<Job<T> | null> {
@@ -274,24 +309,39 @@ export class DummyBackend implements IJobQueueBackend {
     )
     if (!job) return null
 
-    job.status = 'active'
-    job.attempt++
-    job.claimToken = randomUUID()
+    this.markClaimed(job)
+    return this.toJob(job as RecordedJob<T>, true)
+  }
 
-    return {
-      id: job.id,
-      type: job.type,
-      data: job.data as T,
-      status: job.status,
-      attempt: job.attempt,
-      maxAttempts: job.maxAttempts,
-      priority: job.priority,
-      dedupeKey: job.dedupeKey,
-      dedupeScope: job.dedupeScope,
-      runAt: job.runAt,
-      createdAt: job.createdAt,
-      claimToken: job.claimToken,
-    }
+  async claimNextByKey<T>(
+    type: string,
+    dedupeKey: string,
+  ): Promise<JobHandle<T> | null> {
+    const now = Date.now()
+    const candidates = this.jobs
+      .filter(
+        (job) =>
+          job.type === type &&
+          job.dedupeKey === dedupeKey &&
+          job.status === 'pending' &&
+          job.runAt.getTime() <= now,
+      )
+      .sort(
+        (a, b) =>
+          a.priority - b.priority || a.runAt.getTime() - b.runAt.getTime(),
+      )
+    const job = candidates[0] as RecordedJob<T> | undefined
+    if (!job) return null
+    const active = this.jobs.some(
+      (candidate) =>
+        candidate !== job &&
+        candidate.status === 'active' &&
+        candidate.dedupeKey === dedupeKey &&
+        candidate.dedupeScope === job.dedupeScope,
+    )
+    if (active) return null
+    this.markClaimed(job)
+    return this.createHandle(job)
   }
 
   /** Fence check mirroring Mongo's fenced lifecycle filter: with a token the
@@ -300,52 +350,144 @@ export class DummyBackend implements IJobQueueBackend {
     job: RecordedJob | undefined,
     claimToken?: string,
   ): boolean {
-    if (!claimToken) return false
+    if (claimToken === undefined) return false
     return !job || job.status !== 'active' || job.claimToken !== claimToken
+  }
+
+  private terminalTransitionMiss(
+    job: RecordedJob,
+    claimToken?: string,
+  ): TerminalWriteMissResult | null {
+    if (
+      job.status === 'completed' ||
+      job.status === 'failed' ||
+      job.status === 'superseded'
+    ) {
+      return { status: 'already-terminal', terminalStatus: job.status }
+    }
+    if (this.fenceMiss(job, claimToken)) return { status: 'lease-lost' }
+    return null
   }
 
   async complete(
     jobId: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
+  ): Promise<CompleteJobResult> {
     const job = this.jobs.find((j) => j.id === jobId)
-    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
-    if (job) {
+    if (!job) return { status: 'not-found' }
+    if (
+      job.status === 'failed' &&
+      !job.failedByLifecycleWrite &&
+      claimToken !== undefined &&
+      job.claimToken === claimToken
+    ) {
       job.status = 'completed'
+      delete job.failedAt
+      delete job.failReason
+      return { status: 'completed' }
     }
-    return 'applied'
+    const miss = this.terminalTransitionMiss(job, claimToken)
+    if (miss) return miss
+    job.status = 'completed'
+    return { status: 'completed' }
   }
 
   async fail(
     jobId: string,
     reason: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
+  ): Promise<FailJobResult> {
     const job = this.jobs.find((j) => j.id === jobId)
-    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
-    if (job) {
-      job.logs.push(`Failed: ${reason}`)
-      if (job.attempt >= job.maxAttempts) {
-        job.status = 'failed'
-      } else {
-        job.status = 'pending' // Back to pending for retry
-      }
+    if (!job) return { status: 'not-found' }
+    const miss = this.terminalTransitionMiss(job, claimToken)
+    if (miss) return miss
+
+    await this.log(jobId, `Failed: ${reason}`)
+    const hasPendingFollower =
+      job.dedupeKey !== undefined &&
+      job.dedupeScope === 'pending' &&
+      this.jobs.some(
+        (candidate) =>
+          candidate.dedupeKey === job.dedupeKey &&
+          candidate.dedupeScope === job.dedupeScope &&
+          candidate.status === 'pending',
+      )
+    if (hasPendingFollower) {
+      job.status = 'superseded'
+      job.failReason = reason
+      job.failedAt = new Date()
+      return { status: 'superseded' }
     }
-    return 'applied'
+    if (job.attempt >= job.maxAttempts) {
+      job.status = 'failed'
+      job.failReason = reason
+      job.failedAt = new Date()
+      job.failedByLifecycleWrite = true
+      return { status: 'failed-terminal' }
+    }
+    job.status = 'pending'
+    return { status: 'retry-scheduled' }
   }
 
   async failFatal(
     jobId: string,
     reason: string,
     claimToken?: string,
-  ): Promise<LifecycleWriteResult> {
+  ): Promise<FailFatalJobResult> {
     const job = this.jobs.find((j) => j.id === jobId)
-    if (this.fenceMiss(job, claimToken)) return 'lease-lost'
-    if (job) {
-      job.status = 'failed'
-      job.logs.push(`Fatal: ${reason}`)
+    if (!job) return { status: 'not-found' }
+    const miss = this.terminalTransitionMiss(job, claimToken)
+    if (miss) return miss
+
+    job.status = 'failed'
+    job.failedByLifecycleWrite = true
+    await this.log(jobId, `Fatal: ${reason}`)
+    return { status: 'failed-terminal' }
+  }
+
+  async release(
+    jobId: string,
+    claimToken?: string,
+  ): Promise<ReleaseJobResult> {
+    const job = this.jobs.find((candidate) => candidate.id === jobId)
+    if (!job) return { status: 'not-found' }
+    if (
+      job.status === 'completed' ||
+      job.status === 'failed' ||
+      job.status === 'superseded'
+    ) {
+      return { status: 'already-terminal', terminalStatus: job.status }
     }
-    return 'applied'
+    if (
+      job.status !== 'active' ||
+      (claimToken !== undefined && job.claimToken !== claimToken)
+    ) {
+      return { status: 'lease-lost' }
+    }
+
+    const blocked =
+      job.dedupeKey !== undefined &&
+      job.dedupeScope !== undefined &&
+      this.jobs.some(
+        (candidate) =>
+          candidate !== job &&
+          candidate.status === 'pending' &&
+          candidate.dedupeKey === job.dedupeKey &&
+          candidate.dedupeScope === job.dedupeScope,
+      )
+    if (blocked) {
+      job.status = 'superseded'
+      job.failReason =
+        'released: a queued follow-up already covers this work'
+      job.failedAt = new Date()
+      return { status: 'superseded' }
+    }
+
+    job.status = 'pending'
+    job.runAt = new Date()
+    delete job.claimedAt
+    delete job.claimToken
+    return { status: 'released' }
   }
 
   /**
@@ -365,17 +507,14 @@ export class DummyBackend implements IJobQueueBackend {
     }
   }
 
-  /**
-   * Dummy jobs track no `claimedAt`, so there is nothing to extend — but the
-   * lease fence is still modelled, or a test could not tell a live heartbeat
-   * from a zombie worker's.
-   */
+  /** Extend a live claim's lease while preserving its fence. */
   async heartbeat(
     jobId: string,
     claimToken?: string,
   ): Promise<LifecycleWriteResult> {
-    const job = this.jobs.find((j) => j.id === jobId)
+    const job = this.jobs.find((candidate) => candidate.id === jobId)
     if (this.fenceMiss(job, claimToken)) return 'lease-lost'
+    if (job) job.claimedAt = new Date()
     return 'applied'
   }
 
@@ -424,6 +563,15 @@ export class DummyBackend implements IJobQueueBackend {
     return heartbeatClaimedInMemory(job, claimToken, () => {
       /* no claimedAt tracked on dummy jobs */
     })
+  }
+
+  async hasOutstanding(type: string, dedupeKey: string): Promise<boolean> {
+    return this.jobs.some(
+      (job) =>
+        job.type === type &&
+        job.dedupeKey === dedupeKey &&
+        (job.status === 'pending' || job.status === 'active'),
+    )
   }
 
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
@@ -478,6 +626,7 @@ export class DummyBackend implements IJobQueueBackend {
       active: filtered.filter((j) => j.status === 'active').length,
       completed: filtered.filter((j) => j.status === 'completed').length,
       failed: filtered.filter((j) => j.status === 'failed').length,
+      superseded: filtered.filter((j) => j.status === 'superseded').length,
       ...backlogAge(filtered),
     }
   }

@@ -16,7 +16,7 @@
  * future job for that key for good.
  */
 import type { Collection, Db } from 'mongodb'
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MongoJobQueue } from '../src/backends/MongoJobQueue'
 import type { JobDoc } from '../src/types'
@@ -41,6 +41,7 @@ describe('MongoJobQueue fail(): pending dedupe collision on retry', () => {
   })
 
   afterEach(async () => {
+    vi.restoreAllMocks()
     await backend.shutdown()
     await collection.drop().catch(() => {
       /* already gone */
@@ -51,16 +52,18 @@ describe('MongoJobQueue fail(): pending dedupe collision on retry', () => {
     await closeMongo()
   })
 
-  it('does not throw when a retrying job collides with the queued follow-up', async () => {
+  it('supersedes a retrying job that collides with its queued follow-up', async () => {
     const handle = await backend.claimOrEnqueue('sync', { n: 1 }, single)
     expect(handle).not.toBeNull()
     await backend.enqueue('sync', { n: 2 }, single)
 
     const active = await collection.findOne({ status: 'active' })
-    // Before the fix this rejected with E11000 on dedupe_pending_idx.
     await expect(
       backend.fail(active!._id, 'transient', active!.claimToken),
-    ).resolves.toBe('applied')
+    ).resolves.toEqual({ status: 'superseded' })
+    expect((await collection.findOne({ _id: active!._id }))?.status).toBe(
+      'superseded',
+    )
   })
 
   it('never leaves the job stuck active after a failed retry', async () => {
@@ -111,14 +114,109 @@ describe('MongoJobQueue fail(): pending dedupe collision on retry', () => {
     expect(doc?.attempt).toBe(1)
   })
 
-  it('the reaper can recover a stalled job whose key has a pending follow-up', async () => {
-    await backend.claimOrEnqueue('sync', { n: 1 }, single)
-    await backend.enqueue('sync', { n: 2 }, single)
+  it('the reaper supersedes a stalled job whose key has a pending follow-up', async () => {
+    const exhausted = { ...single, maxAttempts: 1 }
+    const active = await backend.claimOrEnqueue('sync', { n: 1 }, exhausted)
+    await backend.enqueue('sync', { n: 2 }, exhausted)
 
     // Zero window: every active lease looks expired.
     await expect(backend.recoverStuckJobs(0)).resolves.toBeGreaterThanOrEqual(1)
 
-    const stuck = await collection.countDocuments({ status: 'active' })
-    expect(stuck).toBe(0)
+    expect((await collection.findOne({ _id: active!.id }))?.status).toBe(
+      'superseded',
+    )
   })
+
+  describe('acknowledgement loss reconciliation', () => {
+    it('returns completed when the complete write commits before the driver throws', async () => {
+      await backend.enqueue('complete-after-commit', {})
+      const claimed = await backend.claimNext('complete-after-commit')
+      const committedUpdate = collection.updateOne.bind(collection)
+      vi.spyOn(collection, 'updateOne').mockImplementationOnce(
+        async (filter, update, options) => {
+          await committedUpdate(filter, update, options)
+          throw new Error('network acknowledgement lost after commit')
+        },
+      )
+
+      await expect(
+        backend.complete(claimed!.id, claimed!.claimToken),
+      ).resolves.toEqual({ status: 'completed' })
+      expect((await collection.findOne({ _id: claimed!.id }))!.status).toBe(
+        'completed',
+      )
+    })
+
+    it('reconciles superseded when its receipt commits before the driver throws', async () => {
+      const active = await backend.claimOrEnqueue('supersede-after-commit', {}, single)
+      await backend.enqueue('supersede-after-commit', {}, single)
+      const committedUpdate = collection.updateOne.bind(collection)
+      vi.spyOn(collection, 'updateOne').mockImplementation(
+        async (filter, update, options) => {
+          const result = await committedUpdate(filter, update, options)
+          const status = (
+            update as { $set?: { status?: unknown } }
+          ).$set?.status
+          if (status === 'superseded') {
+            throw new Error('network acknowledgement lost after commit')
+          }
+          return result
+        },
+      )
+
+      await expect(active!.fail('stale payload')).resolves.toEqual({
+        status: 'superseded',
+      })
+      expect((await collection.findOne({ _id: active!.id }))?.status).toBe(
+        'superseded',
+      )
+    })
+
+    it('retains the original retry result after a later claim completes', async () => {
+      await backend.enqueue(
+        'fail-after-commit',
+        {},
+        { maxAttempts: 3, backoff: 'fixed', backoffDelay: 60_000 },
+      )
+      const claimed = await backend.claimNext('fail-after-commit')
+      const committedUpdate = collection.updateOne.bind(collection)
+      let releaseAcknowledgement!: () => void
+      const acknowledgementMayFail = new Promise<void>((resolve) => {
+        releaseAcknowledgement = resolve
+      })
+      let markCommitted!: () => void
+      const committed = new Promise<void>((resolve) => {
+        markCommitted = resolve
+      })
+      vi.spyOn(collection, 'updateOne').mockImplementationOnce(
+        async (filter, update, options) => {
+          await committedUpdate(filter, update, options)
+          markCommitted()
+          await acknowledgementMayFail
+          throw new Error('network acknowledgement lost after commit')
+        },
+      )
+
+      const failing = backend.fail(
+        claimed!.id,
+        'transient',
+        claimed!.claimToken,
+      )
+      await committed
+      await committedUpdate(
+        { _id: claimed!.id },
+        { $set: { runAt: new Date(0) } },
+      )
+      const reclaimed = await backend.claimNext('fail-after-commit')
+      await backend.complete(reclaimed!.id, reclaimed!.claimToken)
+      releaseAcknowledgement()
+
+      await expect(failing).resolves.toEqual({ status: 'retry-scheduled' })
+      expect(reclaimed!.claimToken).not.toBe(claimed!.claimToken)
+      expect((await collection.findOne({ _id: claimed!.id }))!.status).toBe(
+        'completed',
+      )
+    })
+  })
+
 })

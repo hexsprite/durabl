@@ -5,16 +5,16 @@
  * error simulates a crash and the next claim is the resume — the journal lives
  * on the same in-memory job across attempts, exactly mirroring durable resume.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { DummyBackend } from '../src/backends/DummyBackend'
 import { ImmediateBackend } from '../src/backends/ImmediateBackend'
 import { JobQueue } from '../src/JobQueue'
 import {
+  LeaseLostError,
   MaxDurationExceeded,
   OrchestrationUnsupportedError,
 } from '../src/journal/errors'
-import { LeaseLostError, startHeartbeat } from '../src/orchestrator/context'
 import {
   deriveHeartbeatIntervalMs,
   Orchestrator,
@@ -527,10 +527,9 @@ describe('lease fencing on failure paths (du-4ft)', () => {
     ).toBe(true)
   })
 
-  // Regression: the reaper marks an attempt-exhausted job status:'failed'
-  // WITHOUT clearing claimToken. completeClaimed matched status:'active' only,
-  // so a worker that then finished every step got 'lease-lost' and the
-  // completed work was permanently lost.
+  // Regression: the reaper can mark an attempt-exhausted job `failed`
+  // immediately before its owner completes. The fenced completion must accept
+  // the same claim token and preserve the completed work.
   it('a run the reaper marked failed (attempt-exhausted) but that finishes all steps ends completed', async () => {
     orch.define(
       'exhausted',
@@ -551,14 +550,50 @@ describe('lease fencing on failure paths (du-4ft)', () => {
   })
 })
 
+describe('heartbeat ownership', () => {
+  it('uses only the queue heartbeat for orchestrated jobs', async () => {
+    const localBackend = new DummyBackend()
+    const localQueue = new JobQueue(localBackend, silentLogger, {
+      visibilityTimeoutMs: 45,
+    })
+    const localOrchestrator = new Orchestrator(localQueue, silentLogger)
+    const queueHeartbeat = vi.spyOn(localBackend, 'heartbeat')
+    const legacyHeartbeat = vi.spyOn(localBackend, 'heartbeatClaimed')
+    let finish!: () => void
+    const body = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    localOrchestrator.define(
+      'one-heartbeat',
+      async () => {
+        await body
+      },
+      { pollInterval: 5, heartbeatIntervalMs: 15 },
+    )
+
+    try {
+      const id = await localQueue.enqueue('one-heartbeat', {})
+      await waitUntil(() => queueHeartbeat.mock.calls.length >= 2)
+      expect(legacyHeartbeat).not.toHaveBeenCalled()
+      finish()
+      await waitUntil(
+        () =>
+          localBackend.jobs.find((job) => job.id === id)?.status === 'completed',
+      )
+    } finally {
+      finish()
+      await localQueue.shutdown(1000)
+    }
+  })
+})
+
 describe('lease-loss surfacing and abortable duration cap (du-04b)', () => {
-  // Regression: startHeartbeat discarded heartbeatClaimed's return, so a
-  // 'lease-lost' tick resolved normally and re-armed forever — the orphaned
-  // body kept firing side-effecting steps on a job another worker now owned.
+  // Regression: a queue heartbeat that reports lease loss must stop the loop
+  // and abort the orchestration before another step starts.
   it('a heartbeat tick detecting lease loss stops beating and the next step throws LeaseLostError without running its fn', async () => {
     let hbCalls = 0
-    const origHb = backend.heartbeatClaimed.bind(backend)
-    backend.heartbeatClaimed = async (jobId, token) => {
+    const origHb = backend.heartbeat.bind(backend)
+    backend.heartbeat = async (jobId, token) => {
       hbCalls++
       return origHb(jobId, token)
     }
@@ -666,52 +701,6 @@ describe('lease-loss surfacing and abortable duration cap (du-04b)', () => {
   })
 })
 
-describe('startHeartbeat stop/complete race', () => {
-  // Regression: on successful completion the wrapper flips the status to
-  // 'completed'. A heartbeat tick already in flight then read 'lease-lost' and
-  // fired onLeaseLost — a spurious 'lease lost — aborting run' warn + run abort
-  // on an already-finished run. A tick that resolves after stop() must be a
-  // no-op.
-  it('a tick resolving after stop() does not fire onLeaseLost', async () => {
-    let resolveHb!: (r: 'heartbeated' | 'lease-lost') => void
-    const hbInFlight = new Promise<'heartbeated' | 'lease-lost'>((res) => {
-      resolveHb = res
-    })
-    let hbCalled = false
-    const fakeQueue = {
-      heartbeatClaimed: () => {
-        hbCalled = true
-        return hbInFlight
-      },
-    } as unknown as JobQueue
-
-    let leaseLost = false
-    let warned = false
-    const handle = startHeartbeat(
-      fakeQueue,
-      'job1',
-      'tok',
-      1,
-      () => {
-        warned = true
-      },
-      () => {
-        leaseLost = true
-      },
-    )
-
-    // Let the first tick fire and suspend on the in-flight heartbeat write.
-    await waitUntil(() => hbCalled)
-    // The run completed and stopped the heartbeat while the write was pending.
-    handle.stop()
-    // Now the write comes back reporting the reclaim the completion caused.
-    resolveHb('lease-lost')
-    await new Promise((r) => setTimeout(r, 20))
-
-    expect(leaseLost).toBe(false) // ignored: stopped before it resolved
-    expect(warned).toBe(false)
-  })
-})
 
 describe('duplicate-append ambiguity', () => {
   it('returns the stored result when appendStep reports already-recorded', async () => {
