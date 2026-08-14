@@ -18,7 +18,7 @@ import type {
   HeartbeatClaimedResult,
   Job,
   JobContext,
-  JobHandle,
+  LeaseAwareJobHandle,
   JobHandler,
   LifecycleWriteResult,
   QueueStats,
@@ -34,7 +34,7 @@ type ImmediateJob<T = unknown> = Job<T> & {
   journalBytes: number
 }
 
-export class ImmediateBackend implements IJobQueueBackend {
+export class ImmediateBackend implements IJobQueueBackend<LeaseAwareJobHandle> {
   /** Inline backend: runs handlers on enqueue, never via the queue poll loop.
    *  Signals `JobQueue` to refuse orchestrations (which need `process()`). */
   readonly executesInline = true
@@ -150,7 +150,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     type: string,
     data: T,
     options: EnqueueOptions = {},
-  ): Promise<JobHandle<T> | null> {
+  ): Promise<LeaseAwareJobHandle<T> | null> {
     const dedupeScope = options.dedupeScope ?? 'pending+active'
 
     if (options.dedupeKey) {
@@ -207,6 +207,7 @@ export class ImmediateBackend implements IJobQueueBackend {
       fail: async (reason: string) => {
         await this.fail(jobId, reason, claimToken)
       },
+      heartbeat: () => this.heartbeat(jobId, claimToken),
       log: (message: string) => {
         void this.log(jobId, message)
       },

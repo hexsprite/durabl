@@ -25,7 +25,7 @@ import type {
   EnqueueOptions,
   HeartbeatClaimedResult,
   Job,
-  JobHandle,
+  LeaseAwareJobHandle,
   JobStatus,
   LifecycleWriteResult,
   QueueStats,
@@ -66,7 +66,7 @@ interface RecordedJob<T = unknown> {
  * expect(backend.jobs[0].type).toBe('myJobType')
  * ```
  */
-export class DummyBackend implements IJobQueueBackend {
+export class DummyBackend implements IJobQueueBackend<LeaseAwareJobHandle> {
   /** All recorded jobs */
   jobs: RecordedJob[] = []
 
@@ -154,7 +154,7 @@ export class DummyBackend implements IJobQueueBackend {
     type: string,
     data: T,
     options: EnqueueOptions = {},
-  ): Promise<JobHandle<T> | null> {
+  ): Promise<LeaseAwareJobHandle<T> | null> {
     const dedupeScope = options.dedupeScope ?? 'pending+active'
 
     if (options.dedupeKey) {
@@ -220,6 +220,7 @@ export class DummyBackend implements IJobQueueBackend {
         job.status = 'failed'
         job.logs.push(`Failed: ${reason}`)
       },
+      heartbeat: () => this.heartbeat(job.id, claimToken),
       log: (message: string) => {
         job.logs.push(message)
       },
@@ -227,7 +228,21 @@ export class DummyBackend implements IJobQueueBackend {
   }
 
   async claimNext<T>(type: string): Promise<Job<T> | null> {
-    const job = this.jobs.find((j) => j.type === type && j.status === 'pending')
+    const job = this.jobs.find(
+      (candidate) =>
+        candidate.type === type &&
+        candidate.status === 'pending' &&
+        !(
+          candidate.dedupeScope === 'pending' &&
+          candidate.dedupeKey &&
+          this.jobs.some(
+            (active) =>
+              active.status === 'active' &&
+              active.dedupeKey === candidate.dedupeKey &&
+              active.dedupeScope === candidate.dedupeScope,
+          )
+        ),
+    )
     if (!job) return null
 
     job.status = 'active'
