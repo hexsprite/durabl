@@ -10,6 +10,16 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-17
+
+### Changed
+
+- Retryable claim and reaper-sweep failures log at `warn`, not `error`. A
+  failure that the backoff retries is not an error. A sustained outage still
+  surfaces: after 5 consecutive failures the site logs `error` once. The count
+  is per processor type for claims, and resets on the first success. The error
+  object stays on the log line at both levels.
+
 ## [0.3.0] - 2026-08-14
 
 ### Added
@@ -143,7 +153,8 @@ called out under **BREAKING** below.
   `pending` / `pending+active` scopes, and change-stream push with a poll-loop
   safety net.
 
-[unreleased]: https://github.com/hexsprite/durabl/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/hexsprite/durabl/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/hexsprite/durabl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hexsprite/durabl/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hexsprite/durabl/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hexsprite/durabl/compare/v0.1.1...v0.2.0
