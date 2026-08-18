@@ -60,13 +60,14 @@ describe('JobQueue.startReaper (du-jt0, du-zcz.4)', () => {
     expect(vi.getTimerCount()).toBe(1)
   })
 
-  it('returns recovered null after a failed startup sweep, reports the error, and keeps running', async () => {
+  it('returns recovered null after a failed startup sweep, reports the failure, and keeps running', async () => {
     const events: JobEvent[] = []
     const error = vi.fn()
+    const warn = vi.fn()
     const logger: Logger = {
       debug: vi.fn(),
       info: vi.fn(),
-      warn: vi.fn(),
+      warn,
       error,
       child: () => logger,
     }
@@ -84,7 +85,9 @@ describe('JobQueue.startReaper (du-jt0, du-zcz.4)', () => {
       recovered: null,
     })
 
-    expect(error).toHaveBeenCalledTimes(1)
+    // du-qwa: the sweep retries next interval, so one failure is a warn.
+    expect(error).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledTimes(1)
     expect(events).toEqual([
       {
         kind: 'reaper-error',

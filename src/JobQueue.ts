@@ -45,6 +45,8 @@ interface ProcessorState {
   inlineSlotWaiters: InlineSlotWaiter[]
   /** Current backoff delay after errors (resets on success) */
   backoffMs: number
+  /** Consecutive claim failures (resets on any successful claim call). */
+  claimFailures: number
 }
 
 interface ManagedRun {
@@ -59,6 +61,15 @@ type ManagedExecutionResult =
   | { status: 'completed' }
   | { status: 'superseded'; handlerError: unknown }
   | { status: 'stopped' }
+
+/**
+ * Consecutive retryable failures before a warn escalates to one error.
+ *
+ * A failure that the backoff will retry is not an error — logging it as one
+ * turns a short Mongo outage into an inbox issue per processor type. A
+ * sustained outage still surfaces: at this count the site logs error once.
+ */
+const ESCALATE_AFTER_FAILURES = 5
 
 const MIN_BACKOFF_MS = 1000
 const MAX_BACKOFF_MS = 60000
@@ -111,6 +122,9 @@ export class JobQueue {
   private isShuttingDown = false
   private unsubscribePush: (() => void) | null = null
   private reaperTimer: ReturnType<typeof setTimeout> | null = null
+
+  /** Consecutive reaper sweep failures (resets on the first success). */
+  private reaperFailures = 0
   /**
    * Whether the reaper loop is live. Separate from {@link reaperTimer} because
    * during an in-flight sweep no timer is armed — without this flag a second
@@ -234,6 +248,7 @@ export class JobQueue {
       running: true,
       activeCount: 0,
       backoffMs: 0,
+      claimFailures: 0,
       inlineSlotWaiters: [],
     }
 
@@ -313,6 +328,8 @@ export class JobQueue {
     state.activeCount++
     try {
       const job = await this.backend.claimNext(state.type)
+      // The backend answered, so the failure streak is over.
+      state.claimFailures = 0
       if (!job) {
         state.activeCount--
         return false
@@ -324,8 +341,15 @@ export class JobQueue {
       return true
     } catch (err) {
       state.activeCount--
-      // Log error and apply exponential backoff
-      this.log.error({ err, type: state.type }, 'error claiming next job')
+      // Log and apply exponential backoff. The retry makes a single failure a
+      // warn; only a sustained streak escalates to error.
+      state.claimFailures++
+      const level =
+        state.claimFailures === ESCALATE_AFTER_FAILURES ? 'error' : 'warn'
+      this.log[level](
+        { err, type: state.type, failures: state.claimFailures },
+        'error claiming next job',
+      )
       state.backoffMs = Math.min(
         MAX_BACKOFF_MS,
         Math.max(MIN_BACKOFF_MS, state.backoffMs * 2 || MIN_BACKOFF_MS),
@@ -484,6 +508,7 @@ export class JobQueue {
       const handled = await this.backend.recoverStuckJobs!(
         this.visibilityTimeoutMs,
       )
+      this.reaperFailures = 0
       if (handled > 0) {
         this.log.warn({ handled }, 'reaper recovered stuck jobs')
         this.emit({
@@ -495,8 +520,11 @@ export class JobQueue {
       return handled
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      this.log.error(
-        { err, phase },
+      this.reaperFailures++
+      const level =
+        this.reaperFailures === ESCALATE_AFTER_FAILURES ? 'error' : 'warn'
+      this.log[level](
+        { err, phase, failures: this.reaperFailures },
         'reaper sweep failed; will retry next interval',
       )
       this.emit({ kind: 'reaper-error', phase, message })
