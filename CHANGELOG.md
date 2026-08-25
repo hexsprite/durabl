@@ -8,7 +8,36 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 While the version is `0.x`, breaking changes ship in minor releases and are
 called out under **BREAKING** below.
 
-## [Unreleased]
+## [0.4.0] - 2026-08-25
+
+### Added
+
+- Structural failure classification. Terminal `failed` jobs carry a
+  `failureKind`: `retries-exhausted`, `fatal` (poison payload), or `stalled`
+  (reaper give-up). Distinguish poison from flaky structurally instead of
+  substring-matching `failReason`.
+- `JobQueue.listFailed(opts)` lists terminal failed jobs newest first, filterable
+  by type, kind, and `since`. Served by a new partial index.
+- `JobQueue.retry(jobId)` replays a terminal failed job: back to pending at
+  attempt 0, failure markers cleared, replay logged. Returns `false` when the
+  job is not terminal-failed or a live job holds its dedupe key.
+- `QueueStats.failedByKind` breaks the failed count down by kind; legacy
+  documents count under `'unknown'`.
+
+### Changed
+
+- `enqueue()` and `claimOrEnqueue()` throw `DedupeScopeConflictError` when a
+  `dedupeKey` already has a live pending/active job under a *different*
+  `dedupeScope`. Previously the mix got zero mutual exclusion between scopes,
+  silently, because the unique indexes key on scope. Terminal history does not
+  conflict.
+
+### BREAKING
+
+- Custom backends must now implement `listFailed()` and `retry()`.
+- Code that intentionally mixes one `dedupeKey` across two scopes while a job is
+  live will now throw at enqueue time instead of running without mutual
+  exclusion.
 
 ## [0.3.1] - 2026-08-17
 
@@ -153,7 +182,8 @@ called out under **BREAKING** below.
   `pending` / `pending+active` scopes, and change-stream push with a poll-loop
   safety net.
 
-[unreleased]: https://github.com/hexsprite/durabl/compare/v0.3.1...HEAD
+[unreleased]: https://github.com/hexsprite/durabl/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/hexsprite/durabl/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hexsprite/durabl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hexsprite/durabl/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hexsprite/durabl/compare/v0.2.0...v0.2.1
