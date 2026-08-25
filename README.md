@@ -156,6 +156,15 @@ Set `{ maxDrains: 0 }` to disable follower draining.
 
 The unique partial indexes enforce this result across processes. Do not use a state read as a coordination lock.
 
+A `dedupeKey` names one logical resource, so it may live under only **one** scope at a time.
+If the key already has a live (pending or active) job under a different scope,
+`enqueue` and `claimOrEnqueue` throw `DedupeScopeConflictError` naming both scopes.
+Without this guard the two jobs would fall under different unique indexes and get no
+mutual exclusion at all — silently, exactly where you believe you have some.
+Once every job under the key is terminal, the key is free for any scope again.
+Note that a key spans job types: two different types using the same key already exclude
+each other today, because the dedupe indexes ignore `type`.
+
 ## Migrating to 0.3.0
 
 Version 0.3.0 is a breaking minor release under the `0.x` version policy.
@@ -299,6 +308,8 @@ declare class JobQueue {
   runClaimed<T>(handle: JobHandle<T>, handler: JobHandler<T>, options?: RunClaimedOptions): Promise<void>
   process<T>(type: string, handler: JobHandler<T>, config?: ProcessorConfig): void
   hasOutstanding(type: string, dedupeKey: string): Promise<boolean>
+  listFailed(opts?: ListFailedOptions): Promise<Job[]>
+  retry(jobId: string): Promise<boolean>
   getStats(type?: string): Promise<QueueStats>
   startup(): Promise<void>
   startReaper(intervalMs?: number): Promise<StartReaperResult>
@@ -658,6 +669,26 @@ Call `process()` only on worker instances.
 **Return or throw from handlers.** A successful return completes the job.
 An `Error` schedules a retry or terminal failure. `FatalJobError` records a terminal failure immediately.
 Use `ctx.signal` to stop external work after shutdown or lease loss.
+
+**Find what died, tell poison from flaky, replay it.** Terminal `failed` jobs carry a
+`failureKind`: `retries-exhausted` (flaky — self-healing after a fix), `fatal`
+(poison payload — needs a human), or `stalled` (the reaper gave up on a dead worker).
+Classify structurally; never substring-match `failReason`.
+
+```typescript
+const poison = await queue.listFailed({ failureKind: 'fatal', limit: 50 })
+for (const job of poison) {
+  // alert on it, inspect job.failReason …
+}
+
+// After fixing the underlying bug:
+await queue.retry(job.id) // back to pending at attempt 0
+```
+
+`retry()` returns `false` if the job is not terminal-failed or if replaying would
+collide with a live job under the same dedupe key. `getStats().failedByKind`
+breaks the failed count down by kind so a dashboard can chart poison separately
+from flaky.
 
 **Drain on SIGTERM.** A bounded shutdown releases managed claims that exceed the grace period.
 This prevents a deploy from leaving those claims active until the visibility timeout.

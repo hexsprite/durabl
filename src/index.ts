@@ -34,7 +34,10 @@ export {
 export type { GlobalQueueOptions, JobQueueOptions } from './JobQueue'
 
 // Types
-export { FatalJobError } from './types'
+export {
+  DedupeScopeConflictError,
+  FatalJobError,
+} from './types'
 export type {
   AppendStepResult,
   CompleteClaimedResult,
@@ -43,6 +46,7 @@ export type {
   EnqueueOptions,
   FailFatalJobResult,
   FailJobResult,
+  FailureKind,
   HeartbeatClaimedResult,
   Job,
   JobContext,
@@ -53,6 +57,7 @@ export type {
   JobHandler,
   JobStatus,
   LifecycleWriteResult,
+  ListFailedOptions,
   ReleaseJobResult,
   TerminalWriteMissResult,
   RunClaimedOptions,

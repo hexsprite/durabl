@@ -48,6 +48,8 @@ function makeStubBackend(
     log: vi.fn().mockResolvedValue(undefined),
     heartbeat: vi.fn().mockResolvedValue('applied'),
     hasOutstanding: vi.fn().mockResolvedValue(false),
+    listFailed: vi.fn().mockResolvedValue([] as Job[]),
+    retry: vi.fn().mockResolvedValue(false),
     findOne: vi.fn().mockResolvedValue(null as Job | null),
     getStats: vi.fn().mockResolvedValue({
       pending: 0,

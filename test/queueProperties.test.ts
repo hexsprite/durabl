@@ -21,6 +21,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { DummyBackend } from '../src/backends/DummyBackend'
 import type { IJobQueueBackend } from '../src/backends/IJobQueueBackend'
 import { MongoJobQueue } from '../src/backends/MongoJobQueue'
+import { DedupeScopeConflictError } from '../src/types'
 import type { DedupeScope, Job, JobDoc } from '../src/types'
 
 import { closeMongo, getMongo, uniqueCollectionName } from './mongoHelper'
@@ -114,6 +115,11 @@ async function runScenario(
       // A throw from any of these is itself a finding: the documented contract
       // is that contention and retry-exhaustion are ordinary outcomes, not
       // exceptions. This is the du-pz9 class.
+      //
+      // Exception: mixing dedupe scopes on one key is now a documented caller
+      // error (du-82x) — the generator produces that mix freely, so the
+      // rejection is an expected outcome, not a violation.
+      if (err instanceof DedupeScopeConflictError) continue
       violations.push(
         `${op.kind} threw: ${err instanceof Error ? err.message : String(err)}`,
       )

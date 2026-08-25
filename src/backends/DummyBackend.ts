@@ -19,7 +19,7 @@ import {
   sortBySeq,
   truncateLogMessage,
 } from '../journal/serialize'
-import { assertValidLatestCoalescing } from '../types'
+import { assertValidLatestCoalescing, DedupeScopeConflictError } from '../types'
 import type {
   AppendStepResult,
   CompleteClaimedResult,
@@ -27,11 +27,13 @@ import type {
   EnqueueOptions,
   FailFatalJobResult,
   FailJobResult,
+  FailureKind,
   HeartbeatClaimedResult,
   Job,
   JobHandle,
   JobStatus,
   LifecycleWriteResult,
+  ListFailedOptions,
   ReleaseJobResult,
   TerminalWriteMissResult,
   QueueStats,
@@ -40,6 +42,11 @@ import type {
 
 import { backlogAge } from './backlogAge'
 import type { IJobQueueBackend } from './IJobQueueBackend'
+
+/** Default page size for the dead-letter listing (`listFailed`). */
+const DEFAULT_LIST_FAILED_LIMIT = 100
+/** Hard ceiling on one `listFailed` page, whatever the caller asked for. */
+const MAX_LIST_FAILED_LIMIT = 1000
 
 interface RecordedJob<T = unknown> {
   id: string
@@ -59,6 +66,8 @@ interface RecordedJob<T = unknown> {
   claimedAt?: Date
   failedAt?: Date
   failReason?: string
+  /** Why the job reached terminal `failed` (see {@link Job.failureKind}). */
+  failureKind?: FailureKind
   /** Distinguishes a lifecycle failure from a reaper race in `complete()`. */
   failedByLifecycleWrite?: boolean
   steps: StepRecord[]
@@ -118,6 +127,9 @@ export class DummyBackend implements IJobQueueBackend {
       runAt: job.runAt,
       createdAt: job.createdAt,
       claimedAt: job.claimedAt,
+      failedAt: job.failedAt,
+      failReason: job.failReason,
+      failureKind: job.failureKind,
       ...(includeClaimToken ? { claimToken: job.claimToken } : {}),
     }
   }
@@ -166,6 +178,31 @@ export class DummyBackend implements IJobQueueBackend {
     })
   }
 
+  /**
+   * A dedupeKey names one logical resource; using it under two scopes gets no
+   * mutual exclusion between them (they fall under different unique indexes in
+   * Mongo), so the mix is rejected instead of silently allowed. Only LIVE
+   * jobs conflict — once everything is terminal the key is free again.
+   */
+  private assertNoScopeConflict(
+    dedupeKey: string,
+    dedupeScope: 'pending' | 'pending+active',
+  ): void {
+    const live = this.jobs.find(
+      (job) =>
+        job.dedupeKey === dedupeKey &&
+        (job.status === 'pending' || job.status === 'active') &&
+        (job.dedupeScope ?? 'pending+active') !== dedupeScope,
+    )
+    if (live) {
+      throw new DedupeScopeConflictError(
+        `dedupeKey "${dedupeKey}" already has a ${live.status} job under scope ` +
+          `'${live.dedupeScope ?? 'pending+active'}'; refusing to enqueue under scope ` +
+          `'${dedupeScope}' — a dedupeKey names one logical resource`,
+      )
+    }
+  }
+
   async enqueue(
     type: string,
     data: unknown,
@@ -175,6 +212,7 @@ export class DummyBackend implements IJobQueueBackend {
 
     // Check for duplicate
     if (options.dedupeKey) {
+      this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
       const existing = this.findByDedupeKey(options.dedupeKey, dedupeScope)
       if (existing) {
         return null
@@ -219,6 +257,7 @@ export class DummyBackend implements IJobQueueBackend {
     const dedupeScope = options.dedupeScope ?? 'pending+active'
 
     if (options.dedupeKey) {
+      this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
       // A run is already queued — don't start another now.
       const pending = this.jobs.find(
         (job) =>
@@ -384,6 +423,7 @@ export class DummyBackend implements IJobQueueBackend {
       job.status = 'completed'
       delete job.failedAt
       delete job.failReason
+      delete job.failureKind
       return { status: 'completed' }
     }
     const miss = this.terminalTransitionMiss(job, claimToken)
@@ -421,6 +461,7 @@ export class DummyBackend implements IJobQueueBackend {
     if (job.attempt >= job.maxAttempts) {
       job.status = 'failed'
       job.failReason = reason
+      job.failureKind = 'retries-exhausted'
       job.failedAt = new Date()
       job.failedByLifecycleWrite = true
       return { status: 'failed-terminal' }
@@ -440,6 +481,9 @@ export class DummyBackend implements IJobQueueBackend {
     if (miss) return miss
 
     job.status = 'failed'
+    job.failReason = reason
+    job.failureKind = 'fatal'
+    job.failedAt = new Date()
     job.failedByLifecycleWrite = true
     await this.log(jobId, `Fatal: ${reason}`)
     return { status: 'failed-terminal' }
@@ -574,6 +618,52 @@ export class DummyBackend implements IJobQueueBackend {
     )
   }
 
+  async listFailed(opts: ListFailedOptions = {}): Promise<Job[]> {
+    return this.jobs
+      .filter((job) => {
+        if (job.status !== 'failed') return false
+        if (opts.type && job.type !== opts.type) return false
+        if (opts.failureKind && job.failureKind !== opts.failureKind) {
+          return false
+        }
+        if (opts.since && (!job.failedAt || job.failedAt < opts.since)) {
+          return false
+        }
+        return true
+      })
+      // Newest failure first, matching the Mongo dead-letter view.
+      .sort(
+        (a, b) => (b.failedAt?.getTime() ?? 0) - (a.failedAt?.getTime() ?? 0),
+      )
+      .slice(0, Math.max(1, Math.min(opts.limit ?? DEFAULT_LIST_FAILED_LIMIT,
+        MAX_LIST_FAILED_LIMIT)))
+      .map((job) => this.toJob(job))
+  }
+
+  async retry(jobId: string): Promise<boolean> {
+    const job = this.jobs.find((j) => j.id === jobId)
+    if (!job || job.status !== 'failed') return false
+    const scope = job.dedupeScope ?? 'pending+active'
+    const collision =
+      job.dedupeKey !== undefined &&
+      this.jobs.some(
+        (candidate) =>
+          candidate !== job &&
+          candidate.dedupeKey === job.dedupeKey &&
+          (candidate.dedupeScope ?? 'pending+active') === scope &&
+          (candidate.status === 'pending' || candidate.status === 'active'),
+      )
+    if (collision) return false
+    job.status = 'pending'
+    job.attempt = 0
+    job.runAt = new Date()
+    delete job.failReason
+    delete job.failedAt
+    delete job.failureKind
+    await this.log(jobId, 'Manual replay: returned to pending')
+    return true
+  }
+
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
     const job = this.jobs.find((j) => this.matchesQuery(j, query))
     if (!job) return null
@@ -621,12 +711,19 @@ export class DummyBackend implements IJobQueueBackend {
 
   async getStats(type?: string): Promise<QueueStats> {
     const filtered = type ? this.jobs.filter((j) => j.type === type) : this.jobs
+    const failedByKind: QueueStats['failedByKind'] = {}
+    for (const job of filtered) {
+      if (job.status !== 'failed') continue
+      const kind = job.failureKind ?? 'unknown'
+      failedByKind[kind] = (failedByKind[kind] ?? 0) + 1
+    }
     return {
       pending: filtered.filter((j) => j.status === 'pending').length,
       active: filtered.filter((j) => j.status === 'active').length,
       completed: filtered.filter((j) => j.status === 'completed').length,
       failed: filtered.filter((j) => j.status === 'failed').length,
       superseded: filtered.filter((j) => j.status === 'superseded').length,
+      failedByKind,
       ...backlogAge(filtered),
     }
   }

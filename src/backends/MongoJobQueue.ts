@@ -16,25 +16,30 @@ import {
 } from '../journal/serialize'
 import {
   assertValidLatestCoalescing,
-  type AppendStepResult,
-  type CompleteClaimedResult,
-  type CompleteJobResult,
-  type DedupeScope,
-  type EnqueueOptions,
-  type FailFatalJobResult,
-  type FailJobResult,
-  type HeartbeatClaimedResult,
-  type Job,
-  type JobDoc,
+  DedupeScopeConflictError,
   jobDocToJob,
-  type JobHandle,
-  type JobStatus,
-  type LifecycleWriteResult,
-  type ReleaseJobResult,
-  type QueueStats,
-  type TerminalReceipt,
-  type TerminalWriteMissResult,
-  type StepRecord,
+} from '../types'
+import type {
+  AppendStepResult,
+  CompleteClaimedResult,
+  CompleteJobResult,
+  DedupeScope,
+  EnqueueOptions,
+  FailFatalJobResult,
+  FailJobResult,
+  HeartbeatClaimedResult,
+  Job,
+  JobDoc,
+  JobHandle,
+  JobStatus,
+  FailureKind,
+  LifecycleWriteResult,
+  ListFailedOptions,
+  ReleaseJobResult,
+  QueueStats,
+  TerminalReceipt,
+  TerminalWriteMissResult,
+  StepRecord,
 } from '../types'
 
 import { retryBackoffMs } from './backoff'
@@ -91,6 +96,10 @@ const DEFAULT_REAPER_BATCH_SIZE = 1000
 const MAX_DEDUPE_SKIPS = 20
 /** Maximum upsert retries after a concurrent pending-follower insert wins. */
 const MAX_LATEST_COALESCE_ATTEMPTS = 3
+/** Default page size for the dead-letter listing (`listFailed`). */
+const DEFAULT_LIST_FAILED_LIMIT = 100
+/** Hard ceiling on one `listFailed` page, whatever the caller asked for. */
+const MAX_LIST_FAILED_LIMIT = 1000
 
 /** Fields returned by hot claim reads; journals and receipts can be megabytes. */
 const CLAIMED_JOB_PROJECTION = {
@@ -109,6 +118,7 @@ const CLAIMED_JOB_PROJECTION = {
   completedAt: 1,
   failedAt: 1,
   failReason: 1,
+  failureKind: 1,
   claimToken: 1,
 } as const
 
@@ -250,6 +260,36 @@ export class MongoJobQueue implements IJobQueueBackend {
     this.pendingListeners.clear() // drop any never-attached listeners
   }
 
+  /**
+   * A dedupeKey names one logical resource; using it under two scopes gets no
+   * mutual exclusion between them (the unique partial indexes key on scope, so
+   * the two docs cannot see each other), so the mix is rejected instead of
+   * silently allowed. Only LIVE jobs conflict — terminal documents keep their
+   * historical scope without blocking the key. Type is deliberately NOT part of
+   * this check: the dedupe indexes ignore type too, so one key already spans
+   * types today.
+   */
+  private async assertNoScopeConflict(
+    dedupeKey: string,
+    dedupeScope: DedupeScope,
+  ): Promise<void> {
+    const live = await this.collection.findOne(
+      {
+        dedupeKey,
+        status: { $in: ['pending', 'active'] satisfies JobStatus[] },
+        dedupeScope: { $ne: dedupeScope },
+      },
+      { projection: { status: 1, dedupeScope: 1 } },
+    )
+    if (live) {
+      throw new DedupeScopeConflictError(
+        `dedupeKey "${dedupeKey}" already has a ${live.status} job under scope ` +
+          `'${live.dedupeScope ?? 'pending+active'}'; refusing to enqueue under scope ` +
+          `'${dedupeScope}' — a dedupeKey names one logical resource`,
+      )
+    }
+  }
+
   async enqueue(
     type: string,
     data: unknown,
@@ -257,6 +297,9 @@ export class MongoJobQueue implements IJobQueueBackend {
   ): Promise<string | null> {
     const now = new Date()
     const dedupeScope: DedupeScope = options.dedupeScope ?? 'pending+active'
+    if (options.dedupeKey) {
+      await this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
+    }
     const runAt = options.delay ? new Date(now.getTime() + options.delay) : now
 
     const doc: JobDoc = {
@@ -309,6 +352,9 @@ export class MongoJobQueue implements IJobQueueBackend {
     assertValidLatestCoalescing(options)
     const now = new Date()
     const dedupeScope: DedupeScope = options.dedupeScope ?? 'pending+active'
+    if (options.dedupeKey) {
+      await this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
+    }
 
     if (options.coalesce === 'latest') {
       const replaced = await this.collection.updateOne(
@@ -679,7 +725,7 @@ export class MongoJobQueue implements IJobQueueBackend {
               result,
             }),
           },
-          $unset: { failedAt: '', failReason: '' },
+          $unset: { failedAt: '', failReason: '', failureKind: '' },
         },
       )
       matchedCount = write.matchedCount
@@ -735,6 +781,7 @@ export class MongoJobQueue implements IJobQueueBackend {
           $set: {
             status: 'failed' as JobStatus,
             failReason: reason,
+            failureKind: 'retries-exhausted',
             failedAt: now,
             ...this.terminalReceiptWrite({
               claimToken: claimToken ?? null,
@@ -868,6 +915,7 @@ export class MongoJobQueue implements IJobQueueBackend {
           $set: {
             status: 'failed' as JobStatus,
             failReason: reason,
+            failureKind: 'fatal',
             failedAt: now,
             ...this.terminalReceiptWrite({
               claimToken: claimToken ?? null,
@@ -1124,7 +1172,7 @@ export class MongoJobQueue implements IJobQueueBackend {
       },
       {
         $set: { status: 'completed' as JobStatus, completedAt: new Date() },
-        $unset: { failReason: '', failedAt: '' },
+        $unset: { failReason: '', failedAt: '', failureKind: '' },
       },
     )
     return res.matchedCount === 1 ? 'completed' : 'lease-lost'
@@ -1155,6 +1203,55 @@ export class MongoJobQueue implements IJobQueueBackend {
     return doc !== null
   }
 
+  async listFailed(opts: ListFailedOptions = {}): Promise<Job[]> {
+    const filter: Filter<JobDoc> = { status: 'failed' as JobStatus }
+    if (opts.type) filter.type = opts.type
+    if (opts.failureKind) filter.failureKind = opts.failureKind
+    if (opts.since) filter.failedAt = { $gte: opts.since }
+    // Newest failure first — the dead-letter view answers "what broke most
+    // recently". The `{status, failedAt}` partial index serves this directly.
+    const cursor = this.collection
+      .find(filter)
+      .project(CLAIMED_JOB_PROJECTION)
+      .sort({ failedAt: -1 })
+      .limit(Math.max(1, Math.min(opts.limit ?? DEFAULT_LIST_FAILED_LIMIT,
+        MAX_LIST_FAILED_LIMIT)))
+    const docs = (await cursor.toArray()) as unknown as JobDoc[]
+    // General read view: no live fencing token on listed jobs.
+    return docs.map((doc) => jobDocToJob(doc))
+  }
+
+  async retry(jobId: string): Promise<boolean> {
+    try {
+      // Atomic and all-or-nothing: a non-terminal job matches nothing and is
+      // left untouched; a dedupe collision aborts the whole write.
+      const res = await this.collection.updateOne(
+        { _id: jobId, status: 'failed' as JobStatus },
+        {
+          $set: {
+            status: 'pending' as JobStatus,
+            attempt: 0,
+            runAt: new Date(),
+          },
+          $unset: {
+            failReason: '',
+            failedAt: '',
+            failureKind: '',
+            claimToken: '',
+            claimedAt: '',
+          },
+          ...this.logWrite('Manual replay: returned to pending', new Date()),
+        },
+      )
+      return res.matchedCount === 1
+    } catch (err) {
+      // Replaying into a dedupe collision must not crash the operator tooling:
+      // skip-and-return-false. Any other duplicate-key error is a real fault.
+      if (dedupeKeyFromDuplicateError(err) === null) throw err
+      return false
+    }
+  }
+
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
     const doc = (await this.collection.findOne(query)) as JobDoc<T> | null
     // General read view: the live fencing claimToken is deliberately NOT
@@ -1167,7 +1264,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     const q = type ? { type } : {}
     const count = (s: JobStatus) =>
       this.collection.countDocuments({ ...q, status: s })
-    const [pending, active, completed, failed, superseded, oldest] =
+    const [pending, active, completed, failed, superseded, oldest, kinds] =
       await Promise.all([
         count('pending'),
         count('active'),
@@ -1185,14 +1282,28 @@ export class MongoJobQueue implements IJobQueueBackend {
           .sort({ runAt: 1 })
           .limit(1)
           .next(),
+        // Poison vs flaky vs stalled — one grouped read over the (partial-
+        // indexed) failed set. Legacy docs without failureKind group as null
+        // and are reported under 'unknown'.
+        this.collection
+          .aggregate<{ _id: FailureKind | null; count: number }>([
+            { $match: { ...q, status: 'failed' } },
+            { $group: { _id: '$failureKind', count: { $sum: 1 } } },
+          ])
+          .toArray(),
       ])
     const oldestPendingRunAt = oldest?.runAt ?? null
+    const failedByKind: QueueStats['failedByKind'] = {}
+    for (const { _id, count } of kinds) {
+      failedByKind[_id ?? 'unknown'] = count
+    }
     return {
       pending,
       active,
       completed,
       failed,
       superseded,
+      failedByKind,
       oldestPendingRunAt,
       oldestPendingLagMs: oldestPendingRunAt
         ? Math.max(0, now.getTime() - oldestPendingRunAt.getTime())
@@ -1287,6 +1398,7 @@ export class MongoJobQueue implements IJobQueueBackend {
             $set: {
               status: 'failed' as JobStatus,
               failReason: 'Stalled — retries exhausted',
+              failureKind: 'stalled',
               failedAt: now,
             },
             ...this.logWrite('Stalled — retries exhausted', now),

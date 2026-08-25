@@ -21,6 +21,7 @@ import type {
   JobEvent,
   JobEventSink,
   JobHandler,
+  ListFailedOptions,
   ProcessorConfig,
   QueueStats,
   StepRecord,
@@ -361,6 +362,24 @@ export class JobQueue {
   /** Get queue statistics. */
   async getStats(type?: string): Promise<QueueStats> {
     return this.backend.getStats(type)
+  }
+
+  /**
+   * List terminal `failed` jobs, newest first — the dead-letter view. Filter
+   * by `failureKind` to tell poison (`fatal`) from flaky (`retries-exhausted`)
+   * and stalled structurally, without matching on message text.
+   */
+  async listFailed(opts: ListFailedOptions = {}): Promise<Job[]> {
+    return this.backend.listFailed(opts)
+  }
+
+  /**
+   * Replay a terminal `failed` job: back to `pending`, attempt reset to 0,
+   * failure markers cleared. Returns `false` if the job isn't terminal-failed
+   * or a live job under the same dedupe key would collide.
+   */
+  async retry(jobId: string): Promise<boolean> {
+    return this.backend.retry(jobId)
   }
 
   /** Return whether this type and dedupe key has a pending or active job. */

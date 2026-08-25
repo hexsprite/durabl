@@ -13,6 +13,40 @@ export type JobStatus =
   | 'superseded'
 
 /**
+ * Why a job reached terminal `failed`. Three paths write that status and they
+ * mean different things operationally — flaky (retry again after a fix),
+ * poison (a human must look at it), stalled (worker died with attempts gone).
+ * Distinguishable structurally instead of by substring-matching `failReason`.
+ */
+export type FailureKind = 'retries-exhausted' | 'fatal' | 'stalled'
+
+/** Filters for {@link IJobQueueBackend.listFailed}. */
+export interface ListFailedOptions {
+  /** Only jobs of this type. */
+  type?: string
+  /** Only jobs that failed this way. */
+  failureKind?: FailureKind
+  /** Only jobs whose `failedAt` is at or after this instant. */
+  since?: Date
+  /** Maximum number of jobs returned. Default: 100. */
+  limit?: number
+}
+
+/**
+ * Thrown by `enqueue`/`claimOrEnqueue` when a dedupeKey already has a live
+ * (pending or active) job under a DIFFERENT dedupeScope. A dedupeKey names a
+ * logical resource; two scopes for one resource is almost certainly a call-site
+ * mistake, and silently allowing it means zero mutual exclusion exactly where
+ * the caller believes they have some.
+ */
+export class DedupeScopeConflictError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'DedupeScopeConflictError'
+  }
+}
+
+/**
  * Controls duplicate job prevention behavior.
  * - 'pending+active': Only one job with dedupeKey can exist (pending OR active)
  * - 'pending': Only one PENDING job; allows 1 pending + 1 active (coalescing)
@@ -138,6 +172,11 @@ export interface Job<T = unknown> {
   failedAt?: Date
   failReason?: string
   /**
+   * Why the job reached terminal `failed` (see {@link FailureKind}). Absent on
+   * jobs failed before this field existed, and on every non-failed status.
+   */
+  failureKind?: FailureKind
+  /**
    * Per-claim lease nonce minted on every claim. Orchestrator fencing
    * (`appendStep`/`completeClaimed`/`heartbeatClaimed`) filters on this so a
    * stale worker can never mutate a reclaimed job. Absent on backends that
@@ -238,6 +277,13 @@ export interface QueueStats {
   failed: number
   superseded: number
   /**
+   * Terminal `failed` jobs broken down by {@link FailureKind}, so a dashboard
+   * can chart poison (`fatal`) separately from flaky (`retries-exhausted`) and
+   * stalled. Legacy documents written before `failureKind` existed are counted
+   * under `'unknown'`. Absent fields mean zero of that kind.
+   */
+  failedByKind?: Partial<Record<FailureKind | 'unknown', number>>
+  /**
    * `runAt` of the oldest job that is pending **and already due**, or `null`
    * when nothing is waiting.
    *
@@ -308,6 +354,8 @@ export interface JobDoc<T = unknown> {
   completedAt?: Date
   failedAt?: Date
   failReason?: string
+  /** Why the job reached terminal `failed` (see {@link Job.failureKind}). */
+  failureKind?: FailureKind
   logs: Array<{ timestamp: Date; message: string }>
   /** Per-claim lease nonce (see {@link Job.claimToken}). */
   claimToken?: string
@@ -350,6 +398,7 @@ export function jobDocToJob<T>(
     completedAt: doc.completedAt,
     failedAt: doc.failedAt,
     failReason: doc.failReason,
+    failureKind: doc.failureKind,
     ...(includeClaimToken ? { claimToken: doc.claimToken } : {}),
   }
 }

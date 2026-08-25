@@ -24,7 +24,10 @@ import {
   DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
   sortBySeq,
 } from '../journal/serialize'
-import { assertValidLatestCoalescing } from '../types'
+import {
+  assertValidLatestCoalescing,
+  DedupeScopeConflictError,
+} from '../types'
 import type {
   AppendStepResult,
   CompleteClaimedResult,
@@ -36,6 +39,7 @@ import type {
   Job,
   JobHandle,
   LifecycleWriteResult,
+  ListFailedOptions,
   ReleaseJobResult,
   TerminalWriteMissResult,
   QueueStats,
@@ -48,6 +52,11 @@ import {
   type IJobQueueBackend,
   type InlineProcessor,
 } from './IJobQueueBackend'
+
+/** Default page size for the dead-letter listing (`listFailed`). */
+const DEFAULT_LIST_FAILED_LIMIT = 100
+/** Hard ceiling on one `listFailed` page, whatever the caller asked for. */
+const MAX_LIST_FAILED_LIMIT = 1000
 
 /** Internal job record: public {@link Job} plus the off-public step journal
  *  and its running byte total. Structurally satisfies {@link JournalableJob}. */
@@ -122,6 +131,31 @@ export class ImmediateBackend implements IJobQueueBackend {
     return `${dedupeScope}:${dedupeKey}`
   }
 
+  /**
+   * A dedupeKey names one logical resource; using it under two scopes gets no
+   * mutual exclusion between them (they fall under different unique indexes in
+   * Mongo), so the mix is rejected instead of silently allowed. Only LIVE
+   * jobs conflict — once everything is terminal the key is free again.
+   */
+  private assertNoScopeConflict(
+    dedupeKey: string,
+    dedupeScope: 'pending' | 'pending+active',
+  ): void {
+    for (const job of this.jobs.values()) {
+      if (
+        job.dedupeKey === dedupeKey &&
+        (job.status === 'pending' || job.status === 'active') &&
+        (job.dedupeScope ?? 'pending+active') !== dedupeScope
+      ) {
+        throw new DedupeScopeConflictError(
+          `dedupeKey "${dedupeKey}" already has a ${job.status} job under scope ` +
+            `'${job.dedupeScope ?? 'pending+active'}'; refusing to enqueue under scope ` +
+            `'${dedupeScope}' — a dedupeKey names one logical resource`,
+        )
+      }
+    }
+  }
+
   /** Free the reservation after a terminal lifecycle transition. */
   private releaseDedupeKey(job: Job): void {
     if (!job.dedupeKey || !job.dedupeScope) return
@@ -139,6 +173,7 @@ export class ImmediateBackend implements IJobQueueBackend {
 
     // Check for duplicate
     if (options.dedupeKey) {
+      this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
       const setKey = this.getDedupeSetKey(options.dedupeKey, dedupeScope)
       if (this.activeDedupeKeys.has(setKey)) {
         return null
@@ -181,6 +216,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     const dedupeScope = options.dedupeScope ?? 'pending+active'
 
     if (options.dedupeKey) {
+      this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
       let activeExists = false
       for (const job of this.jobs.values()) {
         if (job.dedupeKey !== options.dedupeKey) continue
@@ -350,6 +386,7 @@ export class ImmediateBackend implements IJobQueueBackend {
       job.completedAt = new Date()
       delete job.failedAt
       delete job.failReason
+      delete job.failureKind
       return { status: 'completed' }
     }
     const miss = this.terminalTransitionMiss(job, claimToken)
@@ -394,6 +431,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     if (job.attempt >= job.maxAttempts) {
       job.status = 'failed'
       job.failedAt = new Date()
+      job.failureKind = 'retries-exhausted'
       job.failedByLifecycleWrite = true
       this.releaseDedupeKey(job)
       return { status: 'failed-terminal' }
@@ -414,6 +452,7 @@ export class ImmediateBackend implements IJobQueueBackend {
 
     job.status = 'failed'
     job.failReason = reason
+    job.failureKind = 'fatal'
     job.failedAt = new Date()
     job.failedByLifecycleWrite = true
     this.releaseDedupeKey(job)
@@ -525,6 +564,7 @@ export class ImmediateBackend implements IJobQueueBackend {
         // stale failure markers, mirroring MongoJobQueue.completeClaimed.
         delete job.failReason
         delete job.failedAt
+        delete job.failureKind
         // enqueue() reserved the dedupe key; completion must free it or a
         // later enqueue with that key is blocked forever.
         this.releaseDedupeKey(job)
@@ -553,6 +593,51 @@ export class ImmediateBackend implements IJobQueueBackend {
       }
     }
     return false
+  }
+
+  async listFailed(opts: ListFailedOptions = {}): Promise<Job[]> {
+    return [...this.jobs.values()]
+      .filter((job) => {
+        if (job.status !== 'failed') return false
+        if (opts.type && job.type !== opts.type) return false
+        if (opts.failureKind && job.failureKind !== opts.failureKind) {
+          return false
+        }
+        if (opts.since && (!job.failedAt || job.failedAt < opts.since)) {
+          return false
+        }
+        return true
+      })
+      // Newest failure first, matching the Mongo dead-letter view.
+      .sort(
+        (a, b) => (b.failedAt?.getTime() ?? 0) - (a.failedAt?.getTime() ?? 0),
+      )
+      .slice(0, Math.max(1, Math.min(opts.limit ?? DEFAULT_LIST_FAILED_LIMIT,
+        MAX_LIST_FAILED_LIMIT)))
+      .map((job) => this.toJob(job))
+  }
+
+  async retry(jobId: string): Promise<boolean> {
+    const job = this.jobs.get(jobId)
+    if (!job || job.status !== 'failed') return false
+    const scope = job.dedupeScope ?? 'pending+active'
+    const collision =
+      job.dedupeKey !== undefined &&
+      [...this.jobs.values()].some(
+        (candidate) =>
+          candidate !== job &&
+          candidate.dedupeKey === job.dedupeKey &&
+          (candidate.dedupeScope ?? 'pending+active') === scope &&
+          (candidate.status === 'pending' || candidate.status === 'active'),
+      )
+    if (collision) return false
+    job.status = 'pending'
+    job.attempt = 0
+    job.runAt = new Date()
+    delete job.failReason
+    delete job.failedAt
+    delete job.failureKind
+    return true
   }
 
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {
@@ -592,12 +677,19 @@ export class ImmediateBackend implements IJobQueueBackend {
     if (type) {
       jobs = jobs.filter((j) => j.type === type)
     }
+    const failedByKind: QueueStats['failedByKind'] = {}
+    for (const job of jobs) {
+      if (job.status !== 'failed') continue
+      const kind = job.failureKind ?? 'unknown'
+      failedByKind[kind] = (failedByKind[kind] ?? 0) + 1
+    }
     return {
       pending: jobs.filter((j) => j.status === 'pending').length,
       active: jobs.filter((j) => j.status === 'active').length,
       completed: jobs.filter((j) => j.status === 'completed').length,
       failed: jobs.filter((j) => j.status === 'failed').length,
       superseded: jobs.filter((j) => j.status === 'superseded').length,
+      failedByKind,
       ...backlogAge(jobs),
     }
   }

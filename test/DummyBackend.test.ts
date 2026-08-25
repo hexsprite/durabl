@@ -341,12 +341,14 @@ describe('DummyBackend', () => {
 
       // Exhaustive on purpose: a new stats field should fail here so it gets
       // considered rather than silently appearing in consumers' payloads.
+      // failedByKind added in du-jdu: failure-kind breakdown of `failed`.
       expect(stats).toEqual({
         pending: 1,
         active: 1,
         completed: 1,
         failed: 0,
         superseded: 0,
+        failedByKind: {},
         // Backlog age — the one pending job is already due.
         oldestPendingRunAt: expect.any(Date),
         oldestPendingLagMs: expect.any(Number),

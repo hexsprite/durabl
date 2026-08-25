@@ -17,6 +17,7 @@ import type {
   Job,
   JobHandle,
   LifecycleWriteResult,
+  ListFailedOptions,
   QueueStats,
   ReleaseJobResult,
   StepRecord,
@@ -142,6 +143,24 @@ export interface IJobQueueBackend {
 
   /** Return whether this type and dedupe key has a pending or active job. */
   hasOutstanding(type: string, dedupeKey: string): Promise<boolean>
+
+  /**
+   * List terminal `failed` jobs, newest failure first. This is the dead-letter
+   * view: filter by {@link ListFailedOptions.failureKind} to separate poison
+   * (`fatal`) from flaky (`retries-exhausted`) and stalled without
+   * substring-matching `failReason`.
+   */
+  listFailed(opts?: ListFailedOptions): Promise<Job[]>
+
+  /**
+   * Replay a terminal `failed` job: back to `pending` with `attempt` reset,
+   * failure markers cleared, and a log line recording the manual replay.
+   *
+   * Returns `false` (never throws) when the job is not terminal-failed —
+   * replaying a live or completed job must be impossible — or when returning it
+   * to `pending` would collide with a live job under the same dedupeKey+scope.
+   */
+  retry(jobId: string): Promise<boolean>
 
   /**
    * Find a job by query. Use for utilities like expiring stale jobs.

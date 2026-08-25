@@ -87,6 +87,12 @@ class MiniBackend implements IJobQueueBackend {
       (job) => job.type === type && job.dedupeKey === dedupeKey,
     )
   }
+  async listFailed(): Promise<Job[]> {
+    return []
+  }
+  async retry(): Promise<boolean> {
+    return false
+  }
   async findOne<T>(): Promise<Job<T> | null> {
     return null
   }

@@ -90,6 +90,18 @@ export async function createJobIndexes(
     { name: 'visibility_timeout_idx' },
   )
   /**
+   * Dead-letter listing (`listFailed`): filter by `{status: 'failed'}` (plus
+   * optional type/kind/since), sort newest failure first. Partial so it never
+   * touches the hot pending/active working set.
+   */
+  await collection.createIndex(
+    { status: 1, failedAt: -1 },
+    {
+      name: 'list_failed_idx',
+      partialFilterExpression: { status: 'failed' },
+    },
+  )
+  /**
    * Retention sweep (`cleanupOldJobs`) filters completed jobs by `completedAt`
    * and failed/superseded jobs by `failedAt`. A single compound index cannot
    * serve the `$or`; Mongo needs one index per branch to plan an index union
