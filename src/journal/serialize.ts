@@ -42,16 +42,37 @@ export const DEFAULT_MAX_LOG_MESSAGE_BYTES = 4000
 /** Marker appended to a message clipped by {@link truncateLogMessage}. */
 const TRUNCATION_SUFFIX = '… [truncated]'
 
+/** UTF-8 byte length of {@link TRUNCATION_SUFFIX} — the suffix itself contains
+ * a multi-byte character, so its length must also be measured in bytes. */
+const TRUNCATION_SUFFIX_BYTES = Buffer.byteLength(TRUNCATION_SUFFIX, 'utf8')
+
 /**
  * Clip an over-long log message, leaving evidence that it was clipped — a
  * silently shortened log line is worse than a visibly shortened one.
+ *
+ * Measures and clips in UTF-8 bytes, not UTF-16 code units: `.length` on a
+ * string counts code units, so CJK content (3 bytes/unit) and emoji (2
+ * units/4 bytes) measured at a third to a half of their real size and could
+ * sail past `maxBytes` on the wire. The walk below advances by code point
+ * (`for...of`), never by code unit, so a surrogate pair is always kept or
+ * dropped whole — slicing by code unit could split one and store a lone
+ * surrogate, which is invalid UTF-8 for BSON.
  */
 export function truncateLogMessage(
   message: string,
   maxBytes = DEFAULT_MAX_LOG_MESSAGE_BYTES,
 ): string {
-  if (message.length <= maxBytes) return message
-  return message.slice(0, maxBytes - TRUNCATION_SUFFIX.length) + TRUNCATION_SUFFIX
+  if (Buffer.byteLength(message, 'utf8') <= maxBytes) return message
+  const budget = Math.max(0, maxBytes - TRUNCATION_SUFFIX_BYTES)
+  let bytes = 0
+  let cut = 0
+  for (const ch of message) {
+    const n = Buffer.byteLength(ch, 'utf8')
+    if (bytes + n > budget) break
+    bytes += n
+    cut += ch.length
+  }
+  return message.slice(0, cut) + TRUNCATION_SUFFIX
 }
 
 /**
@@ -129,11 +150,14 @@ export function assertSerializable(value: unknown, step: string): void {
 
 /**
  * Approximate the serialized byte size of one record (step or log entry).
- * Cheap `JSON.stringify` length — an over- not under-estimate for ASCII, which
- * is the safe direction for a cap.
+ * UTF-8 byte length of the JSON form — an over- not under-estimate of the
+ * BSON size, which is the safe direction for a cap. `.length` was wrong here:
+ * it counts UTF-16 code units, so CJK and emoji content measured at a third
+ * to a half of its real size and sailed past the 16MB BSON limit.
  */
 export function approxRecordBytes(value: unknown): number {
-  return JSON.stringify(value)?.length ?? 0
+  const json = JSON.stringify(value)
+  return json === undefined ? 0 : Buffer.byteLength(json, 'utf8')
 }
 
 /**

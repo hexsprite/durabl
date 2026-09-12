@@ -61,8 +61,34 @@ describe('MongoJobQueue logs[] bounding', () => {
     await backend.log(id, 'x'.repeat(5000))
 
     const doc = await collection.findOne({ _id: id })
-    expect(doc!.logs[0].message.length).toBe(100)
+    // Clipped to N UTF-8 bytes, not N UTF-16 code units: the truncation
+    // suffix's ellipsis is 3 bytes but 1 code unit, so `.length` reads lower
+    // than the byte cap.
+    expect(Buffer.byteLength(doc!.logs[0].message, 'utf8')).toBe(100)
     expect(doc!.logs[0].message).toContain('truncated')
+  })
+
+  it('clips failReason to the log message budget on fail', async () => {
+    // failReason comes from err.message and was written to the document
+    // verbatim while the log copy of the same string, in the same update,
+    // was clipped — a second, uncapped route to an oversized document.
+    const id = (await backend.enqueue('chatty', {}, { maxAttempts: 1 })) as string
+    const claimed = await backend.claimNext('chatty')
+    await backend.fail(id, 'x'.repeat(5000), claimed!.claimToken)
+
+    const doc = await collection.findOne({ _id: id })
+    expect(Buffer.byteLength(doc!.failReason!, 'utf8')).toBeLessThanOrEqual(100)
+    expect(doc!.failReason).toContain('truncated')
+  })
+
+  it('clips failReason to the log message budget on failFatal', async () => {
+    const id = (await backend.enqueue('chatty', {})) as string
+    const claimed = await backend.claimNext('chatty')
+    await backend.failFatal(id, 'x'.repeat(5000), claimed!.claimToken)
+
+    const doc = await collection.findOne({ _id: id })
+    expect(Buffer.byteLength(doc!.failReason!, 'utf8')).toBeLessThanOrEqual(100)
+    expect(doc!.failReason).toContain('truncated')
   })
 
   it('still applies the terminal write after heavy logging', async () => {

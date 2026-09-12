@@ -23,6 +23,9 @@ called out under **BREAKING** below.
 - The reaper re-checks lease expiry at write time. A worker that heartbeats
   mid-sweep keeps its run instead of losing it to a second worker, and the
   recovered count reports only writes that applied.
+- Journal and log size caps measure UTF-8 bytes, not UTF-16 code units, so
+  CJK and emoji content can no longer exceed the caps on the wire. Clipping
+  never splits a surrogate pair. `failReason` is clipped in all backends.
 
 ## [0.4.0] - 2026-08-25
 

@@ -22,7 +22,9 @@ import {
 } from '../journal/inMemory'
 import {
   DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+  DEFAULT_MAX_LOG_MESSAGE_BYTES,
   sortBySeq,
+  truncateLogMessage,
 } from '../journal/serialize'
 import {
   assertValidLatestCoalescing,
@@ -408,7 +410,10 @@ export class ImmediateBackend implements IJobQueueBackend {
     const miss = this.terminalTransitionMiss(job, claimToken)
     if (miss) return miss
 
-    job.failReason = reason
+    // Unlike Dummy/Mongo, ImmediateBackend has no configurable
+    // maxLogMessageBytes (its log() is a no-op), so failReason clips to the
+    // same module default those backends fall back to.
+    job.failReason = truncateLogMessage(reason, DEFAULT_MAX_LOG_MESSAGE_BYTES)
     let hasPendingFollower = false
     if (job.dedupeKey && job.dedupeScope === 'pending') {
       for (const candidate of this.jobs.values()) {
@@ -451,7 +456,7 @@ export class ImmediateBackend implements IJobQueueBackend {
     if (miss) return miss
 
     job.status = 'failed'
-    job.failReason = reason
+    job.failReason = truncateLogMessage(reason, DEFAULT_MAX_LOG_MESSAGE_BYTES)
     job.failureKind = 'fatal'
     job.failedAt = new Date()
     job.failedByLifecycleWrite = true

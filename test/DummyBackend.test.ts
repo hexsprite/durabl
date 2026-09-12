@@ -315,8 +315,36 @@ describe('DummyBackend', () => {
       await backend.log(id, 'x'.repeat(500))
 
       const [entry] = backend.jobs.find((j) => j.id === id)!.logs
-      expect(entry.length).toBe(40)
+      // Clipped to N UTF-8 bytes, not N UTF-16 code units: the truncation
+      // suffix's ellipsis is 3 bytes but 1 code unit, so `.length` reads
+      // lower than the byte cap.
+      expect(Buffer.byteLength(entry, 'utf8')).toBe(40)
       expect(entry).toContain('truncated')
+    })
+
+    it('clips failReason to the log message budget on fail', async () => {
+      // failReason comes from err.message and was written verbatim while the
+      // log copy of the same string, in the same call, was clipped — a
+      // second, uncapped route to an oversized document.
+      backend.maxLogMessageBytes = 40
+      await backend.enqueue('job', {}, { maxAttempts: 1 })
+      const job = await backend.claimNext('job')
+      await backend.fail(job!.id, 'x'.repeat(500), job!.claimToken)
+
+      const failReason = backend.jobs.find((j) => j.id === job!.id)!.failReason
+      expect(Buffer.byteLength(failReason!, 'utf8')).toBeLessThanOrEqual(40)
+      expect(failReason).toContain('truncated')
+    })
+
+    it('clips failReason to the log message budget on failFatal', async () => {
+      backend.maxLogMessageBytes = 40
+      await backend.enqueue('job', {})
+      const job = await backend.claimNext('job')
+      await backend.failFatal(job!.id, 'x'.repeat(500), job!.claimToken)
+
+      const failReason = backend.jobs.find((j) => j.id === job!.id)!.failReason
+      expect(Buffer.byteLength(failReason!, 'utf8')).toBeLessThanOrEqual(40)
+      expect(failReason).toContain('truncated')
     })
 
     it('keeps log volume out of the step-journal budget', async () => {

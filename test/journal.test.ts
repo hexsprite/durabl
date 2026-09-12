@@ -23,6 +23,7 @@ import {
   fromStored,
   guardAppend,
   toStored,
+  truncateLogMessage,
 } from '../src/journal/serialize'
 import { deriveUuid } from '../src/orchestrator/context'
 import type { StepRecord } from '../src/types'
@@ -136,6 +137,58 @@ describe('serialize: size guard', () => {
   it('guardAppend names the offending step', () => {
     const huge = rec(0, 'fat-step', 'x'.repeat(5000))
     expect(() => guardAppend(huge, 0, 1000)).toThrow(/fat-step/)
+  })
+
+  it('approxRecordBytes counts UTF-8 bytes, not UTF-16 code units', () => {
+    // '語' is 1 code unit but 3 bytes in UTF-8 — .length would undercount it.
+    expect(approxRecordBytes('語')).toBe(Buffer.byteLength(JSON.stringify('語')))
+    expect(approxRecordBytes('語'.repeat(100))).toBeGreaterThan(300)
+  })
+
+  it('guardAppend trips JournalTooLarge on multi-byte content that .length would let through', () => {
+    // 1000 code units, 3000 UTF-8 bytes. Measured by .length this record is
+    // ~1020 and would have been accepted under the 2000-byte soft limit —
+    // the exact bug: non-ASCII content sailing past the cap it exists to
+    // enforce.
+    const huge = rec(0, 'cjk-step', '語'.repeat(1000))
+    expect(() => guardAppend(huge, 0, 2000)).toThrow(JournalTooLarge)
+  })
+})
+
+describe('truncateLogMessage', () => {
+  it('leaves an ASCII message at exactly the byte limit unchanged', () => {
+    const message = 'x'.repeat(40)
+    expect(truncateLogMessage(message, 40)).toBe(message)
+  })
+
+  it('clips an over-long ASCII message to exactly maxBytes bytes', () => {
+    const result = truncateLogMessage('x'.repeat(500), 40)
+    expect(Buffer.byteLength(result, 'utf8')).toBe(40)
+    expect(result).toContain('[truncated]')
+  })
+
+  it('clips multi-byte content on a byte budget, keeping only whole characters', () => {
+    const result = truncateLogMessage('語'.repeat(100), 60)
+    expect(Buffer.byteLength(result, 'utf8')).toBeLessThanOrEqual(60)
+    expect(result).toContain('[truncated]')
+    // The kept prefix (everything before the suffix) must consist only of
+    // whole '語' characters — no partial multi-byte character leaked through.
+    const kept = result.slice(0, result.indexOf('…'))
+    expect(kept).toBe('語'.repeat(kept.length))
+  })
+
+  it('never splits a surrogate pair when clipping emoji', () => {
+    // maxBytes 30, suffix is 15 bytes, so the budget is 15 bytes. Each emoji
+    // is 4 bytes, so 3 whole emoji (12 bytes) fit and the 4th does not.
+    const result = truncateLogMessage('😀'.repeat(50), 30)
+    expect(result).toBe('😀😀😀' + '… [truncated]')
+    // A split surrogate pair would produce a lone surrogate, which fails
+    // isWellFormed() (Node >= 20). Cast: the tsconfig `lib` target (ES2022)
+    // predates the ES2024 type declaration, though the runtime has it.
+    const wellFormed = (
+      result as unknown as { isWellFormed(): boolean }
+    ).isWellFormed()
+    expect(wellFormed).toBe(true)
   })
 })
 

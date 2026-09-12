@@ -606,6 +606,15 @@ export class MongoJobQueue implements IJobQueueBackend {
     }
   }
 
+  /**
+   * `failReason` is operator-facing and is persisted on every attempt; clip
+   * it to the same budget as a log line so an error message that embeds a
+   * payload cannot grow the document past what the terminal write can carry.
+   */
+  private clipReason(reason: string): string {
+    return truncateLogMessage(reason, this.maxLogMessageBytes)
+  }
+
   /** Lifecycle filter: fenced (`active` + matching token) when a token is
    * given, plain `_id` lookup otherwise. */
   private lifecycleFilter(
@@ -780,7 +789,7 @@ export class MongoJobQueue implements IJobQueueBackend {
         const write = await this.collection.updateOne(filter, {
           $set: {
             status: 'failed' as JobStatus,
-            failReason: reason,
+            failReason: this.clipReason(reason),
             failureKind: 'retries-exhausted',
             failedAt: now,
             ...this.terminalReceiptWrite({
@@ -813,7 +822,7 @@ export class MongoJobQueue implements IJobQueueBackend {
       const write = await this.collection.updateOne(filter, {
         $set: {
           status: 'pending' as JobStatus,
-          failReason: reason,
+          failReason: this.clipReason(reason),
           runAt,
           ...this.terminalReceiptWrite({
             claimToken: claimToken ?? null,
@@ -862,7 +871,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     const res = await this.collection.updateOne(filter, {
       $set: {
         status: 'superseded' as JobStatus,
-        failReason: note,
+        failReason: this.clipReason(note),
         failedAt: now,
         ...(terminalReceipt
           ? this.terminalReceiptWrite(terminalReceipt)
@@ -914,7 +923,7 @@ export class MongoJobQueue implements IJobQueueBackend {
         {
           $set: {
             status: 'failed' as JobStatus,
-            failReason: reason,
+            failReason: this.clipReason(reason),
             failureKind: 'fatal',
             failedAt: now,
             ...this.terminalReceiptWrite({

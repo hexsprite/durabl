@@ -454,13 +454,13 @@ export class DummyBackend implements IJobQueueBackend {
       )
     if (hasPendingFollower) {
       job.status = 'superseded'
-      job.failReason = reason
+      job.failReason = truncateLogMessage(reason, this.maxLogMessageBytes)
       job.failedAt = new Date()
       return { status: 'superseded' }
     }
     if (job.attempt >= job.maxAttempts) {
       job.status = 'failed'
-      job.failReason = reason
+      job.failReason = truncateLogMessage(reason, this.maxLogMessageBytes)
       job.failureKind = 'retries-exhausted'
       job.failedAt = new Date()
       job.failedByLifecycleWrite = true
@@ -481,7 +481,7 @@ export class DummyBackend implements IJobQueueBackend {
     if (miss) return miss
 
     job.status = 'failed'
-    job.failReason = reason
+    job.failReason = truncateLogMessage(reason, this.maxLogMessageBytes)
     job.failureKind = 'fatal'
     job.failedAt = new Date()
     job.failedByLifecycleWrite = true
