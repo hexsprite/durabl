@@ -1346,7 +1346,7 @@ export class MongoJobQueue implements IJobQueueBackend {
    * predictable; the returned count tells an operator whether it is keeping up
    * (a full batch means there is more waiting).
    *
-   * @returns Number of stuck jobs handled (re-queued + failed).
+   * @returns Number of stuck jobs whose recovery write applied.
    */
   async recoverStuckJobs(
     visibilityTimeoutMs = 300000,
@@ -1381,39 +1381,46 @@ export class MongoJobQueue implements IJobQueueBackend {
           { projection: { _id: 1 } },
         )) !== null
 
+      // Re-assert the lease is still expired at write time. Between the
+      // cursor read and this write a stalled worker can wake and heartbeat;
+      // without this guard the reaper hands its active run to a second
+      // worker even though the first is still running the handler.
+      const stillStalled = {
+        _id: job._id,
+        status: 'active' as const,
+        claimedAt: { $lt: cutoff },
+      }
+
       if (hasPendingFollower) {
-        await this.retireCoalesced(
-          { _id: job._id, status: 'active' },
+        const matched = await this.retireCoalesced(
+          stillStalled,
           'Stalled',
           now,
         )
-        handled++
+        if (matched === 1) handled++
         continue
       }
 
+      let matched: number
       if (exhausted) {
-        await this.collection.updateOne(
-          { _id: job._id, status: 'active' },
-          {
-            $set: {
-              status: 'failed' as JobStatus,
-              failReason: 'Stalled — retries exhausted',
-              failureKind: 'stalled',
-              failedAt: now,
-            },
-            ...this.logWrite('Stalled — retries exhausted', now),
+        const res = await this.collection.updateOne(stillStalled, {
+          $set: {
+            status: 'failed' as JobStatus,
+            failReason: 'Stalled — retries exhausted',
+            failureKind: 'stalled',
+            failedAt: now,
           },
-        )
+          ...this.logWrite('Stalled — retries exhausted', now),
+        })
+        matched = res.matchedCount
       } else {
         const runAt = new Date(now.getTime() + retryBackoffMs(job.attempt, job))
         try {
-          await this.collection.updateOne(
-            { _id: job._id, status: 'active' },
-            {
-              $set: { status: 'pending' as JobStatus, runAt },
-              ...this.logWrite('Recovered (stalled)', now),
-            },
-          )
+          const res = await this.collection.updateOne(stillStalled, {
+            $set: { status: 'pending' as JobStatus, runAt },
+            ...this.logWrite('Recovered (stalled)', now),
+          })
+          matched = res.matchedCount
         } catch (err) {
           if (dedupeKeyFromDuplicateError(err) === null) throw err
           // Same collision as in `fail()`: a follow-up is already queued under
@@ -1423,14 +1430,13 @@ export class MongoJobQueue implements IJobQueueBackend {
           // Without this the reaper threw on every sweep for this job, so a
           // stalled job whose key had a queued follow-up could never be
           // recovered by anything — it held the key forever.
-          await this.retireCoalesced(
-            { _id: job._id, status: 'active' },
-            'Stalled',
-            now,
-          )
+          matched = await this.retireCoalesced(stillStalled, 'Stalled', now)
         }
       }
-      handled++
+      // matchedCount, not modifiedCount: the write is a no-op only when the
+      // lease was refreshed under us, and that is exactly the case we must
+      // not count as a recovery.
+      if (matched === 1) handled++
     }
     return handled
   }

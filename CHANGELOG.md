@@ -20,6 +20,9 @@ called out under **BREAKING** below.
   `Promise.race` and `Promise.any` in orchestrator bodies.
 - A lease-lost report from the bootstrap flush no longer masks the orchestrator
   body's own error; the real failure is logged and reaches `fail()`.
+- The reaper re-checks lease expiry at write time. A worker that heartbeats
+  mid-sweep keeps its run instead of losing it to a second worker, and the
+  recovered count reports only writes that applied.
 
 ## [0.4.0] - 2026-08-25
 
