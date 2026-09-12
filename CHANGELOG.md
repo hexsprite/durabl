@@ -10,10 +10,44 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-12
+
+A correctness release. No API is removed, but four fixes reject input or
+output that 0.4 accepted silently. Read **Upgrading from 0.4** first.
+
+### BREAKING
+
+- `OrchestratorContext.step()` rejects a non-positive or non-finite `timeoutMs`
+  override (`0`, negative, `Infinity`, `NaN`). The job fails terminally with
+  the new exported `InvalidStepTimeout`. Before, the override silently disabled
+  the step liveness cap.
+- `durabl/no-nondeterministic-control-path` now reports `Promise.race` and
+  `Promise.any` in orchestrator bodies. Their winner depends on timing, so a
+  resumed run can take a different path.
+- `failReason` is clipped to `maxLogMessageBytes` (default 4000 UTF-8 bytes)
+  and ends with `… [truncated]` when clipped. Before, it was stored verbatim.
+- Journal and log size caps count UTF-8 bytes, not UTF-16 code units. A step
+  result with CJK or emoji text now reaches `JournalTooLarge` at its real size,
+  up to 3x sooner than in 0.4.
+
+### Upgrading from 0.4
+
+1. Search orchestrator bodies for `timeoutMs`. Each value must be a positive
+   finite number. To disable the cap, omit the option.
+2. Run `eslint` with the `durabl` plugin. Replace any `Promise.race` or
+   `Promise.any` in an orchestrator body with a step whose result is journaled.
+3. If code matches `failReason` exactly, match on `failureKind` instead, or on
+   a prefix.
+4. If a step returns large non-ASCII payloads, check its size against the
+   journal soft limit. Store large data outside the journal and return a
+   reference.
+5. Review idempotency keys on mutating steps that a *different* job can reach
+   for the same entity, such as a retry after terminal failure. Use an
+   entity-scoped key there, not the jobId default. See the updated
+   restart-trial example in the README.
+
 ### Fixed
 
-- `OrchestratorContext.step()` rejects non-positive or non-finite `timeoutMs`
-  overrides terminally instead of silently disabling the step liveness cap.
 - `now()` / `uuid()` bootstrap state is durably appended before a helper-only
   run can complete or retry, preserving values across every resume path.
 - `durabl/no-nondeterministic-control-path` rejects timing-dependent
@@ -204,7 +238,8 @@ called out under **BREAKING** below.
   `pending` / `pending+active` scopes, and change-stream push with a poll-loop
   safety net.
 
-[unreleased]: https://github.com/hexsprite/durabl/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/hexsprite/durabl/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/hexsprite/durabl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hexsprite/durabl/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hexsprite/durabl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hexsprite/durabl/compare/v0.2.1...v0.3.0
