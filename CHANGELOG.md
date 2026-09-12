@@ -26,6 +26,9 @@ called out under **BREAKING** below.
 - Journal and log size caps measure UTF-8 bytes, not UTF-16 code units, so
   CJK and emoji content can no longer exceed the caps on the wire. Clipping
   never splits a surrogate pair. `failReason` is clipped in all backends.
+- If `startup()` fails to start push (e.g. change streams on a standalone
+  mongod), processors return to the default poll interval instead of staying
+  on the 60s safety net.
 
 ## [0.4.0] - 2026-08-25
 

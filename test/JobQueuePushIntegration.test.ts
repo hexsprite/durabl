@@ -142,4 +142,66 @@ describe('JobQueue push/poll selection', () => {
     expect(calledTypes).toContain('typeE')
     expect(calledTypes).toContain('typeF')
   })
+
+  describe('startup failure', () => {
+    // A backend that advertises push (a live unsubscribe from onJobAvailable)
+    // buffers the listener pre-startup. If backend.startup() then rejects
+    // (e.g. change streams on a non-replica-set mongod), the queue must not
+    // stay parked on the 60s safety-net interval with nothing left to wake
+    // it — pickup latency was silently 60s after a one-line startup warning.
+
+    it('returns processors to the default poll interval when startup() rejects', async () => {
+      const unsubscribe = vi.fn()
+      const backend = makeStubBackend(() => unsubscribe)
+      backend.startup = vi.fn().mockRejectedValue(new Error('not a replica set'))
+      queue = new JobQueue(backend)
+      queue.process('a', async () => undefined)
+
+      expect(getPollInterval(queue, 'a')).toBe(60000)
+
+      await expect(queue.startup()).rejects.toThrow('not a replica set')
+
+      expect(getPollInterval(queue, 'a')).toBe(5000)
+      expect(unsubscribe).toHaveBeenCalledOnce()
+    })
+
+    it('leaves an explicit pollInterval alone on startup failure', async () => {
+      const backend = makeStubBackend(() => vi.fn())
+      backend.startup = vi.fn().mockRejectedValue(new Error('not a replica set'))
+      queue = new JobQueue(backend)
+      queue.process('b', async () => undefined, { pollInterval: 250 })
+
+      await expect(queue.startup()).rejects.toThrow('not a replica set')
+
+      expect(getPollInterval(queue, 'b')).toBe(250)
+    })
+
+    it('gives processors registered after a failed startup the default interval', async () => {
+      const backend = makeStubBackend(() => vi.fn())
+      backend.startup = vi.fn().mockRejectedValue(new Error('not a replica set'))
+      queue = new JobQueue(backend)
+
+      await expect(queue.startup()).rejects.toThrow('not a replica set')
+
+      queue.process('c', async () => undefined)
+      expect(getPollInterval(queue, 'c')).toBe(5000)
+    })
+
+    it('wakes a parked poll loop so the new interval applies immediately', async () => {
+      const backend = makeStubBackend(() => vi.fn())
+      backend.startup = vi.fn().mockRejectedValue(new Error('not a replica set'))
+      queue = new JobQueue(backend)
+      queue.process('d', async () => undefined)
+
+      const claimNext = backend.claimNext as unknown as ReturnType<typeof vi.fn>
+      claimNext.mockClear()
+
+      await expect(queue.startup()).rejects.toThrow('not a replica set')
+
+      // On the old 60s interval this loop wouldn't wake for another 55s.
+      await vi.advanceTimersByTimeAsync(5000)
+
+      expect(claimNext).toHaveBeenCalled()
+    })
+  })
 })

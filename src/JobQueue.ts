@@ -48,6 +48,8 @@ interface ProcessorState {
   backoffMs: number
   /** Consecutive claim failures (resets on any successful claim call). */
   claimFailures: number
+  /** True when the consumer passed `pollInterval`; the queue never overrides it. */
+  pollIntervalExplicit: boolean
 }
 
 interface ManagedRun {
@@ -251,6 +253,7 @@ export class JobQueue {
       backoffMs: 0,
       claimFailures: 0,
       inlineSlotWaiters: [],
+      pollIntervalExplicit: config.pollInterval !== undefined,
     }
 
     const register = this.backend[registerInlineProcessor]
@@ -458,7 +461,38 @@ export class JobQueue {
 
   /** Initialize the queue (create indexes, etc). */
   async startup(): Promise<void> {
-    await this.backend.startup()
+    try {
+      await this.backend.startup()
+    } catch (err) {
+      // The backend advertised push but could not bring it up (e.g. change
+      // streams on a standalone mongod). Degrade to the poll default before
+      // surfacing the error so a consumer that catches and continues is not
+      // silently left on the 60s safety net.
+      this.dropPush()
+      throw err
+    }
+  }
+
+  /**
+   * Push was subscribed in the constructor on the promise that startup() would
+   * open the stream. If it never did, every processor is parked on the 60s
+   * safety-net interval with nothing to wake it. Unsubscribe, and return every
+   * processor that inherited the push default to the poll default. Explicit
+   * intervals are the consumer's and are left alone.
+   */
+  private dropPush(): void {
+    if (!this.unsubscribePush) return
+    this.unsubscribePush()
+    this.unsubscribePush = null
+    for (const state of this.processors.values()) {
+      if (!state.pollIntervalExplicit) {
+        state.config.pollInterval = DEFAULT_POLL_INTERVAL_MS
+      }
+    }
+    // Loops already asleep for up to 60s: wake them so the new interval
+    // takes effect now, not after the old sleep expires. Each loop re-reads
+    // its config on the next iteration.
+    this.cancelPendingSleeps()
   }
 
   /**
