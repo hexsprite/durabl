@@ -740,6 +740,38 @@ describe('lease fencing on failure paths (du-4ft)', () => {
 
     expect(statusOf(id)).toBe('completed') // work not lost to the reaper race
   })
+
+  // Regression (du-7pv): flushBootstrap() ran in a `finally`, so its
+  // LeaseLostError replaced the body's own error. The real failure was never
+  // logged or recorded; the run looked like a clean lease-loss yield.
+  it('a body error still reaches fail() when the bootstrap append reports lease-lost', async () => {
+    let bootstrapRejected = false
+    const origAppend = backend.appendStep.bind(backend)
+    backend.appendStep = async (...args: Parameters<DummyBackend['appendStep']>) => {
+      if (args[2].name === '$bootstrap' && !bootstrapRejected) {
+        bootstrapRejected = true
+        return { status: 'lease-lost' }
+      }
+      return origAppend(...args)
+    }
+
+    orch.define(
+      'masked',
+      async (_job, octx) => {
+        octx.now()
+        throw new Error('genuine body failure')
+      },
+      fast,
+    )
+
+    const id = (await queue.enqueue('masked', {})) as string
+    await waitUntil(() =>
+      backend.jobs
+        .find((j) => j.id === id)!
+        .logs.some((l) => l.includes('genuine body failure')),
+    )
+    expect(bootstrapRejected).toBe(true)
+  })
 })
 
 describe('heartbeat ownership', () => {

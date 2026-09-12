@@ -161,14 +161,24 @@ export class Orchestrator {
       })
 
       try {
+        let bodyFailed = false
+        let bodyError: unknown
         try {
           await this.runBody(fn, job, octx, config.maxDurationMs, runController)
-        } finally {
-          // now()/uuid() are synchronous, but their bootstrap journal write is
-          // not. Settle it while this claim is still active before JobQueue can
-          // complete or retry the run.
-          await octx.flushBootstrap()
+        } catch (err) {
+          bodyFailed = true
+          bodyError = err
         }
+        // now()/uuid() are synchronous, but their bootstrap journal write is
+        // not. Settle it while this claim is still active before JobQueue can
+        // complete or retry the run. A flush failure must not mask the body's
+        // own error, so it only surfaces when the body succeeded.
+        try {
+          await octx.flushBootstrap()
+        } catch (flushErr) {
+          if (!bodyFailed) throw flushErr
+        }
+        if (bodyFailed) throw bodyError
       } catch (err) {
         if (err instanceof LeaseLostError) {
           this.log.warn(

@@ -18,6 +18,8 @@ called out under **BREAKING** below.
   run can complete or retry, preserving values across every resume path.
 - `durabl/no-nondeterministic-control-path` rejects timing-dependent
   `Promise.race` and `Promise.any` in orchestrator bodies.
+- A lease-lost report from the bootstrap flush no longer masks the orchestrator
+  body's own error; the real failure is logged and reaches `fail()`.
 
 ## [0.4.0] - 2026-08-25
 
