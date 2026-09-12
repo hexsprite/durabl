@@ -404,12 +404,19 @@ orch.define<{ userId: string }>('restart-trial', async (job, octx) => {
     { idempotencyKey: `${userId}:customer` },
   )
 
-  const sub = await octx.step('create-sub', ({ idempotencyKey }) =>
-    stripeAdapter.createSubscription(customerId, {
-      plan: 'basic_monthly',
-      trialDays: DEFAULT_TRIAL_DAYS,
-      idempotencyKey,   // jobId-scoped default is correct here
-    }),
+  // Entity-scoped too. The enqueue dedupeKey does not cover a job that failed
+  // terminally: its scope excludes `failed`, so a later request enqueues a
+  // DIFFERENT job. A jobId-scoped key here would mint a 2nd subscription (a
+  // double charge). Every step of a flow that can go terminal has this exposure.
+  const sub = await octx.step(
+    'create-sub',
+    ({ idempotencyKey }) =>
+      stripeAdapter.createSubscription(customerId, {
+        plan: 'basic_monthly',
+        trialDays: DEFAULT_TRIAL_DAYS,
+        idempotencyKey,
+      }),
+    { idempotencyKey: `${customerId}:sub-create:basic_monthly:${DEFAULT_TRIAL_DAYS}` },
   )
 
   await octx.step('mark-restarted', () =>
@@ -545,6 +552,8 @@ Two caps restore liveness:
   cancellable APIs (`fetch`, drivers that support abort, etc.). If an external
   side effect cannot be cancelled, the timed-out operation may still land after the
   retry begins; that step remains at-least-once and needs an idempotency key (§9).
+  Overrides must be positive and finite; an invalid value fails terminally with
+  `InvalidStepTimeout` rather than disabling the cap or retrying unchanged code.
 - **`maxDurationMs`** (whole orchestration): a backstop wrapping the entire user
   fn; on breach the wrapper stops, lets the heartbeat stop, and the job fails
   retryably (or fatally if you set it to, via `NonRetryable`). Guards against a
@@ -552,8 +561,6 @@ Two caps restore liveness:
 
 ### 7.4 Progress bump on append (C)
 
-  Overrides must be positive and finite; an invalid value fails terminally with
-  `InvalidStepTimeout` rather than disabling the cap or retrying unchanged code.
 `appendStep` also `$set: { claimedAt: now }` in the same single-doc write — a free
 lease extension between steps, no extra round-trip. Note this only covers the gaps
 *between* fast steps; a single long-running step holds the lease purely via §7.2's
@@ -632,14 +639,25 @@ guarantee Temporal activities give. Close it per dangerous step:
    internal Mongo mutations use upserts keyed by it. A double-fire in the crash
    window is absorbed.
 2. **`dedupeKey` on enqueue** — kills the double-click / double-submit path before
-   durability even matters (one job, not two). This is the *only* defense against
-   two *different* jobs for the same entity; a jobId-scoped step key does not cover
-   that case.
+   durability even matters (one job, not two). It covers only *live* jobs: both
+   `dedupeScope` values (`pending`, `pending+active`) exclude `failed`. After a
+   terminal failure the key is released, and a later request enqueues a
+   *different* job for the same entity. A jobId-scoped step key does not cover
+   that job.
 
-**Migration discipline:** for each *mutating* step, ask "idempotent?" If no, give
-it a key, scoped to the entity that must not be duplicated. For Focuster billing
-that's ~3 keys total (`create-sub` jobId-scoped, `ensure-customer` user-scoped,
-the charge path in `createSubscription`). Read-only / naturally idempotent steps
+**Migration discipline:** for each *mutating* step, ask two questions. First, "is
+it idempotent?" Second, "can a *different* job reach this step for the same
+entity?" For any flow that can fail terminally, the second answer is yes for every
+step. If a mutating step is not idempotent, give it a key scoped to the entity
+that must not be duplicated. For Focuster billing that's ~3 keys total
+(`create-sub` customer-scoped, `ensure-customer` user-scoped, the charge path in
+`createSubscription`).
+
+**Limit: key retention.** An entity-scoped key only lasts as long as the external
+system keeps it. Stripe keeps keys for about 24 hours. After that, the same key
+creates a new request. A user who retries the next day is past that window. To
+close this gap, reconcile against the external system. durabl has no
+terminal-failure hook for that today (deferred, §10). Read-only / naturally idempotent steps
 (loads, cancels, upserts) need nothing. A future dev-mode guard should warn when a
 step re-runs after a lost append **and has no idempotency key**, so unguarded
 mutating steps surface in test rather than in a production double-charge.
@@ -658,6 +676,7 @@ mutating steps surface in test rather than in a production double-charge.
 | Dev-mode control-path heuristic | follow-up | the opt-in ESLint plugin shipped; a runtime development warning remains deferred |
 | `orch.inspect` / `orch.resume` | follow-up | operational recovery API; keep the journal shape compatible, but ship separately if needed |
 | Final result journaling | follow-up | useful DX; not required for restart-trial-style side-effect flows |
+| `onTerminalFailure` hook | follow-up | a place to reconcile external effects after the job fails for good; entity keys expire (§9) |
 
 ## 11. v1 build order
 

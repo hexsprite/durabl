@@ -595,8 +595,13 @@ orch.define<{ userId: string }>('restart-trial', async (job, octx) => {
     { idempotencyKey: `${userId}:customer` },
   )
 
-  const sub = await octx.step('create-sub', ({ idempotencyKey }) =>
-    stripe.createSubscription(customerId, { plan: 'basic', idempotencyKey }),
+  // Entity-scoped too. The enqueue dedupeKey releases on terminal failure, so a
+  // later request is a *different* job; a jobId-scoped key would double-charge.
+  const sub = await octx.step(
+    'create-sub',
+    ({ idempotencyKey }) =>
+      stripe.createSubscription(customerId, { plan: 'basic', idempotencyKey }),
+    { idempotencyKey: `${customerId}:sub-create:basic` },
   )
 
   octx.log(`restarted trial with subscription ${sub.id}`)
@@ -635,12 +640,12 @@ Guarantees and limits worth knowing:
 - **At-least-once steps, not exactly-once.** A crash in the window between a step fn returning and its journal append committing re-runs that step. Close it on dangerous steps with the provided idempotency key (Stripe et al. dedupe on it) or a `dedupeKey` on enqueue.
 - **Determinism on the control path.** Only `await` `octx.*` (or `Promise.all`/`allSettled` over steps) in the orchestrator body; do live reads / `Date.now()` / randomness *inside* a step. The optional `durabl/eslint` rule enforces this; the divergence detector (a changed step name at a journaled seq → fatal `NondeterminismError`) is the runtime backstop.
 - **Auto-managed lease.** The wrapper heartbeats on a self-scheduling loop sized to the queue's reaper timeout (`visibilityTimeoutMs`, the single source of truth). `stepTimeoutMs` and `maxDurationMs` keep a hung step from heartbeating forever. When a heartbeat comes back `'lease-lost'` (the job was reclaimed) the loop stops and `octx.signal` aborts — the orphaned body throws at its next `step()` boundary instead of firing side effects.
+- **Timeout overrides stay bounded.** `step(..., { timeoutMs })` requires a positive finite value. Invalid overrides fail terminally with `InvalidStepTimeout`; they cannot silently turn a bounded orchestration into an infinite one.
 - **Journal lives on the job doc**, inside Mongo's 16MB budget. Return ids/refs, not whole payloads; an oversized journal fails with a clear `JournalTooLarge`. Treat journaled results as sensitive (don't journal secrets). `logs[]` shares the document but not the budget — it's bounded to the newest `maxLogEntries` (default 1000, each message clipped at `maxLogMessageBytes`), so log volume can neither trip a spurious `JournalTooLarge` nor grow the document to the point where the write that marks a job failed no longer fits.
 
 Full design and rationale: [`docs/orchestrator-spec.md`](docs/orchestrator-spec.md).
 
 ## Running the tests
-- **Timeout overrides stay bounded.** `step(..., { timeoutMs })` requires a positive finite value. Invalid overrides fail terminally with `InvalidStepTimeout`; they cannot silently turn a bounded orchestration into an infinite one.
 
 ```bash
 npm install
