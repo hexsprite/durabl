@@ -96,6 +96,19 @@ export class StepTimeout extends Error {
 }
 
 /**
+ * A per-step timeout override was non-positive or non-finite. Fatal because the
+ * orchestrator body will supply the same invalid value on every retry. §7.3.
+ */
+export class InvalidStepTimeout extends Error {
+  constructor(public readonly timeoutMs: number) {
+    super(
+      `StepOptions.timeoutMs must be a positive finite number of milliseconds, got ${timeoutMs}`,
+    )
+    this.name = 'InvalidStepTimeout'
+  }
+}
+
+/**
  * The whole orchestration exceeded `maxDurationMs`. Retryable by default. §7.3.
  */
 export class MaxDurationExceeded extends Error {
@@ -144,7 +157,8 @@ export class HeartbeatConfigConflict extends Error {
 /**
  * Fatal orchestration errors map to `failFatal` (terminal, no retry). Everything
  * else (`StepTimeout`, `MaxDurationExceeded`, lease loss, plain throws) is a
- * normal retryable failure. §5.
+ * normal retryable failure. `InvalidStepTimeout` is fatal because retrying
+ * deterministic code cannot repair its configuration. §5.
  *
  * `OrchestrationUnsupportedError` is fatal: a backend that can't fence (e.g.
  * no claimToken minted on claim) will fail identically on every retry —
@@ -156,6 +170,7 @@ export function isFatalOrchestrationError(err: unknown): boolean {
     err instanceof NondeterminismError ||
     err instanceof NonSerializableStepResult ||
     err instanceof JournalTooLarge ||
+    err instanceof InvalidStepTimeout ||
     err instanceof OrchestrationUnsupportedError
   )
 }

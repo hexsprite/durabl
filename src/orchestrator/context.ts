@@ -4,7 +4,11 @@
  */
 import { createHash, randomBytes } from 'node:crypto'
 
-import { LeaseLostError, StepTimeout } from '../journal/errors'
+import {
+  InvalidStepTimeout,
+  LeaseLostError,
+  StepTimeout,
+} from '../journal/errors'
 import { assertStepMatches, fromStored, toStored } from '../journal/serialize'
 import type {
   AppendStepResult,
@@ -103,7 +107,9 @@ interface BuildContextArgs<T> {
  * Build the durable context for one run. `seq` is assigned synchronously at each
  * `step()` call so order is deterministic even under concurrent fan-out (§3.3).
  */
-export function buildContext<T>(args: BuildContextArgs<T>): OrchestratorContext {
+export function buildContext<T>(
+  args: BuildContextArgs<T>,
+): OrchestratorContext & { flushBootstrap(): Promise<void> } {
   const { journal, job, claimToken, log, steps, stepTimeoutMs, runController } =
     args
   const journalBySeq = new Map<number, StepRecord>(
@@ -167,6 +173,13 @@ export function buildContext<T>(args: BuildContextArgs<T>): OrchestratorContext 
         : new LeaseLostError()
     }
 
+    if (
+      opts?.timeoutMs !== undefined &&
+      (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0)
+    ) {
+      throw new InvalidStepTimeout(opts.timeoutMs)
+    }
+
     const seq = nextSeq++ // synchronous: fixes order before any await (§3.3)
 
     const recorded = journalBySeq.get(seq)
@@ -214,6 +227,9 @@ export function buildContext<T>(args: BuildContextArgs<T>): OrchestratorContext 
     step,
     now: () => ensureBootstrap().startedAt,
     uuid: (label: string) => deriveUuid(ensureBootstrap().seed, label),
+    flushBootstrap: async () => {
+      if (bootstrapAppend) await bootstrapAppend
+    },
     log: (message: string) => log(message),
     heartbeat: async () => {
       const res = await journal.heartbeatClaimed(job.id, claimToken)
@@ -273,4 +289,3 @@ export function runWithTimeout<R>(
     )
   })
 }
-

@@ -256,6 +256,34 @@ describe('JobQueue managed execution', () => {
       expect(run.heartbeat).toHaveBeenCalledTimes(3)
     })
 
+    it('does not overlap heartbeats and recovers after a transient rejection', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger, {
+        visibilityTimeoutMs: 900,
+      })
+      const run = makeHandle({ n: 1 })
+      const firstHeartbeat = deferred<'applied'>()
+      run.heartbeat
+        .mockImplementationOnce(() => firstHeartbeat.promise)
+        .mockResolvedValue('applied')
+      const handler = deferred<void>()
+      const running = queue.runClaimed(run.handle, () => handler.promise)
+
+      await vi.advanceTimersByTimeAsync(300)
+      expect(run.heartbeat).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(200)
+      expect(run.heartbeat).toHaveBeenCalledTimes(1)
+
+      firstHeartbeat.reject(new Error('temporary heartbeat failure'))
+      await vi.advanceTimersByTimeAsync(299)
+      expect(run.heartbeat).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(run.heartbeat).toHaveBeenCalledTimes(2)
+
+      handler.resolve()
+      await running
+      expect(run.complete).toHaveBeenCalledTimes(1)
+    })
+
     it('aborts the signal and skips terminal writes after heartbeat lease loss', async () => {
       const events: JobEvent[] = []
       const queue = new JobQueue(makeBackend(), silentLogger, {

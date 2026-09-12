@@ -1,15 +1,15 @@
 # durabl Orchestrator — Durable Execution Layer (v1 Spec)
 
-Status: Draft / ready-for-build once the journal/fatal-routing/lease-fencing
-acceptance tests in §12 exist
+Status: Implemented. The v1 mechanism shipped in durabl 0.2.0; §12 is the
+maintained acceptance contract.
 Scope: v1 only. Durable timers, signals, fan-out helper, and version pinning are
 explicitly deferred (see §10).
 
 ## 1. Problem
 
-durabl today is **job-level durable only**: a handler that crashes halfway retries
-from the top, re-running every side effect. For multi-step flows with external
-mutations (Stripe customer + subscription + DB write), that means any
+Base `JobQueue` handlers are **job-level durable only**: a handler that crashes
+halfway retries from the top, re-running every side effect. For multi-step flows
+with external mutations (Stripe customer + subscription + DB write), that means any
 interruption can **double-charge, orphan a subscription, or duplicate a
 customer**. (See Focuster `SubscriptionService.restartTrial` — cancel → ensure
 customer → create subscription → mark → sync, with zero memory between steps.)
@@ -552,6 +552,8 @@ Two caps restore liveness:
 
 ### 7.4 Progress bump on append (C)
 
+  Overrides must be positive and finite; an invalid value fails terminally with
+  `InvalidStepTimeout` rather than disabling the cap or retrying unchanged code.
 `appendStep` also `$set: { claimedAt: now }` in the same single-doc write — a free
 lease extension between steps, no extra round-trip. Note this only covers the gaps
 *between* fast steps; a single long-running step holds the lease purely via §7.2's
@@ -653,7 +655,7 @@ mutating steps surface in test rather than in a production double-charge.
 | Separate-collection journal | when needed | escape hatch for >16MB / high-step-count fan-out |
 | Per-step retry policy | when needed | v1 is job-level retry only |
 | Journal field-level encryption/redaction | when needed | §8.2 documents the boundary; v1 relies on "don't journal secrets" |
-| ESLint plugin + dev-mode control-path heuristic | follow-up | useful guardrails; not required for the first durable-execution slice |
+| Dev-mode control-path heuristic | follow-up | the opt-in ESLint plugin shipped; a runtime development warning remains deferred |
 | `orch.inspect` / `orch.resume` | follow-up | operational recovery API; keep the journal shape compatible, but ship separately if needed |
 | Final result journaling | follow-up | useful DX; not required for restart-trial-style side-effect flows |
 
@@ -676,7 +678,7 @@ mutating steps surface in test rather than in a production double-charge.
    `maxDurationMs` caps (§7.3), fatal-sentinel → `failFatal` mapping.
 5. Tests (§12).
 6. Focuster glue: `createOrchestrator()`; migrate `restart-trial` first as the
-   proving flow; flip the Meteor method to enqueue.
+   proving flow; flip the Meteor method to enqueue. Completed in Focuster PR #1026.
 
 ## 12. Test plan (the toy→prod line)
 
@@ -754,8 +756,8 @@ lethal items into v1 mechanism:
 With those plus §9 (idempotency keys on the 2–3 mutating steps), §6 (divergence
 detection), and §12 (crash-under-failure tests), the implementation is
 prod-credible — none of it research, all leveraging durabl's existing atomic-claim /
-lease / heartbeat / reaper primitives. Strictly better than Focuster's current
-retry-from-top billing the moment `restart-trial` ships behind it.
+lease / heartbeat / reaper primitives. The proving `restart-trial` migration
+subsequently shipped in Focuster PR #1026.
 
 ---
 
@@ -784,7 +786,7 @@ to a finding ID (R = reliability, D = DX, S = security).
 - **R5 — determinism rule gets planned guards.** Proposed a dev-mode control-path heuristic
   that warns on a branch over a non-journaled `await`, plus the synchronous
   `now()`/`uuid(label)` helpers to remove the temptation. (§2.1)
-- **R5b — lint enforcement.** Proposed `durabl/eslint`'s
+- **R5b — lint enforcement.** Shipped `durabl/eslint`'s
   `no-nondeterministic-control-path` rule (opt-in plugin, optional peer deps):
   bans bare `await`/sync-nondeterminism on an orchestrator control path at
   keystroke + CI, exempts step-callback bodies. Closes the common *inline*

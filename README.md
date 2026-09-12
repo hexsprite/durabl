@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/durabl.svg)](https://www.npmjs.com/package/durabl)
 [![license](https://img.shields.io/npm/l/durabl.svg)](./LICENSE)
 
-A small durable job queue backed by MongoDB. Atomic claiming, retries, visibility-timeout leases, dedupe keys, and optional change-stream push — no Redis, no separate worker service, no orchestrator.
+A small durable job queue backed by MongoDB. Atomic claiming, retries, visibility-timeout leases, dedupe keys, optional change-stream push, and opt-in step-level orchestration — no Redis or separate worker service.
 
 > **Status: work in progress.** This is the production job queue I've run inside [Focuster](https://focuster.com) since 2016, just lifted out of the app and decoupled from Meteor. It works and it's tested, but the packaging is young: the API may still shift and the docs are thin in places. Treat `0.x` as "useful, not yet stable."
 
@@ -19,7 +19,7 @@ Focuster needed a durable queue for calendar sync jobs when Meteor 3 landed and 
 
 The actual workload is modest: a handful of job types at concurrency 2–16, polling every few seconds, with one hard requirement — **don't run the same user's sync twice at once**, even across a rolling deploy. MongoDB's `findOneAndUpdate` is exactly the primitive that solves atomic claiming, and a unique partial index solves dedupe. So the queue is ~900 lines of TypeScript over the `mongodb` driver instead of a dependency on Redis or a workflow engine.
 
-I stole the good ideas (pluggable backends from Django's task framework, the dedupe-key concept from BullMQ/SQS) and skipped the heavy ones (step-level replay from Inngest/DBOS — job-level durability is enough for now).
+I stole the good ideas (pluggable backends from Django's task framework, the dedupe-key concept from BullMQ/SQS) and skipped the heavy infrastructure. Base handlers remain job-level durable; multi-step side-effect flows can opt into DBOS-style resume-from-step through `Orchestrator`, without adding another service or datastore.
 
 ## Features
 
@@ -31,6 +31,7 @@ I stole the good ideas (pluggable backends from Django's task framework, the ded
 - **Latest-payload coalescing.** `coalesce: 'latest'` replaces the pending follower payload while the active payload stays immutable.
 - **Push/poll hybrid.** MongoDB change streams provide fast pickup. The poll loop remains a safety net.
 - **Pluggable backends.** `MongoJobQueue` is the production backend. `DummyBackend` records calls. `ImmediateBackend` runs `queue.process` handlers during `enqueue`.
+- **Opt-in durable orchestration.** `Orchestrator` journals completed steps and skips them on resume while reusing the queue's claims, leases, and retries.
 
 ## Install
 
@@ -612,7 +613,7 @@ interface OrchestratorContext {
   // Memoized, journaled step. Idempotency key passed in; override via opts.
   step<R>(name, fn: (keys, signal: AbortSignal) => Promise<R>, opts?: {
     idempotencyKey?: string
-    timeoutMs?: number   // per-step liveness cap; default = visibilityTimeoutMs
+    timeoutMs?: number   // positive finite per-step cap; default = visibilityTimeoutMs
   }): Promise<R>
 
   // Both backed by ONE journaled bootstrap record ({ startedAt, seed }), captured
@@ -639,6 +640,7 @@ Guarantees and limits worth knowing:
 Full design and rationale: [`docs/orchestrator-spec.md`](docs/orchestrator-spec.md).
 
 ## Running the tests
+- **Timeout overrides stay bounded.** `step(..., { timeoutMs })` requires a positive finite value. Invalid overrides fail terminally with `InvalidStepTimeout`; they cannot silently turn a bounded orchestration into an infinite one.
 
 ```bash
 npm install

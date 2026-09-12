@@ -22,6 +22,21 @@ import {
 import { silentLogger } from './testLogger'
 import { waitUntil } from './waitUntil'
 
+class DelayedBootstrapBackend extends DummyBackend {
+  private delayedBootstrap = false
+
+  override async appendStep(
+    ...args: Parameters<DummyBackend['appendStep']>
+  ): ReturnType<DummyBackend['appendStep']> {
+    const record = args[2]
+    if (record.name === '$bootstrap' && !this.delayedBootstrap) {
+      this.delayedBootstrap = true
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    return super.appendStep(...args)
+  }
+}
+
 let backend: DummyBackend
 let queue: JobQueue
 let orch: Orchestrator
@@ -53,6 +68,13 @@ describe('Orchestrator construction', () => {
   it('define() then process() same type is a conflict', () => {
     orch.define('dup', async () => {}, fast)
     expect(() => queue.process('dup', async () => {})).toThrow()
+  })
+
+  it('process() then define() same type is a conflict', () => {
+    queue.process('dup-reverse', async () => {}, fast)
+    expect(() =>
+      orch.define('dup-reverse', async () => {}, fast),
+    ).toThrow(/already registered/)
   })
 
   // Regression: ImmediateBackend runs its own handler registry inline on
@@ -100,6 +122,32 @@ describe('config validation (du-e1s)', () => {
       orch.define('st-zero', async () => {}, { stepTimeoutMs: 0 }),
     ).toThrow(/stepTimeoutMs/)
   })
+
+  it.each([0, -1, Number.NaN])(
+    'step() rejects timeoutMs: %s fatally before running the step',
+    async (timeoutMs) => {
+      const effect = vi.fn(async () => 'should not run')
+      orch.define(
+        'step-timeout-invalid',
+        async (_job, octx) => {
+          await octx.step('invalid-timeout', effect, { timeoutMs })
+        },
+        fast,
+      )
+
+      const id = (await queue.enqueue(
+        'step-timeout-invalid',
+        {},
+        { maxAttempts: 3 },
+      )) as string
+      await waitUntil(() => statusOf(id) === 'failed')
+
+      const job = backend.jobs.find((candidate) => candidate.id === id)!
+      expect(effect).not.toHaveBeenCalled()
+      expect(job.attempt).toBe(1)
+      expect(job.failReason).toMatch(/timeoutMs.*positive finite number/)
+    },
+  )
 
   it('define() rejects non-positive heartbeatIntervalMs / maxDurationMs / pollInterval overrides', () => {
     expect(() =>
@@ -300,6 +348,80 @@ describe('failure semantics', () => {
   })
 })
 
+describe('step timeout liveness', () => {
+  it('aborts a hung cancellable step and retries it from resume', async () => {
+    let calls = 0
+    let observedAbort = false
+    orch.define(
+      'cancellable-timeout',
+      async (_job, octx) => {
+        await octx.step('hung', async (_keys, signal) => {
+          calls += 1
+          if (calls > 1) return 'recovered'
+          return new Promise<string>((_resolve, reject) => {
+            signal.addEventListener(
+              'abort',
+              () => {
+                observedAbort = true
+                reject(new Error('cancelled'))
+              },
+              { once: true },
+            )
+          })
+        })
+      },
+      { ...fast, stepTimeoutMs: 20 },
+    )
+
+    const id = (await queue.enqueue(
+      'cancellable-timeout',
+      {},
+      { maxAttempts: 2 },
+    )) as string
+    await waitUntil(() => statusOf(id) === 'completed')
+
+    expect(observedAbort).toBe(true)
+    expect(calls).toBe(2)
+  })
+
+  it('reuses the idempotency key when a timed-out side effect lands after retry', async () => {
+    const keys: string[] = []
+    let calls = 0
+    let landed = 0
+    orch.define(
+      'non-cancellable-timeout',
+      async (_job, octx) => {
+        await octx.step('external-effect', async ({ idempotencyKey }) => {
+          calls += 1
+          keys.push(idempotencyKey)
+          if (calls === 1) {
+            return new Promise<string>((resolve) => {
+              setTimeout(() => {
+                landed += 1
+                resolve('late-success')
+              }, 50)
+            })
+          }
+          landed += 1
+          return 'retry-success'
+        })
+      },
+      { ...fast, stepTimeoutMs: 20 },
+    )
+
+    const id = (await queue.enqueue(
+      'non-cancellable-timeout',
+      {},
+      { maxAttempts: 2 },
+    )) as string
+    await waitUntil(() => statusOf(id) === 'completed')
+    await waitUntil(() => landed === 2)
+
+    expect(keys).toHaveLength(2)
+    expect(keys[1]).toBe(keys[0])
+  })
+})
+
 describe('void steps', () => {
   it('journals completion, skips on resume, replays undefined', async () => {
     let ran = 0
@@ -329,6 +451,39 @@ describe('void steps', () => {
 })
 
 describe('now() / uuid() determinism', () => {
+  it('persists bootstrap values before a helper-only failed attempt retries', async () => {
+    backend = new DelayedBootstrapBackend()
+    queue = new JobQueue(backend, silentLogger)
+    orch = new Orchestrator(queue, silentLogger)
+    const nows: number[] = []
+    const uuids: string[] = []
+
+    orch.define(
+      'helper-only-retry',
+      async (_job, octx) => {
+        nows.push(octx.now())
+        uuids.push(octx.uuid('stable'))
+        if (nows.length === 1) {
+          // eslint-disable-next-line durabl/no-nondeterministic-control-path -- deliberately leave enough time for the unawaited bootstrap write to remain pending.
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          throw new Error('retry before any user step')
+        }
+      },
+      fast,
+    )
+
+    const id = (await queue.enqueue(
+      'helper-only-retry',
+      {},
+      { maxAttempts: 2 },
+    )) as string
+    await waitUntil(() => statusOf(id) === 'completed')
+
+    expect(nows).toHaveLength(2)
+    expect(nows[1]).toBe(nows[0])
+    expect(uuids[1]).toBe(uuids[0])
+  })
+
   it('are constant across resume, distinct per label, and never journaled', async () => {
     const nows: number[] = []
     const uuidA: string[] = []
@@ -459,6 +614,7 @@ describe('now() / uuid() determinism', () => {
 describe('fan-out (Promise.all over steps)', () => {
   it('assigns stable distinct seqs and resumes correctly', async () => {
     const effects: number[] = []
+    const completionOrder: number[] = []
     const keys: string[] = []
     let crashed = false
 
@@ -470,6 +626,8 @@ describe('fan-out (Promise.all over steps)', () => {
             octx.step(`s${i}`, async (k) => {
               effects.push(i)
               keys.push(k.idempotencyKey)
+              await new Promise((resolve) => setTimeout(resolve, (2 - i) * 5))
+              completionOrder.push(i)
               return i
             }),
           ),
@@ -486,9 +644,43 @@ describe('fan-out (Promise.all over steps)', () => {
     await waitUntil(() => statusOf(id) === 'completed')
 
     expect(effects).toHaveLength(3) // all ran once; none re-ran on resume
+    expect(completionOrder).toEqual([2, 1, 0])
     expect(new Set(keys).size).toBe(3) // per-iteration keys are distinct
     const steps = await backend.readSteps(id)
     expect(steps.map((s) => s.seq)).toEqual([0, 1, 2])
+  })
+
+  it('keeps repeated loop step names distinct by sequence across resume', async () => {
+    const keys: string[] = []
+    let crashed = false
+    orch.define(
+      'loop',
+      async (_job, octx) => {
+        for (const value of [1, 2, 3]) {
+          await octx.step('item', async ({ idempotencyKey }) => {
+            keys.push(idempotencyKey)
+            return value
+          })
+        }
+        if (!crashed) {
+          crashed = true
+          throw new Error('resume the loop')
+        }
+      },
+      fast,
+    )
+
+    const id = (await queue.enqueue('loop', {})) as string
+    await waitUntil(() => statusOf(id) === 'completed')
+
+    expect(keys).toHaveLength(3)
+    expect(new Set(keys).size).toBe(3)
+    const steps = await backend.readSteps(id)
+    expect(steps.map(({ seq, name }) => [seq, name])).toEqual([
+      [0, 'item'],
+      [1, 'item'],
+      [2, 'item'],
+    ])
   })
 })
 

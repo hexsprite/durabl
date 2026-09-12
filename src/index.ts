@@ -79,6 +79,7 @@ export type {
 } from './orchestrator/types'
 export {
   HeartbeatConfigConflict,
+  InvalidStepTimeout,
   isFatalOrchestrationError,
   JournalTooLarge,
   MaxDurationExceeded,

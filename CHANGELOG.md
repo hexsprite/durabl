@@ -8,6 +8,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 While the version is `0.x`, breaking changes ship in minor releases and are
 called out under **BREAKING** below.
 
+## [Unreleased]
+
+### Fixed
+
+- `OrchestratorContext.step()` rejects non-positive or non-finite `timeoutMs`
+  overrides terminally instead of silently disabling the step liveness cap.
+- `now()` / `uuid()` bootstrap state is durably appended before a helper-only
+  run can complete or retry, preserving values across every resume path.
+- `durabl/no-nondeterministic-control-path` rejects timing-dependent
+  `Promise.race` and `Promise.any` in orchestrator bodies.
+
 ## [0.4.0] - 2026-08-25
 
 ### Added

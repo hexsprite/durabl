@@ -39,7 +39,7 @@ export type Options = [
 
 export type MessageIds = 'bareAwait' | 'syncNondet'
 
-const PROMISE_COMBINATORS = new Set(['all', 'allSettled', 'race', 'any'])
+const PROMISE_COMBINATORS = new Set(['all', 'allSettled'])
 
 const createRule = ESLintUtils.RuleCreator(
   () =>

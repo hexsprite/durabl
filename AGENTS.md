@@ -49,7 +49,7 @@ Two layers, split on purpose:
   - `pending+active` (default) — blocks any duplicate.
   - `pending` — allows one pending behind one active = single-flight coalescing. This is what `claimOrEnqueue` uses to replace a distributed lock.
 - **Leases, not deletes.** A claimed job is `active` with a visibility timeout. `JobQueue` heartbeats managed runs. The reaper returns dead-worker jobs to `pending`.
-- **Job-level durability only.** No step replay. A handler that crashes halfway retries from the top. Don't add checkpointing without a deliberate decision — it's explicitly out of scope.
+- **Base handlers are job-level durable.** A plain `JobQueue.process()` handler that crashes halfway retries from the top. Multi-step flows may deliberately opt into the shipped `Orchestrator`, whose journaled steps resume without replaying completed effects. Keep checkpointing out of the base queue.
 
 ### Push/poll hybrid (`MongoChangeStreamWatcher`)
 

@@ -161,7 +161,14 @@ export class Orchestrator {
       })
 
       try {
-        await this.runBody(fn, job, octx, config.maxDurationMs, runController)
+        try {
+          await this.runBody(fn, job, octx, config.maxDurationMs, runController)
+        } finally {
+          // now()/uuid() are synchronous, but their bootstrap journal write is
+          // not. Settle it while this claim is still active before JobQueue can
+          // complete or retry the run.
+          await octx.flushBootstrap()
+        }
       } catch (err) {
         if (err instanceof LeaseLostError) {
           this.log.warn(

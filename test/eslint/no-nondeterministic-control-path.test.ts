@@ -32,6 +32,14 @@ ruleTester.run('no-nondeterministic-control-path', rule, {
         })
       `,
     },
+    // Settling every step is deterministic even when individual steps fail.
+    {
+      code: `
+        orch.define('fan-settled', async (job, octx) => {
+          await Promise.allSettled(job.data.ids.map((id) => octx.step('one:' + id, () => work(id))))
+        })
+      `,
+    },
     // Awaits + nondeterminism INSIDE a step callback are fine (runs once, journaled).
     {
       code: `
@@ -107,6 +115,23 @@ ruleTester.run('no-nondeterministic-control-path', rule, {
         orch.define('helper', async (job, octx) => {
           const x = await decide(octx)
           if (x) await octx.step('a', () => load())
+        })
+      `,
+      errors: [{ messageId: 'bareAwait' }],
+    },
+    // Timing-dependent combinators can pick a different result on resume.
+    {
+      code: `
+        orch.define('race', async (job, octx) => {
+          await Promise.race(job.data.ids.map((id) => octx.step('one:' + id, () => work(id))))
+        })
+      `,
+      errors: [{ messageId: 'bareAwait' }],
+    },
+    {
+      code: `
+        orch.define('any', async (job, octx) => {
+          await Promise.any(job.data.ids.map((id) => octx.step('one:' + id, () => work(id))))
         })
       `,
       errors: [{ messageId: 'bareAwait' }],
