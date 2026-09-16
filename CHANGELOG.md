@@ -107,6 +107,8 @@ output that 0.4 accepted silently. Read **Upgrading from 0.4** first.
 
 ## [0.3.0] - 2026-08-14
 
+Upgrade steps: [`docs/migrating.md`](docs/migrating.md).
+
 ### Added
 
 - `JobQueue.runClaimed()` provides queue-managed execution for an existing claim.
