@@ -1,0 +1,85 @@
+name: Publish
+
+# A pushed `v*` tag publishes that commit to npm. Nothing else triggers it, so
+# an ordinary push to main never reaches the registry.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      # npm trusted publishing exchanges this OIDC token for a short-lived
+      # registry credential. No NPM_TOKEN, no OTP prompt.
+      id-token: write
+      # Needed to create the GitHub Release for the tag.
+      contents: write
+
+    env:
+      MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.mongodb-binaries
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # Trusted publishing needs npm 11.5.1 or later. The runner's bundled npm
+      # trails that, so pin a known-good version instead of hoping.
+      - run: npm install -g npm@latest
+
+      - name: Cache mongod binary
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: mongodb-binaries-${{ runner.os }}-
+
+      - run: npm ci
+
+      # The tag is the release. If the gates fail here, nothing is published.
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+      # The tag must name the version in package.json. Without this check a
+      # mistyped tag republishes the version already on the registry.
+      - name: Verify tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match package.json $pkg" >&2
+            exit 1
+          fi
+
+      # The CHANGELOG section for this version becomes the release body, so the
+      # notes stay hand-written in one place instead of being generated from
+      # commit subjects. An empty section means the version was never written
+      # up, which is worth failing on.
+      - name: Extract release notes from CHANGELOG
+        run: |
+          awk -v v="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## \\[" v "\\]" { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "no CHANGELOG section for ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+      - run: npm publish
+
+      # Last, so a failed publish never leaves a release announcing a version
+      # that is not on the registry.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md

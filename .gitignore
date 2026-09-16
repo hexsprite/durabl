@@ -18,3 +18,7 @@ bun.lockb
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Local agent/tool state
+.pi/
+.beads.gate.lock
