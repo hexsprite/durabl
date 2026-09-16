@@ -1,10 +1,19 @@
 name: Publish
 
-# A pushed `v*` tag publishes that commit to npm. Nothing else triggers it, so
-# an ordinary push to main never reaches the registry.
+# A pushed `v*` tag publishes that commit to npm. Nothing else reaches the
+# registry: an ordinary push to main does not trigger this workflow at all, and
+# a manual run stops before the publish step.
 on:
   push:
     tags: ['v*']
+  # Dry run. Exercises the gates and the release-notes extraction against any
+  # branch, so the pipeline can be proven without spending a version number.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'CHANGELOG version to extract notes for (dry run only)'
+        required: false
+        default: ''
 
 jobs:
   publish:
@@ -48,16 +57,25 @@ jobs:
       - run: npm test
       - run: npm run build
 
-      # The tag must name the version in package.json. Without this check a
-      # mistyped tag republishes the version already on the registry.
-      - name: Verify tag matches package.json
+      # On a tag, the tag must name the version in package.json. Without this
+      # check a mistyped tag republishes the version already on the registry.
+      # A dry run has no tag, so it takes the version from the input, falling
+      # back to package.json.
+      - name: Resolve version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
           pkg="$(node -p "require('./package.json').version")"
-          if [ "$tag" != "$pkg" ]; then
-            echo "tag v$tag does not match package.json $pkg" >&2
-            exit 1
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [ "$version" != "$pkg" ]; then
+              echo "tag v$version does not match package.json $pkg" >&2
+              exit 1
+            fi
+          else
+            version="${{ inputs.version }}"
+            [ -n "$version" ] || version="$pkg"
           fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "resolved version: $version"
 
       # The CHANGELOG section for this version becomes the release body, so the
       # notes stay hand-written in one place instead of being generated from
@@ -65,21 +83,30 @@ jobs:
       # up, which is worth failing on.
       - name: Extract release notes from CHANGELOG
         run: |
-          awk -v v="${GITHUB_REF_NAME#v}" '
+          awk -v v="$VERSION" '
             $0 ~ "^## \\[" v "\\]" { inside = 1; next }
             inside && /^## \[/ { exit }
             inside { print }
           ' CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
-            echo "no CHANGELOG section for ${GITHUB_REF_NAME}" >&2
+            echo "no CHANGELOG section for $VERSION" >&2
             exit 1
           fi
+          echo "--- release notes ---"
+          cat release-notes.md
 
-      - run: npm publish
+      - name: Publish to npm
+        if: github.event_name == 'push'
+        run: npm publish
 
       # Last, so a failed publish never leaves a release announcing a version
       # that is not on the registry.
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           body_path: release-notes.md
+
+      - name: Dry run summary
+        if: github.event_name != 'push'
+        run: echo "Dry run for $VERSION. Gates and release notes verified; publish skipped."
