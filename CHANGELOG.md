@@ -10,6 +10,19 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+### Added
+
+- `createVersionGate()` runs startup hooks only for the process carrying the
+  newest version, so an older process booting beside a newer one cannot undo
+  its work. A rolling deploy overlaps machines, and startup work that runs on
+  every boot (index creation, `collMod` validators, migrations) otherwise
+  reapplies on whichever process boots last. `runIfNewestVersion()` is the
+  one-shot form.
+- `buildTimestampFromFile()` returns the entrypoint's mtime as epoch
+  milliseconds, for callers with no build identifier of their own. The gate
+  itself reads no filesystem: `version` is required and accepts any ordered
+  value, a `number` or a `Date`.
+
 ## [0.5.0] - 2026-09-12
 
 A correctness release. No API is removed, but four fixes reject input or
