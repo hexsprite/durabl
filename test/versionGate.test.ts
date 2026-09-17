@@ -1,14 +1,14 @@
 /**
- * Deploy-gate suite.
+ * Version-gate suite.
  *
- * The behaviour under test is deploy *ordering*: during a rolling deploy an
- * older machine can boot beside a newer one, and its unconditional startup
- * work (indexes, validators, migrations) would otherwise re-apply an older
- * schema over the newer one. The gate must let the newest build through and
- * turn the older one into a no-op.
+ * The behaviour under test is ordering: during a rolling deploy an older
+ * process can boot beside a newer one, and its unconditional startup work
+ * (indexes, validators, migrations) would otherwise re-apply an older schema
+ * over the newer one. The gate must let the newest version through and turn
+ * the older one into a no-op.
  *
- * The identical-timestamp case is asserted as *both run* on purpose — the gate
- * is a skip, not a lock (see `src/deployGate.ts`). If that ever becomes
+ * The identical-version case is asserted as *both run* on purpose — the gate
+ * is a skip, not a lock (see `src/versionGate.ts`). If that ever becomes
  * exclusion, this test is the one that should fail and force the decision.
  */
 import { promises as fs } from 'node:fs'
@@ -18,8 +18,12 @@ import { join } from 'node:path'
 import type { Collection, Db } from 'mongodb'
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { createDeployGate, runIfLatestBuild } from '../src/deployGate'
-import type { DeploymentDoc } from '../src/deployGate'
+import {
+  buildTimestampFromFile,
+  createVersionGate,
+  runIfNewestVersion,
+} from '../src/versionGate'
+import type { VersionGateDoc } from '../src/versionGate'
 import type { Logger } from '../src/logger'
 
 import { closeMongo, getMongo, uniqueCollectionName } from './mongoHelper'
@@ -45,15 +49,15 @@ function capturingLogger(warnings: unknown[] = []): CapturingLogger {
   }
 }
 
-describe('deploy gate', () => {
+describe('version gate', () => {
   let db: Db
   let collectionName: string
-  let collection: Collection<DeploymentDoc>
+  let collection: Collection<VersionGateDoc>
 
   beforeEach(async () => {
     ;({ db } = await getMongo())
-    collectionName = uniqueCollectionName('deployments')
-    collection = db.collection<DeploymentDoc>(collectionName)
+    collectionName = uniqueCollectionName('versionGates')
+    collection = db.collection<VersionGateDoc>(collectionName)
   })
 
   afterEach(async () => {
@@ -66,16 +70,16 @@ describe('deploy gate', () => {
     await closeMongo()
   })
 
-  const gateFor = (buildTimestamp: Date, revision?: string) =>
-    createDeployGate({
+  const gateFor = (version: number | Date, revision?: string) =>
+    createVersionGate({
       db,
       collectionName,
-      buildTimestamp,
+      version,
       revision,
       logger: capturingLogger(),
     })
 
-  it('runs hooks and records the build on a first-ever boot', async () => {
+  it('runs hooks and records the version on a first-ever boot', async () => {
     const gate = gateFor(OLD, 'sha-old')
     let ran = 0
     gate(async () => {
@@ -86,16 +90,16 @@ describe('deploy gate', () => {
 
     expect(result).toMatchObject({
       ran: true,
-      previousTimestamp: null,
+      previousVersion: null,
       hooksRun: 1,
     })
     expect(ran).toBe(1)
     const row = await collection.findOne({ _id: 'default' })
-    expect(row?.buildTimestamp).toEqual(OLD)
+    expect(row?.version).toBe(OLD.getTime())
     expect(row?.revision).toBe('sha-old')
   })
 
-  it('runs hooks and advances the record when the build is newer', async () => {
+  it('runs hooks and advances the record when the version is newer', async () => {
     await gateFor(OLD, 'sha-old').run()
 
     const gate = gateFor(NEW, 'sha-new')
@@ -106,21 +110,21 @@ describe('deploy gate', () => {
     const result = await gate.run()
 
     expect(result.ran).toBe(true)
-    expect(result.previousTimestamp).toEqual(OLD)
+    expect(result.previousVersion).toBe(OLD.getTime())
     expect(ran).toBe(1)
     const row = await collection.findOne({ _id: 'default' })
-    expect(row?.buildTimestamp).toEqual(NEW)
+    expect(row?.version).toBe(NEW.getTime())
     expect(row?.revision).toBe('sha-new')
   })
 
-  it('skips hooks and leaves the record alone when the build is older', async () => {
+  it('skips hooks and leaves the record alone when the version is older', async () => {
     await gateFor(NEW, 'sha-new').run()
 
     const logger = capturingLogger()
-    const gate = createDeployGate({
+    const gate = createVersionGate({
       db,
       collectionName,
-      buildTimestamp: OLD,
+      version: OLD,
       revision: 'sha-old',
       logger,
     })
@@ -131,21 +135,21 @@ describe('deploy gate', () => {
     const result = await gate.run()
 
     expect(result).toMatchObject({ ran: false, hooksRun: 0 })
-    expect(result.previousTimestamp).toEqual(NEW)
+    expect(result.previousVersion).toBe(NEW.getTime())
     expect(ran).toBe(0)
-    // The newer machine's record survives the older machine's boot.
+    // The newer process's record survives the older process's boot.
     const row = await collection.findOne({ _id: 'default' })
-    expect(row?.buildTimestamp).toEqual(NEW)
+    expect(row?.version).toBe(NEW.getTime())
     expect(row?.revision).toBe('sha-new')
     expect(logger.warnings).toHaveLength(1)
     expect(logger.warnings[0]).toMatchObject({
-      buildTimestamp: OLD,
-      previousTimestamp: NEW,
+      version: OLD.getTime(),
+      previousVersion: NEW.getTime(),
       previousRevision: 'sha-new',
     })
   })
 
-  it('lets both processes run when the build timestamps are identical', async () => {
+  it('lets both processes run when the versions are identical', async () => {
     // Documented gap: skip, not lock. Hooks must be idempotent.
     let ran = 0
     for (const _ of [1, 2]) {
@@ -159,10 +163,10 @@ describe('deploy gate', () => {
 
     expect(ran).toBe(2)
     const row = await collection.findOne({ _id: 'default' })
-    expect(row?.buildTimestamp).toEqual(OLD)
+    expect(row?.version).toBe(OLD.getTime())
   })
 
-  it('records the newest build when two boots race the compare-and-swap', async () => {
+  it('records the newest version when two boots race the compare-and-swap', async () => {
     const older = gateFor(OLD, 'sha-old')
     const newer = gateFor(NEW, 'sha-new')
     let ran = 0
@@ -173,14 +177,14 @@ describe('deploy gate', () => {
     newer(hook)
 
     // Neither sees the other's row, so both run; the record must still end up
-    // on the newer build regardless of which write lands last.
+    // on the newer version regardless of which write lands last.
     const [a, b] = await Promise.all([older.run(), newer.run()])
 
     expect(a.ran).toBe(true)
     expect(b.ran).toBe(true)
     expect(ran).toBe(2)
     const row = await collection.findOne({ _id: 'default' })
-    expect(row?.buildTimestamp).toEqual(NEW)
+    expect(row?.version).toBe(NEW.getTime())
     expect(row?.revision).toBe('sha-new')
     expect(await collection.countDocuments()).toBe(1)
   })
@@ -197,7 +201,7 @@ describe('deploy gate', () => {
     await older.run()
 
     const row = await collection.findOne({ _id: 'default' })
-    expect(row?.buildTimestamp).toEqual(NEW)
+    expect(row?.version).toBe(NEW.getTime())
     expect(row?.revision).toBe('sha-new')
   })
 
@@ -219,7 +223,7 @@ describe('deploy gate', () => {
     expect(result.hooksRun).toBe(2)
   })
 
-  it('propagates a failing hook and does not claim the deploy', async () => {
+  it('propagates a failing hook and does not claim the version', async () => {
     const gate = gateFor(NEW)
     gate(async () => {
       throw new Error('migration blew up')
@@ -229,42 +233,90 @@ describe('deploy gate', () => {
     expect(await collection.findOne({ _id: 'default' })).toBeNull()
   })
 
-  it('falls back to the entrypoint mtime for the build version', async () => {
+  it('accepts version as a plain epoch-ms number', async () => {
+    const gate = createVersionGate({
+      db,
+      collectionName,
+      version: NEW.getTime(),
+      logger: capturingLogger(),
+    })
+    let ran = 0
+    gate(async () => {
+      ran += 1
+    })
+
+    const result = await gate.run()
+
+    expect(result).toMatchObject({ ran: true, version: NEW.getTime() })
+    expect(ran).toBe(1)
+    const row = await collection.findOne({ _id: 'default' })
+    expect(row?.version).toBe(NEW.getTime())
+  })
+
+  it('treats a Date and its equivalent epoch-ms number as the same version', async () => {
+    // A Date-supplied process must not let a number-supplied process at the
+    // identical instant look "newer" (or vice versa) — both forms normalize
+    // to the same stored number, so a re-run at the same instant is the
+    // documented skip-not-lock case (both run), not a spurious skip or a
+    // spurious re-run.
+    await gateFor(NEW).run() // Date
+
+    const gate = createVersionGate({
+      db,
+      collectionName,
+      version: NEW.getTime(), // equivalent epoch-ms number
+      logger: capturingLogger(),
+    })
+    let ran = 0
+    gate(async () => {
+      ran += 1
+    })
+    const result = await gate.run()
+
+    expect(result.ran).toBe(true)
+    expect(result.previousVersion).toBe(NEW.getTime())
+    expect(ran).toBe(1)
+  })
+
+  it('derives a build version from a file mtime via buildTimestampFromFile', async () => {
     const entrypoint = join(tmpdir(), `durabl-entrypoint-${Date.now()}.js`)
     await fs.writeFile(entrypoint, '// build artifact\n')
     await fs.utimes(entrypoint, NEW, NEW)
 
     try {
-      const gate = createDeployGate({
+      const version = await buildTimestampFromFile(entrypoint)
+      expect(version).toBe(NEW.getTime())
+
+      const gate = createVersionGate({
         db,
         collectionName,
-        entrypoint,
+        version,
         logger: capturingLogger(),
       })
       const result = await gate.run()
 
-      expect(result.buildTimestamp).toEqual(NEW)
+      expect(result.version).toBe(NEW.getTime())
       const row = await collection.findOne({ _id: 'default' })
-      expect(row?.buildTimestamp).toEqual(NEW)
+      expect(row?.version).toBe(NEW.getTime())
     } finally {
       await fs.rm(entrypoint, { force: true })
     }
   })
 
-  it('keeps separate deploymentIds independent', async () => {
-    await createDeployGate({
+  it('keeps separate gateIds independent', async () => {
+    await createVersionGate({
       db,
       collectionName,
-      deploymentId: 'web',
-      buildTimestamp: NEW,
+      gateId: 'web',
+      version: NEW,
       logger: capturingLogger(),
     }).run()
 
-    const workers = createDeployGate({
+    const workers = createVersionGate({
       db,
       collectionName,
-      deploymentId: 'workers',
-      buildTimestamp: OLD,
+      gateId: 'workers',
+      version: OLD,
       logger: capturingLogger(),
     })
     let ran = 0
@@ -278,16 +330,16 @@ describe('deploy gate', () => {
     expect(await collection.countDocuments()).toBe(2)
   })
 
-  it('runs a single hook through the runIfLatestBuild convenience', async () => {
+  it('runs a single hook through the runIfNewestVersion convenience', async () => {
     let ran = 0
-    const first = await runIfLatestBuild(
-      { db, collectionName, buildTimestamp: NEW, logger: capturingLogger() },
+    const first = await runIfNewestVersion(
+      { db, collectionName, version: NEW, logger: capturingLogger() },
       async () => {
         ran += 1
       },
     )
-    const second = await runIfLatestBuild(
-      { db, collectionName, buildTimestamp: OLD, logger: capturingLogger() },
+    const second = await runIfNewestVersion(
+      { db, collectionName, version: OLD, logger: capturingLogger() },
       async () => {
         ran += 1
       },
