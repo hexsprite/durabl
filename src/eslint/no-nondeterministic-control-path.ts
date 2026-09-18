@@ -20,6 +20,12 @@
  * or a replay sandbox would be required to catch that — both are explicitly out of
  * scope for resume-from-step. Divergence detection (spec §6) + review are the
  * backstop for what the lint cannot see.
+ *
+ * Second ceiling: a declared body is recognised by its 2nd-param type annotation.
+ * A declaration registered by identifier (`define(name, myFn)`) whose `octx` param is
+ * unannotated is out of reach — the rule visits the registration call, not the
+ * declaration, and the declaration carries no marker. Annotating the param is what
+ * makes a named orchestrator auditable.
  */
 
 import { ESLintUtils, TSESTree } from '@typescript-eslint/utils'
@@ -46,11 +52,16 @@ const createRule = ESLintUtils.RuleCreator(
     'https://github.com/hexsprite/durabl/blob/main/docs/orchestrator-spec.md#22-lint-enforcement-no-nondeterministic-control-path',
 )
 
-type Fn = TSESTree.ArrowFunctionExpression | TSESTree.FunctionExpression
+type Fn =
+  | TSESTree.ArrowFunctionExpression
+  | TSESTree.FunctionExpression
+  | TSESTree.FunctionDeclaration
 
 function isFn(n: TSESTree.Node): n is Fn {
   return (
-    n.type === T.ArrowFunctionExpression || n.type === T.FunctionExpression
+    n.type === T.ArrowFunctionExpression ||
+    n.type === T.FunctionExpression ||
+    n.type === T.FunctionDeclaration
   )
 }
 
@@ -112,11 +123,14 @@ export default createRule<Options, MessageIds>({
         matched = true
       }
 
-      // b) fn is arg[1] of a `*.define(type, fn)` call
+      // b) fn is arg[1] of a `*.define(type, fn)` call. A declaration can never be
+      // a call argument, so widen the array to Node[] rather than narrow the guard.
       const parent = fn.parent
+      const defineArgs: TSESTree.Node[] =
+        parent?.type === T.CallExpression ? parent.arguments : []
       if (
         parent?.type === T.CallExpression &&
-        parent.arguments[1] === fn &&
+        defineArgs[1] === fn &&
         parent.callee.type === T.MemberExpression &&
         parent.callee.property.type === T.Identifier &&
         defineNames.includes(parent.callee.property.name)
@@ -146,7 +160,10 @@ export default createRule<Options, MessageIds>({
     function isStepCallback(fn: Fn): boolean {
       const parent = fn.parent
       if (parent?.type !== T.CallExpression) return false
-      if (!parent.arguments.includes(fn)) return false
+      // Same widening as the define() guard: only an expression can be an
+      // argument, but `Fn` now also admits declarations, which cannot.
+      const args: TSESTree.Node[] = parent.arguments
+      if (!args.includes(fn)) return false
       const callee = parent.callee
       if (
         callee.type === T.MemberExpression &&

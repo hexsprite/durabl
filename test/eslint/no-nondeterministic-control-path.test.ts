@@ -60,6 +60,17 @@ ruleTester.run('no-nondeterministic-control-path', rule, {
         }
       `,
     },
+    // Same annotation on a declaration, registered by identifier — the shape a
+    // named orchestrator takes. Steps only, so nothing to report.
+    {
+      code: `
+        export async function restart(job: Job, octx: OrchestratorContext) {
+          const sub = await octx.step('load', () => getSub(job.data.userId))
+          return sub
+        }
+        orch.define('restart', restart)
+      `,
+    },
     // Destructured context: bare step()/heartbeat() calls allowed.
     {
       code: `
@@ -89,6 +100,26 @@ ruleTester.run('no-nondeterministic-control-path', rule, {
   ],
 
   invalid: [
+    // A declaration is an orchestrator body too: the annotation that marks it
+    // must not have to be an arrow function to be seen.
+    {
+      code: `
+        export async function restart(job: Job, octx: OrchestratorContext) {
+          await db.users.save(job.data)
+        }
+      `,
+      errors: [{ messageId: 'bareAwait' }],
+    },
+    {
+      code: `
+        export async function restart(job: Job, octx: OrchestratorContext) {
+          if (Date.now() > job.data.deadline) {
+            await octx.step('a', () => load())
+          }
+        }
+      `,
+      errors: [{ messageId: 'syncNondet' }],
+    },
     // The headline foot-gun: branch on a non-journaled live read.
     {
       code: `

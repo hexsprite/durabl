@@ -23,6 +23,15 @@ called out under **BREAKING** below.
   itself reads no filesystem: `version` is required and accepts any ordered
   value, a `number` or a `Date`.
 
+### Fixed
+
+- `durabl/no-nondeterministic-control-path` now checks a `FunctionDeclaration`
+  as well as an arrow function or function expression. A named, exported
+  orchestrator whose 2nd param is typed `OrchestratorContext` was invisible, so
+  the rule reported nothing on the only shape some consumers write — a clean
+  lint run read as coverage that did not exist. Reported by Focuster as
+  fo-wb7ec.
+
 ## [0.5.0] - 2026-09-12
 
 A correctness release. No API is removed, but four fixes reject input or
