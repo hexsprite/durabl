@@ -32,6 +32,7 @@ I stole the good ideas (pluggable backends from Django's task framework, the ded
 - **Push/poll hybrid.** MongoDB change streams provide fast pickup. The poll loop remains a safety net.
 - **Pluggable backends.** `MongoJobQueue` is the production backend. `DummyBackend` records calls. `ImmediateBackend` runs `queue.process` handlers during `enqueue`.
 - **Opt-in durable orchestration.** `Orchestrator` journals completed steps and skips them on resume while reusing the queue's claims, leases, and retries.
+- **Version-gated startup hooks.** `createVersionGate` runs startup work only for the process carrying the newest version, so an older process booting beside a newer one during a rolling deploy can't undo its work.
 
 ## Install
 
@@ -165,6 +166,30 @@ mutual exclusion at all — silently, exactly where you believe you have some.
 Once every job under the key is terminal, the key is free for any scope again.
 Note that a key spans job types: two different types using the same key already exclude
 each other today, because the dedupe indexes ignore `type`.
+
+### Version-gated startup hooks
+
+A rolling deploy runs an old process beside a new one. Startup work that runs on every boot — index creation, `collMod` validators, migrations — reapplies on whichever process boots last. An older process booting after a newer one can silently undo the newer process's schema.
+
+`createVersionGate` fixes the order. It records the newest version any process has seen in a singleton Mongo document. A process skips its registered hooks when its own version is older than the record.
+
+```typescript
+import { buildTimestampFromFile, createVersionGate } from 'durabl'
+
+const runIfNewest = createVersionGate({
+  db,
+  version: await buildTimestampFromFile(),
+})
+
+runIfNewest(async () => { await reconcileIndexes() })
+runIfNewest(async () => { await runMigrations() })
+
+await runIfNewest.run() // once, at the end of startup
+```
+
+`buildTimestampFromFile()` stats the running entrypoint (`process.argv[1]` by default) and returns its mtime as epoch milliseconds. Any ordered value works for `version`: a CI run number, a build number, or epoch milliseconds. An unordered value, like a git SHA, does not — the gate cannot tell which of two SHAs is newer. Pass a SHA or image digest as `revision` instead. Durabl records it for debugging, but never compares it.
+
+Two processes at the identical version both run the hooks. Nothing locks between them. The gate solves ordering, not exclusion, so registered hooks must be idempotent regardless — they run on every boot of the newest version.
 
 ## Testing your jobs
 

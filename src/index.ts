@@ -91,6 +91,19 @@ export {
   StepTimeout,
 } from './journal/errors'
 
+// Version gate — startup hooks an older process must skip
+export {
+  buildTimestampFromFile,
+  createVersionGate,
+  runIfNewestVersion,
+} from './versionGate'
+export type {
+  VersionGate,
+  VersionGateDoc,
+  VersionGateOptions,
+  VersionGateResult,
+} from './versionGate'
+
 // Logger interface + console default (inject your own pino/winston instance)
 export { type Logger, consoleLogger, defaultLogger } from './logger'
 
