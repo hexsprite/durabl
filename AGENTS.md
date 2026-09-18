@@ -66,6 +66,7 @@ A change-stream reconnect emits an **empty-string `''`** sentinel — a catch-up
 - `verbatimModuleSyntax` + `isolatedModules` are on — use `import type` / `export type` for type-only imports (see `src/index.ts`).
 - Inject a `Logger` (`src/logger.ts`); don't `console.log`. Default is `consoleLogger`; pass a pino/winston instance in prod.
 - README is the canonical API doc and reflects real Focuster production usage. Keep it in sync when the public surface shifts.
+- **Changed anything under `src/`? Add a line to `CHANGELOG.md` under `## [Unreleased]` in the same change.** Write what a consumer would notice, not how it was implemented. Those lines become the release notes, and the BREAKING and Upgrading sections are written from them. A change that merges without one gets reconstructed later from commit subjects, by someone who no longer remembers why it mattered. If a consumer would notice nothing (pure refactor, test-only, internal tooling), say so in the PR and apply the `no-changelog` label.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker

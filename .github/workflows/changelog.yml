@@ -1,0 +1,59 @@
+name: Changelog
+
+# A public-surface change that merges without a changelog line is rediscovered
+# at release time, when whoever writes the notes has to reconstruct it from
+# commit subjects. This fails the PR while the author still has the context.
+on:
+  pull_request:
+    # labeled/unlabeled so adding `no-changelog` re-runs the check instead of
+    # leaving a stale red mark.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: changelog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  entry:
+    runs-on: ubuntu-latest
+
+    # The escape hatch. Apply `no-changelog` for a pure refactor, a test-only
+    # change, or anything a consumer cannot observe.
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-changelog') }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The check compares against the base branch, which a shallow clone
+          # does not have.
+          fetch-depth: 0
+
+      - name: Require a changelog entry for source changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed="$(git diff --name-only "$BASE" "$HEAD")"
+
+          # Only the shipped surface counts. Tests and internal tooling can
+          # change without a consumer noticing.
+          if ! echo "$changed" | grep -qE '^src/'; then
+            echo "No src/ changes. Nothing to document."
+            exit 0
+          fi
+
+          if echo "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "CHANGELOG.md updated."
+            exit 0
+          fi
+
+          cat >&2 <<'MSG'
+          This PR changes src/ but does not touch CHANGELOG.md.
+
+          Add a line under "## [Unreleased]" saying what a consumer of the
+          package would notice. Write the effect, not the implementation.
+
+          If a consumer would notice nothing (a pure refactor, a test-only
+          change, internal tooling), apply the `no-changelog` label instead.
+          MSG
+          exit 1
