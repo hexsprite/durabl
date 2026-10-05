@@ -357,8 +357,9 @@ describe('failureKind is structural, not textual', () => {
     })
 
     it('retry() refuses live jobs and honours dedupe collisions', async () => {
-      await backend.enqueue('live', {}, { backoffDelay: 60_000 })
-      const live = await backend.findOne({ type: 'live', status: 'active' })
+      const live = await backend.claimOrEnqueue('live', {}, {
+        backoffDelay: 60_000,
+      })
       expect(live).not.toBeNull()
       await expect(backend.retry(live!.id)).resolves.toBe(false)
 
