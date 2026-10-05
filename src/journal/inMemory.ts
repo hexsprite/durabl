@@ -20,6 +20,7 @@ export interface JournalableJob {
   id: string
   status: JobStatus
   claimToken?: string
+  claimedAt?: Date
   steps: StepRecord[]
   /** Running approximate byte size of steps + logs (mirrors Mongo's field). */
   journalBytes: number
@@ -47,6 +48,7 @@ export function appendStepInMemory(
   claimToken: string,
   record: StepRecord,
   softLimitBytes: number,
+  onAppended?: () => void,
 ): AppendStepResult {
   if (!holdsLease(job, claimToken)) {
     return { status: 'lease-lost' }
@@ -59,6 +61,7 @@ export function appendStepInMemory(
   const incoming = guardAppend(record, job.journalBytes, softLimitBytes)
   job.steps.push(record)
   job.journalBytes += incoming
+  onAppended?.()
   return { status: 'appended' }
 }
 

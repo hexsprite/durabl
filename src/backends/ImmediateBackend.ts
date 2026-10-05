@@ -32,6 +32,7 @@ import {
 } from '../types'
 import type {
   AppendStepResult,
+  BackoffConfig,
   CompleteClaimedResult,
   CompleteJobResult,
   EnqueueOptions,
@@ -49,6 +50,7 @@ import type {
 } from '../types'
 
 import { backlogAge } from './backlogAge'
+import { retryBackoffMs } from './backoff'
 import {
   registerInlineProcessor,
   type IJobQueueBackend,
@@ -62,7 +64,7 @@ const MAX_LIST_FAILED_LIMIT = 1000
 
 /** Internal job record: public {@link Job} plus the off-public step journal
  *  and its running byte total. Structurally satisfies {@link JournalableJob}. */
-type ImmediateJob<T = unknown> = Job<T> & {
+type ImmediateJob<T = unknown> = Job<T> & BackoffConfig & {
   steps: StepRecord[]
   journalBytes: number
   /** Distinguishes a lifecycle failure from a reaper race in `complete()`. */
@@ -93,6 +95,9 @@ export class ImmediateBackend implements IJobQueueBackend {
       steps: _steps,
       journalBytes: _journalBytes,
       failedByLifecycleWrite: _failedByLifecycleWrite,
+      backoff: _backoff,
+      backoffDelay: _backoffDelay,
+      backoffMaxDelay: _backoffMaxDelay,
       claimToken,
       ...publicJob
     } = job
@@ -172,38 +177,49 @@ export class ImmediateBackend implements IJobQueueBackend {
     options: EnqueueOptions = {},
   ): Promise<string | null> {
     const dedupeScope = options.dedupeScope ?? 'pending+active'
+    const processor = this.processors.get(type)
 
     // Check for duplicate
     if (options.dedupeKey) {
       this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
       const setKey = this.getDedupeSetKey(options.dedupeKey, dedupeScope)
-      if (this.activeDedupeKeys.has(setKey)) {
+      if (!processor && dedupeScope === 'pending') {
+        const pendingFollower = [...this.jobs.values()].some(
+          (candidate) =>
+            candidate.dedupeKey === options.dedupeKey &&
+            candidate.dedupeScope === dedupeScope &&
+            candidate.status === 'pending',
+        )
+        if (pendingFollower) return null
+      } else if (this.activeDedupeKeys.has(setKey)) {
         return null
       }
       this.activeDedupeKeys.add(setKey)
     }
 
     const jobId = this.generateId()
+    const now = new Date()
     const job: ImmediateJob = {
       id: jobId,
       type,
       data,
-      status: 'active',
-      attempt: 1,
+      status: processor ? 'active' : 'pending',
+      attempt: processor ? 1 : 0,
       maxAttempts: options.maxAttempts ?? 3,
+      backoff: options.backoff,
+      backoffDelay: options.backoffDelay,
+      backoffMaxDelay: options.backoffMaxDelay,
       priority: options.priority ?? 0,
       dedupeKey: options.dedupeKey,
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
-      runAt: new Date(),
-      createdAt: new Date(),
-      claimedAt: new Date(),
-      claimToken: randomUUID(),
+      runAt: now,
+      createdAt: now,
+      ...(processor ? { claimedAt: now, claimToken: randomUUID() } : {}),
       steps: [],
       journalBytes: 0,
     }
 
     this.jobs.set(jobId, job)
-    const processor = this.processors.get(type)
     if (processor) await processor(this.createHandle(job))
 
     return jobId
@@ -243,6 +259,9 @@ export class ImmediateBackend implements IJobQueueBackend {
             status: 'pending',
             attempt: 0,
             maxAttempts: options.maxAttempts ?? 3,
+            backoff: options.backoff,
+            backoffDelay: options.backoffDelay,
+            backoffMaxDelay: options.backoffMaxDelay,
             priority: options.priority ?? 0,
             dedupeKey: options.dedupeKey,
             dedupeScope,
@@ -265,6 +284,9 @@ export class ImmediateBackend implements IJobQueueBackend {
       status: 'active',
       attempt: 1,
       maxAttempts: options.maxAttempts ?? 3,
+      backoff: options.backoff,
+      backoffDelay: options.backoffDelay,
+      backoffMaxDelay: options.backoffMaxDelay,
       priority: options.priority ?? 0,
       dedupeKey: options.dedupeKey,
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
@@ -441,6 +463,8 @@ export class ImmediateBackend implements IJobQueueBackend {
       this.releaseDedupeKey(job)
       return { status: 'failed-terminal' }
     }
+    // Space retries so a fast failure cannot burn every attempt in one tick.
+    job.runAt = new Date(Date.now() + retryBackoffMs(job.attempt, job))
     job.status = 'pending'
     return { status: 'retry-scheduled' }
   }
@@ -548,11 +572,15 @@ export class ImmediateBackend implements IJobQueueBackend {
     claimToken: string,
     record: StepRecord,
   ): Promise<AppendStepResult> {
+    const job = this.journalView(jobId)
     return appendStepInMemory(
-      this.journalView(jobId),
+      job,
       claimToken,
       record,
       DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+      () => {
+        if (job) job.claimedAt = new Date()
+      },
     )
   }
 

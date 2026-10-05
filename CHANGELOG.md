@@ -10,6 +10,12 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+### Fixed
+
+- In-memory backends match production retry spacing and journal lease renewal.
+  DummyBackend also respects priority and runAt when claiming, and
+  ImmediateBackend leaves unhandled jobs pending instead of active forever.
+
 ## [0.5.1] - 2026-09-18
 
 ### Added
