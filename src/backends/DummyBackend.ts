@@ -22,6 +22,7 @@ import {
 import { assertValidLatestCoalescing, DedupeScopeConflictError } from '../types'
 import type {
   AppendStepResult,
+  BackoffConfig,
   CompleteClaimedResult,
   CompleteJobResult,
   EnqueueOptions,
@@ -42,6 +43,7 @@ import type {
 } from '../types'
 
 import { backlogAge } from './backlogAge'
+import { retryBackoffMs } from './backoff'
 import type { IJobQueueBackend } from './IJobQueueBackend'
 import {
   DEFAULT_RETENTION_MS,
@@ -54,7 +56,7 @@ const DEFAULT_LIST_FAILED_LIMIT = 100
 /** Hard ceiling on one `listFailed` page, whatever the caller asked for. */
 const MAX_LIST_FAILED_LIMIT = 1000
 
-interface RecordedJob<T = unknown> {
+interface RecordedJob<T = unknown> extends BackoffConfig {
   id: string
   type: string
   data: T
@@ -253,6 +255,9 @@ export class DummyBackend implements IJobQueueBackend {
       priority: options.priority ?? 0,
       attempt: 0,
       maxAttempts: options.maxAttempts ?? 3,
+      backoff: options.backoff,
+      backoffDelay: options.backoffDelay,
+      backoffMaxDelay: options.backoffMaxDelay,
       dedupeKey: options.dedupeKey,
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
       createdAt,
@@ -323,6 +328,9 @@ export class DummyBackend implements IJobQueueBackend {
       priority: options.priority ?? 0,
       attempt: 1,
       maxAttempts: options.maxAttempts ?? 3,
+      backoff: options.backoff,
+      backoffDelay: options.backoffDelay,
+      backoffMaxDelay: options.backoffMaxDelay,
       dedupeKey: options.dedupeKey,
       dedupeScope: options.dedupeKey ? dedupeScope : undefined,
       createdAt: claimedAt,
@@ -361,8 +369,9 @@ export class DummyBackend implements IJobQueueBackend {
     // in production, so a unit test could pass while the same logic misbehaved
     // for real — which defeats the reason this backend exists.
     const now = Date.now()
-    for (;;) {
-      const job = this.jobs.find(
+    // Mongo claims by priority then runAt; insertion order hid priority here.
+    const candidates = this.jobs
+      .filter(
         (j) =>
           j.type === type &&
           j.status === 'pending' &&
@@ -374,10 +383,15 @@ export class DummyBackend implements IJobQueueBackend {
             )
           ),
       )
-      if (!job) return null
+      .sort(
+        (a, b) =>
+          a.priority - b.priority || a.runAt.getTime() - b.runAt.getTime(),
+      )
+    for (const job of candidates) {
       // A spent job fails here, so look at the next candidate.
       if (this.tryClaim(job)) return this.toJob(job as RecordedJob<T>, true)
     }
+    return null
   }
 
   async claimNextByKey<T>(
@@ -497,6 +511,8 @@ export class DummyBackend implements IJobQueueBackend {
       job.failedByLifecycleWrite = true
       return { status: 'failed-terminal' }
     }
+    // Space retries so a fast failure cannot burn every attempt in one tick.
+    job.runAt = new Date(Date.now() + retryBackoffMs(job.attempt, job))
     job.status = 'pending'
     return { status: 'retry-scheduled' }
   }
@@ -620,6 +636,9 @@ export class DummyBackend implements IJobQueueBackend {
       claimToken,
       record,
       DEFAULT_JOURNAL_SOFT_LIMIT_BYTES,
+      () => {
+        if (job) job.claimedAt = new Date()
+      },
     )
   }
 
@@ -642,7 +661,7 @@ export class DummyBackend implements IJobQueueBackend {
   ): Promise<HeartbeatClaimedResult> {
     const job = this.jobs.find((j) => j.id === jobId)
     return heartbeatClaimedInMemory(job, claimToken, () => {
-      /* no claimedAt tracked on dummy jobs */
+      if (job) job.claimedAt = new Date()
     })
   }
 
@@ -726,8 +745,9 @@ export class DummyBackend implements IJobQueueBackend {
       priority: job.priority,
       dedupeKey: job.dedupeKey,
       dedupeScope: job.dedupeScope,
-      runAt: job.createdAt,
+      runAt: job.runAt,
       createdAt: job.createdAt,
+      claimedAt: job.claimedAt,
     }
   }
 
