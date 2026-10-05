@@ -24,12 +24,18 @@ describe('ImmediateBackend', () => {
   })
 
   describe('enqueue() without handler', () => {
-    it('creates job even without handler', async () => {
+    // Regression: no processor left a fake active run that could never finish.
+    it('leaves a pending job for a later processor claim', async () => {
       const jobId = await backend.enqueue('unknownJob', { x: 1 })
 
       expect(jobId).toBe('immediate-1')
       const stats = await backend.getStats()
-      expect(stats.active).toBe(1) // Created as active since it tried to run
+      expect(stats.pending).toBe(1)
+      expect(stats.active).toBe(0)
+      const job = await backend.findOne({ id: jobId! })
+      expect(job?.status).toBe('pending')
+      expect(job?.attempt).toBe(0)
+      expect((await backend.claimNext('unknownJob'))?.id).toBe(jobId)
     })
   })
 
@@ -173,7 +179,11 @@ describe('ImmediateBackend', () => {
     // another worker (new token) would still clobber it — unlike
     // MongoJobQueue.createHandle, which fences on the token.
     it('a stale handle reports lease loss after the job is reclaimed', async () => {
-      const handle = await backend.claimOrEnqueue('job', {})
+      const handle = await backend.claimOrEnqueue('job', {}, {
+        backoff: 'fixed',
+        backoffDelay: 0,
+        backoffMaxDelay: 0,
+      })
       // Send the job back to pending (its token is still live here), then let
       // another worker reclaim it — claimNext mints a fresh token.
       const failed: FailJobResult = await handle!.fail('lease expired')
@@ -230,9 +240,7 @@ describe('ImmediateBackend', () => {
 
   describe('lifecycle results', () => {
     async function claimLifecycleJob() {
-      const id = await backend.enqueue('lifecycle', {})
-      await backend.fail(id!, 'prepare claim')
-      return (await backend.claimNext('lifecycle'))!
+      return (await backend.claimOrEnqueue('lifecycle', {}))!
     }
 
     it('complete() reports an unfenced admin completion', async () => {
@@ -320,7 +328,12 @@ describe('ImmediateBackend', () => {
       const handle = await backend.claimOrEnqueue(
         'pendingJob',
         { n: 2 },
-        { maxAttempts: 2 },
+        {
+          maxAttempts: 2,
+          backoff: 'fixed',
+          backoffDelay: 0,
+          backoffMaxDelay: 0,
+        },
       )
       await handle!.fail('retry later')
 
@@ -333,12 +346,15 @@ describe('ImmediateBackend', () => {
 
   describe('findOne()', () => {
     it('does not expose the live fencing claimToken', async () => {
-      // ImmediateBackend mints a claimToken on enqueue (jobs run inline); the
-      // general read view must not leak it — only the claim path may see it.
+      // Only the active claim carries a token; general reads must keep it private.
       const id = await backend.enqueue('tokJob', { n: 1 })
-      const found = await backend.findOne({ type: 'tokJob' })
+      const claimed = await backend.claimNext('tokJob')
+      expect(claimed).not.toBeNull()
+      expect(claimed!.id).toBe(id)
+      expect(claimed!.claimToken).toEqual(expect.any(String))
+
+      const found = await backend.findOne({ id })
       expect(found).not.toBeNull()
-      expect(found!.id).toBe(id)
       expect(found!.claimToken).toBeUndefined()
     })
   })
