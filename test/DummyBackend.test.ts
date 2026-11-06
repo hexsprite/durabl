@@ -193,6 +193,77 @@ describe('DummyBackend', () => {
     })
   })
 
+  // Symptom: every rolling deploy during a long job used up one retry. The
+  // in-memory backends must agree with MongoJobQueue so job logic tests see it.
+  describe('release() attempt budget', () => {
+    it('release returns the claimed attempt so shutdown does not consume a retry', async () => {
+      await backend.enqueue('job', {}, { maxAttempts: 3 })
+      const claimed = await backend.claimNext('job')
+      expect(claimed!.attempt).toBe(1)
+
+      const result = await backend.release(claimed!.id, claimed!.claimToken)
+
+      expect(result).toEqual({ status: 'released' })
+      expect(backend.jobs[0].status).toBe('pending')
+      expect(backend.jobs[0].attempt).toBe(0)
+      expect((await backend.claimNext('job'))!.attempt).toBe(1)
+    })
+
+    it('handle.release() on a claimOrEnqueue claim restores attempt 0', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+
+      await handle!.release()
+
+      expect(backend.jobs[0].attempt).toBe(0)
+    })
+
+    it('never takes the attempt below zero', async () => {
+      await backend.enqueue('job', {})
+      const claimed = await backend.claimNext('job')
+      backend.jobs[0].attempt = 0
+
+      await backend.release(claimed!.id, claimed!.claimToken)
+
+      expect(backend.jobs[0].attempt).toBe(0)
+    })
+  })
+
+  // Symptom: a pending job already at maxAttempts reached a handler.
+  describe('claim attempt budget', () => {
+    it('claimNext never hands out a spent job and fails it as retries-exhausted', async () => {
+      await backend.enqueue('job', {}, { maxAttempts: 2 })
+      backend.jobs[0].attempt = 2
+
+      expect(await backend.claimNext('job')).toBeNull()
+
+      expect(backend.jobs[0].status).toBe('failed')
+      expect(backend.jobs[0].failureKind).toBe('retries-exhausted')
+    })
+
+    it('claimNext skips the spent job and claims the next one', async () => {
+      await backend.enqueue('job', { n: 'spent' }, { maxAttempts: 2 })
+      await backend.enqueue('job', { n: 'fresh' })
+      backend.jobs[0].attempt = 2
+
+      const claimed = await backend.claimNext<{ n: string }>('job')
+
+      expect(claimed!.data).toEqual({ n: 'fresh' })
+      expect(backend.jobs[0].status).toBe('failed')
+    })
+
+    it('claimNextByKey never hands out a spent job', async () => {
+      await backend.enqueue(
+        'job',
+        {},
+        { maxAttempts: 2, dedupeKey: 'k', dedupeScope: 'pending' },
+      )
+      backend.jobs[0].attempt = 2
+
+      expect(await backend.claimNextByKey('job', 'k')).toBeNull()
+      expect(backend.jobs[0].failureKind).toBe('retries-exhausted')
+    })
+  })
+
   describe('lifecycle results', () => {
     it('complete() reports an unfenced admin completion', async () => {
       await backend.enqueue('job', {})

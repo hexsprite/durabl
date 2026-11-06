@@ -117,6 +117,11 @@ export interface IJobQueueBackend {
   /**
    * Return a live claim to the due pending queue without recording a failure.
    * A supplied claim token fences the write against replacement owners.
+   *
+   * A release gives the claim's attempt back: `attempt` returns to the value it
+   * had before the claim, and never drops below 0. The handler did not fail, so
+   * a deploy must not spend a retry. A `superseded` release is terminal and
+   * changes no attempt.
    */
   release(jobId: string, claimToken?: string): Promise<ReleaseJobResult>
 

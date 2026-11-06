@@ -165,6 +165,158 @@ describe('MongoJobQueue', () => {
     })
   })
 
+  // Symptom: every rolling deploy during a long job used up one retry.
+  // `release()` kept the attempt that `claimNext` had counted, so three
+  // deploys left a maxAttempts=3 job with a single real try.
+  describe('release() attempt budget', () => {
+    it('release returns the claimed attempt so shutdown does not consume a retry', async () => {
+      const id = await backend.enqueue('job', {}, { maxAttempts: 3 })
+      const claimed = await backend.claimNext('job')
+      expect(claimed!.attempt).toBe(1)
+
+      const result = await backend.release(id!, claimed!.claimToken)
+
+      expect(result).toEqual({ status: 'released' })
+      const stored = await collection.findOne({ _id: id! })
+      expect(stored!.status).toBe('pending')
+      expect(stored!.attempt).toBe(0)
+    })
+
+    it('survives as many releases as maxAttempts without exhausting the job', async () => {
+      const id = await backend.enqueue('job', {}, { maxAttempts: 3 })
+
+      for (let deploy = 0; deploy < 4; deploy++) {
+        const claimed = await backend.claimNext('job')
+        expect(claimed).not.toBeNull()
+        expect(claimed!.attempt).toBe(1)
+        await backend.release(id!, claimed!.claimToken)
+      }
+
+      const stored = await collection.findOne({ _id: id! })
+      expect(stored).toMatchObject({ status: 'pending', attempt: 0 })
+    })
+
+    it('keeps a real failure attempt: only the released claim is given back', async () => {
+      const id = await backend.enqueue('job', {}, { maxAttempts: 3 })
+      const first = await backend.claimNext('job')
+      await backend.fail(id!, 'boom', first!.claimToken)
+      await collection.updateOne({ _id: id! }, { $set: { runAt: new Date() } })
+
+      const second = await backend.claimNext('job')
+      expect(second!.attempt).toBe(2)
+      await backend.release(id!, second!.claimToken)
+
+      expect((await collection.findOne({ _id: id! }))!.attempt).toBe(1)
+    })
+
+    it('never takes the stored attempt below zero', async () => {
+      const id = await backend.enqueue('job', {})
+      const claimed = await backend.claimNext('job')
+      // A manual re-activation can leave an active job at attempt 0.
+      await collection.updateOne({ _id: id! }, { $set: { attempt: 0 } })
+
+      await backend.release(id!, claimed!.claimToken)
+
+      expect((await collection.findOne({ _id: id! }))!.attempt).toBe(0)
+    })
+
+    it('a stale release does not touch the replacement claim attempt', async () => {
+      const id = await backend.enqueue('job', {})
+      const first = await backend.claimNext('job')
+      await backend.release(id!, first!.claimToken)
+      await backend.claimNext('job')
+
+      const stale = await backend.release(id!, first!.claimToken)
+
+      expect(stale).toEqual({ status: 'lease-lost' })
+      expect((await collection.findOne({ _id: id! }))!.attempt).toBe(1)
+    })
+  })
+
+  // Symptom: a pending job with attempt >= maxAttempts (manual edit, legacy
+  // document) was handed to a handler beyond its retry budget.
+  describe('claim attempt budget', () => {
+    async function makeExhausted(
+      id: string,
+      attempt = 3,
+    ): Promise<void> {
+      await collection.updateOne({ _id: id }, { $set: { attempt } })
+    }
+
+    it('claimNext never hands out a pending job whose attempts are spent', async () => {
+      const id = await backend.enqueue('job', {}, { maxAttempts: 3 })
+      await makeExhausted(id!)
+
+      expect(await backend.claimNext('job')).toBeNull()
+
+      expect(await collection.findOne({ _id: id! })).toMatchObject({
+        status: 'failed',
+        failureKind: 'retries-exhausted',
+        attempt: 3,
+      })
+    })
+
+    it('claimNext fails the spent job and still claims the next due job', async () => {
+      const spent = await backend.enqueue(
+        'job',
+        { n: 'spent' },
+        { maxAttempts: 2, priority: 0 },
+      )
+      await backend.enqueue('job', { n: 'fresh' }, { priority: 5 })
+      await makeExhausted(spent!, 2)
+
+      const claimed = await backend.claimNext<{ n: string }>('job')
+
+      expect(claimed!.data).toEqual({ n: 'fresh' })
+      expect(claimed!.attempt).toBe(1)
+      expect((await collection.findOne({ _id: spent! }))!.status).toBe('failed')
+    })
+
+    it('a spent pending job does not hold its dedupe slot', async () => {
+      const id = await backend.enqueue(
+        'job',
+        {},
+        { maxAttempts: 3, dedupeKey: 'k' },
+      )
+      await makeExhausted(id!)
+      expect(await backend.enqueue('job', {}, { dedupeKey: 'k' })).toBeNull()
+
+      await backend.claimNext('job')
+
+      expect(
+        await backend.enqueue('job', {}, { dedupeKey: 'k' }),
+      ).not.toBeNull()
+    })
+
+    it('claimNextByKey never hands out a spent job either', async () => {
+      const id = await backend.enqueue(
+        'job',
+        {},
+        { maxAttempts: 3, dedupeKey: 'k', dedupeScope: 'pending' },
+      )
+      await makeExhausted(id!)
+
+      expect(await backend.claimNextByKey('job', 'k')).toBeNull()
+
+      expect(await collection.findOne({ _id: id! })).toMatchObject({
+        status: 'failed',
+        failureKind: 'retries-exhausted',
+      })
+    })
+
+    it('records why the spent job failed in its log', async () => {
+      const id = await backend.enqueue('job', {}, { maxAttempts: 1 })
+      await makeExhausted(id!, 1)
+
+      await backend.claimNext('job')
+
+      const stored = await collection.findOne({ _id: id! })
+      expect(stored!.failedAt).toBeInstanceOf(Date)
+      expect(stored!.failReason).toMatch(/exhausted/i)
+      expect(stored!.logs?.at(-1)?.message).toMatch(/exhausted/i)
+    })
+  })
+
   describe('findOne()', () => {
     it('does not expose the live fencing claimToken (claim path only)', async () => {
       // The claim path must see the token (processJob fences writes with it)…

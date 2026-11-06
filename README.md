@@ -480,7 +480,8 @@ queue.installSignalHandlers({ timeoutMs: 20_000 })
 `shutdown()` fences new claims and managed runs before it snapshots active work.
 `claimOrEnqueue()` and `runClaimed()` reject after shutdown starts. If a backend claim loses the race, Durabl releases or supersedes it before rejecting.
 Shutdown waits for managed runs until the timeout. It then aborts each remaining `ctx.signal` and stops its heartbeat.
-It releases each remaining claim to the due pending queue without consuming an attempt.
+It releases each remaining claim to the due pending queue without consuming an attempt: `release()` gives the claim's attempt back, so `attempt` returns to its value before the claim.
+A claim never starts a pending job with `attempt >= maxAttempts`. It fails that job as `retries-exhausted` and takes the next one.
 If a pending follower blocks release, shutdown marks the old claim `superseded` because the follower already preserves the work.
 Release writes have a separate one-second bound, so a broken backend cannot block shutdown.
 

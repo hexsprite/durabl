@@ -103,4 +103,44 @@ describe('JobQueue.shutdown()', () => {
     await queue.shutdown(1000)
     await expect(queue.shutdown(1000)).resolves.toBeUndefined()
   })
+
+  // Symptom: every rolling deploy during a long job used up one retry. With
+  // maxAttempts 3, three deploys left one real try. Graceful shutdown must
+  // hand the claim's attempt back.
+  it('graceful shutdown mid-job leaves the attempt count unchanged for the restart', async () => {
+    const backend = new DummyBackend()
+    const first = new JobQueue(backend, silentLogger)
+    let started = false
+    first.process(
+      'long',
+      async (_job, ctx) => {
+        started = true
+        await new Promise<void>((resolve) => {
+          ctx.signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+      { pollInterval: 10 },
+    )
+    await first.enqueue('long', {}, { maxAttempts: 3 })
+    await waitUntil(() => started)
+
+    await first.shutdown(0)
+
+    expect(backend.jobs[0].status).toBe('pending')
+    expect(backend.jobs[0].attempt).toBe(0)
+
+    // The restarted process sees a first attempt again.
+    const second = new JobQueue(backend, silentLogger)
+    const seen: number[] = []
+    second.process(
+      'long',
+      async (job) => {
+        seen.push(job.attempt)
+      },
+      { pollInterval: 10 },
+    )
+    await waitUntil(() => seen.length > 0)
+    await second.shutdown(1000)
+    expect(seen).toEqual([1])
+  })
 })

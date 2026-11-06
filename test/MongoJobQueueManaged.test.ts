@@ -2,9 +2,12 @@ import type { Collection, Db, UpdateFilter } from 'mongodb'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MongoJobQueue } from '../src/backends/MongoJobQueue'
+import { JobQueue } from '../src/JobQueue'
 import type { JobDoc } from '../src/types'
 
 import { closeMongo, getMongo, uniqueCollectionName } from './mongoHelper'
+import { silentLogger } from './testLogger'
+import { waitUntil } from './waitUntil'
 
 describe('MongoJobQueue managed claims and release', () => {
   let db: Db
@@ -80,9 +83,10 @@ describe('MongoJobQueue managed claims and release', () => {
     ).resolves.toEqual({ status: 'released' })
 
     const released = await collection.findOne({ _id: handle!.id })
+    // The claim counted attempt 1; release gives it back (du-v3l).
     expect(released).toMatchObject({
       status: 'pending',
-      attempt: 1,
+      attempt: 0,
     })
     expect(released!.runAt.getTime()).toBeGreaterThanOrEqual(beforeRelease)
     expect(released!.runAt.getTime()).toBeLessThanOrEqual(Date.now())
@@ -230,5 +234,44 @@ describe('MongoJobQueue managed claims and release', () => {
       dedupeKey: 'account:1',
       data: { n: 2 },
     })
+  })
+
+  // Symptom: every rolling deploy during a long job used up one retry. Real
+  // MongoJobQueue + JobQueue: shutdown mid-job must not spend the attempt.
+  it('graceful shutdown mid-job leaves the stored attempt unchanged for the restart', async () => {
+    const first = new JobQueue(backend, silentLogger)
+    let started = false
+    first.process(
+      'long',
+      async (_job, ctx) => {
+        started = true
+        await new Promise<void>((resolve) => {
+          ctx.signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+      { pollInterval: 20 },
+    )
+    const id = await first.enqueue('long', {}, { maxAttempts: 3 })
+    await waitUntil(() => started)
+
+    await first.shutdown(0)
+
+    expect(await collection.findOne({ _id: id! })).toMatchObject({
+      status: 'pending',
+      attempt: 0,
+    })
+
+    const second = new JobQueue(backend, silentLogger)
+    const seen: number[] = []
+    second.process(
+      'long',
+      async (job) => {
+        seen.push(job.attempt)
+      },
+      { pollInterval: 20 },
+    )
+    await waitUntil(() => seen.length > 0)
+    await second.shutdown(1000)
+    expect(seen).toEqual([1])
   })
 })

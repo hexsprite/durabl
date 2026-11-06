@@ -228,6 +228,87 @@ describe('ImmediateBackend', () => {
     })
   })
 
+  // Symptom: every rolling deploy during a long job used up one retry. This
+  // backend must agree with MongoJobQueue so job logic tests see the same budget.
+  describe('release() attempt budget', () => {
+    it('release returns the claimed attempt so shutdown does not consume a retry', async () => {
+      const handle = await backend.claimOrEnqueue('job', {}, { maxAttempts: 3 })
+      expect(handle!.attempt).toBe(1)
+
+      const result = await handle!.release()
+
+      expect(result).toEqual({ status: 'released' })
+      const stored = await backend.findOne({ id: handle!.id })
+      expect(stored!.status).toBe('pending')
+      expect(stored!.attempt).toBe(0)
+      expect((await backend.claimNext('job'))!.attempt).toBe(1)
+    })
+
+    it('never takes the attempt below zero', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+      ;(backend as unknown as { jobs: Map<string, { attempt: number }> }).jobs.get(
+        handle!.id,
+      )!.attempt = 0
+
+      await handle!.release()
+
+      expect((await backend.findOne({ id: handle!.id }))!.attempt).toBe(0)
+    })
+  })
+
+  // Symptom: a pending job already at maxAttempts reached a handler.
+  describe('claim attempt budget', () => {
+    function spend(id: string): void {
+      ;(
+        backend as unknown as {
+          jobs: Map<string, { attempt: number; maxAttempts: number }>
+        }
+      ).jobs.get(id)!.attempt = 99
+    }
+
+    it('claimNext never hands out a spent job and fails it as retries-exhausted', async () => {
+      const handle = await backend.claimOrEnqueue('job', {})
+      await handle!.release()
+      spend(handle!.id)
+
+      expect(await backend.claimNext('job')).toBeNull()
+
+      const stored = await backend.findOne({ id: handle!.id })
+      expect(stored!.status).toBe('failed')
+      expect(stored!.failureKind).toBe('retries-exhausted')
+    })
+
+    it('claimNextByKey never hands out a spent job', async () => {
+      const handle = await backend.claimOrEnqueue(
+        'job',
+        {},
+        { dedupeKey: 'k', dedupeScope: 'pending' },
+      )
+      await handle!.release()
+      spend(handle!.id)
+
+      expect(await backend.claimNextByKey('job', 'k')).toBeNull()
+      expect((await backend.findOne({ id: handle!.id }))!.failureKind).toBe(
+        'retries-exhausted',
+      )
+    })
+
+    it('a spent pending job does not hold its dedupe key', async () => {
+      const handle = await backend.claimOrEnqueue(
+        'job',
+        {},
+        { dedupeKey: 'k' },
+      )
+      await handle!.release()
+      spend(handle!.id)
+      await backend.claimNext('job')
+
+      expect(
+        await backend.claimOrEnqueue('job', {}, { dedupeKey: 'k' }),
+      ).not.toBeNull()
+    })
+  })
+
   describe('lifecycle results', () => {
     async function claimLifecycleJob() {
       const id = await backend.enqueue('lifecycle', {})

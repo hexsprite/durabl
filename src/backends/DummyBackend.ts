@@ -152,6 +152,23 @@ export class DummyBackend implements IJobQueueBackend {
     }
   }
 
+  /**
+   * Mirror of MongoJobQueue's claim write. A pending job with no attempts left
+   * is failed as `retries-exhausted` instead of claimed. Returns `true` when
+   * the job was claimed, `false` when it was failed.
+   */
+  private tryClaim(job: RecordedJob): boolean {
+    if (job.attempt >= job.maxAttempts) {
+      job.status = 'failed'
+      job.failureKind = 'retries-exhausted'
+      job.failReason = 'Retries exhausted before claim'
+      job.failedAt = new Date()
+      return false
+    }
+    this.markClaimed(job)
+    return true
+  }
+
   private markClaimed(job: RecordedJob): void {
     job.status = 'active'
     job.attempt++
@@ -336,20 +353,23 @@ export class DummyBackend implements IJobQueueBackend {
     // in production, so a unit test could pass while the same logic misbehaved
     // for real — which defeats the reason this backend exists.
     const now = Date.now()
-    const job = this.jobs.find(
-      (j) =>
-        j.type === type &&
-        j.status === 'pending' &&
-        j.runAt.getTime() <= now &&
-        !(
-          j.dedupeKey &&
-          activeSlots.has(`${j.dedupeKey}|${j.dedupeScope ?? 'pending+active'}`)
-        ),
-    )
-    if (!job) return null
-
-    this.markClaimed(job)
-    return this.toJob(job as RecordedJob<T>, true)
+    for (;;) {
+      const job = this.jobs.find(
+        (j) =>
+          j.type === type &&
+          j.status === 'pending' &&
+          j.runAt.getTime() <= now &&
+          !(
+            j.dedupeKey &&
+            activeSlots.has(
+              `${j.dedupeKey}|${j.dedupeScope ?? 'pending+active'}`,
+            )
+          ),
+      )
+      if (!job) return null
+      // A spent job fails here, so look at the next candidate.
+      if (this.tryClaim(job)) return this.toJob(job as RecordedJob<T>, true)
+    }
   }
 
   async claimNextByKey<T>(
@@ -369,18 +389,19 @@ export class DummyBackend implements IJobQueueBackend {
         (a, b) =>
           a.priority - b.priority || a.runAt.getTime() - b.runAt.getTime(),
       )
-    const job = candidates[0] as RecordedJob<T> | undefined
-    if (!job) return null
-    const active = this.jobs.some(
-      (candidate) =>
-        candidate !== job &&
-        candidate.status === 'active' &&
-        candidate.dedupeKey === dedupeKey &&
-        candidate.dedupeScope === job.dedupeScope,
-    )
-    if (active) return null
-    this.markClaimed(job)
-    return this.createHandle(job)
+    for (const job of candidates as RecordedJob<T>[]) {
+      const active = this.jobs.some(
+        (candidate) =>
+          candidate !== job &&
+          candidate.status === 'active' &&
+          candidate.dedupeKey === dedupeKey &&
+          candidate.dedupeScope === job.dedupeScope,
+      )
+      if (active) return null
+      // A spent job fails here, so look at the next candidate.
+      if (this.tryClaim(job)) return this.createHandle(job)
+    }
+    return null
   }
 
   /** Fence check mirroring Mongo's fenced lifecycle filter: with a token the
@@ -528,6 +549,9 @@ export class DummyBackend implements IJobQueueBackend {
     }
 
     job.status = 'pending'
+    // Give the claim's attempt back, like MongoJobQueue: a release is not a
+    // failure, so it must not spend a retry. Clamp at zero.
+    job.attempt = Math.max(0, job.attempt - 1)
     job.runAt = new Date()
     delete job.claimedAt
     delete job.claimToken
