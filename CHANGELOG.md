@@ -12,6 +12,8 @@ called out under **BREAKING** below.
 
 ### BREAKING
 
+- Node 22 is now the minimum (`engines.node: >=22`). Node 20 reached end of
+  life in April 2026. The build targets Node 22, and CI tests 22, 24 and 26.
 - `MongoJobQueue.batchHeartbeat()` is removed. It extended leases without a
   claim token, so a dead worker could extend the lease of the job's new owner.
   Nothing in durabl called it. Use the fenced `heartbeat()` on each claimed
