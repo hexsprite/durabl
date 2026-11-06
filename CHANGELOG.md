@@ -10,6 +10,13 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+### BREAKING
+
+- `MongoJobQueue.batchHeartbeat()` is removed. It extended leases without a
+  claim token, so a dead worker could extend the lease of the job's new owner.
+  Nothing in durabl called it. Use the fenced `heartbeat()` on each claimed
+  job, which `JobQueue` already does for managed runs.
+
 ### Fixed
 
 - Clock skew between hosts no longer runs a job twice. `MongoJobQueue` now

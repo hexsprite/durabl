@@ -654,57 +654,6 @@ describe('MongoJobQueue', () => {
     })
   })
 
-  describe('batchHeartbeat()', () => {
-    // du-g3t: keep N running jobs alive with ONE updateMany instead of N
-    // updateOne calls, so heartbeat write load is independent of concurrency.
-    it('extends claimedAt for all given running jobs in a single write', async () => {
-      const ids: string[] = []
-      for (let i = 0; i < 3; i++) {
-        await backend.enqueue('job', { i })
-        const job = await backend.claimNext<{ i: number }>('job')
-        ids.push(job!.id)
-      }
-
-      // Backdate all claimedAt timestamps.
-      const stale = new Date(Date.now() - 200000)
-      await collection.updateMany(
-        { _id: { $in: ids } },
-        { $set: { claimedAt: stale } },
-      )
-
-      const before = Date.now()
-      await backend.batchHeartbeat(ids)
-
-      for (const id of ids) {
-        const doc = await collection.findOne({ _id: id })
-        // claimedAt is server time: allow the offset's half-round-trip error.
-        expect(doc!.claimedAt!.getTime()).toBeGreaterThanOrEqual(before - 50)
-      }
-    })
-
-    it('only touches active jobs, never completed/failed ones', async () => {
-      await backend.enqueue('job', {})
-      const active = await backend.claimNext('job')
-      await backend.enqueue('job2', {})
-      const done = await backend.claimNext('job2')
-      await backend.complete(done!.id)
-      const completedAt = (await collection.findOne({ _id: done!.id }))!
-        .completedAt
-
-      await backend.batchHeartbeat([active!.id, done!.id])
-
-      const doneDoc = await collection.findOne({ _id: done!.id })
-      // Completed job untouched: still completed, claimedAt not refreshed past
-      // completion.
-      expect(doneDoc!.status).toBe('completed')
-      expect(doneDoc!.completedAt).toEqual(completedAt)
-    })
-
-    it('is a no-op for an empty id list', async () => {
-      await expect(backend.batchHeartbeat([])).resolves.toBeUndefined()
-    })
-  })
-
   describe('dedupeScope behavior', () => {
     it('pending+active blocks both pending and active', async () => {
       const handle = await backend.claimOrEnqueue(
