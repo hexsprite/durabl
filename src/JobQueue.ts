@@ -58,6 +58,10 @@ interface ManagedRun {
   stopHeartbeat: () => void
   settled: Promise<void>
   resolveSettled: () => void
+  /** Local lease deadline (epoch ms): claim time or last confirmed renewal + visibility timeout. */
+  leaseDeadlineAt: number
+  /** True while a terminal write is in flight; the heartbeat stays out of its way. */
+  writing: boolean
 }
 
 type ManagedExecutionResult =
@@ -86,6 +90,13 @@ const DEFAULT_REAPER_INTERVAL_MS = 60000
 const DEFAULT_MAX_DRAINS = 10
 /** Maximum wait for all post-abort release writes during shutdown. */
 const SHUTDOWN_RELEASE_WAIT_MS = 1000
+/**
+ * Retry policy for a managed lifecycle write that throws: tries in total, the
+ * first delay, and the delay cap. Delays double: 200, 400, 800, 1600, 3200ms.
+ */
+const WRITE_RETRY_MAX_TRIES = 6
+const WRITE_RETRY_BASE_MS = 200
+const WRITE_RETRY_MAX_MS = 5000
 /**
  * Recovered-count at which a sweep is assumed to have hit the backend's batch
  * cap. Mirrors `DEFAULT_REAPER_BATCH_SIZE` in MongoJobQueue; a full batch means
@@ -765,7 +776,14 @@ export class JobQueue {
   }
 
   private async releaseForShutdown(handle: JobHandle<unknown>): Promise<void> {
-    const result = await handle.release()
+    // Same bound as the shutdown release wait: a retry never outlives it.
+    const deadline = Date.now() + SHUTDOWN_RELEASE_WAIT_MS
+    const result = await this.retryLifecycleWrite(
+      handle,
+      'release',
+      () => handle.release(),
+      { deadlineAt: () => deadline },
+    )
     if (result.status === 'superseded') {
       this.emit({
         kind: 'superseded',
@@ -1007,6 +1025,10 @@ export class JobQueue {
       stopHeartbeat: () => undefined,
       settled,
       resolveSettled,
+      leaseDeadlineAt:
+        (handle.claimedAt?.getTime() ?? Date.now()) +
+        this.visibilityTimeoutMs,
+      writing: false,
     }
     this.managedRuns.add(run)
     return run
@@ -1038,7 +1060,8 @@ export class JobQueue {
       try {
         await handler(this.jobView(handle), context)
       } catch (handlerError) {
-        run.stopHeartbeat()
+        // The heartbeat keeps running: a retried failure write must not let
+        // the lease lapse. The finally block below stops it.
         if (run.controller.signal.aborted) throw handlerError
 
         const reason =
@@ -1048,7 +1071,9 @@ export class JobQueue {
         const fatal = handlerError instanceof FatalJobError
         try {
           if (fatal) {
-            const result = await handle.failFatal(reason)
+            const result = await this.writeManaged(run, 'failFatal', () =>
+              handle.failFatal(reason),
+            )
             if (result.status === 'lease-lost') {
               this.loseLease(run, 'failFatal')
             } else if (result.status === 'failed-terminal') {
@@ -1060,7 +1085,9 @@ export class JobQueue {
               })
             }
           } else {
-            const result = await handle.fail(reason)
+            const result = await this.writeManaged(run, 'fail', () =>
+              handle.fail(reason),
+            )
             if (result.status === 'lease-lost') {
               this.loseLease(run, 'fail')
             } else if (result.status === 'superseded') {
@@ -1097,9 +1124,10 @@ export class JobQueue {
         throw handlerError
       }
 
-      run.stopHeartbeat()
       if (run.controller.signal.aborted) return { status: 'stopped' }
-      const result = await handle.complete()
+      const result = await this.writeManaged(run, 'complete', () =>
+        handle.complete(),
+      )
       if (result.status === 'lease-lost') {
         this.loseLease(run, 'complete')
         return { status: 'stopped' }
@@ -1116,6 +1144,80 @@ export class JobQueue {
       run.stopHeartbeat()
       this.managedRuns.delete(run)
       run.resolveSettled()
+    }
+  }
+
+  /** Run one managed terminal write with retry, fenced by the run's lease. */
+  private writeManaged<R>(
+    run: ManagedRun,
+    operation: string,
+    write: () => Promise<R>,
+  ): Promise<R> {
+    return this.retryLifecycleWrite(
+      run.handle,
+      operation,
+      async () => {
+        run.writing = true
+        try {
+          return await write()
+        } catch (err) {
+          // Clear only on a throw: the retry window needs renewals. After a
+          // write returns, the job is settled, and a heartbeat that started
+          // before the write must not report its result as a lost lease.
+          run.writing = false
+          throw err
+        }
+      },
+      { signal: run.controller.signal, deadlineAt: () => run.leaseDeadlineAt },
+    )
+  }
+
+  /**
+   * Retry a lifecycle write that threw, with capped exponential backoff.
+   *
+   * A write that returns is final, even `lease-lost`; only a throw means the
+   * outcome is unknown. A retry is safe: every write is fenced by the claim
+   * token, so a write that already applied comes back as a miss, not a second
+   * effect. Without the retry, a lost ack left a succeeded job `active` until
+   * the reaper reran it.
+   *
+   * Retrying stops when the signal aborts (shutdown, lease loss), when the
+   * next attempt would start past the deadline, or after the max tries. The
+   * last error is then rethrown.
+   */
+  private async retryLifecycleWrite<R>(
+    handle: JobHandle<unknown>,
+    operation: string,
+    write: () => Promise<R>,
+    bounds: { signal?: AbortSignal; deadlineAt: () => number },
+  ): Promise<R> {
+    let delayMs = WRITE_RETRY_BASE_MS
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await write()
+      } catch (err) {
+        if (
+          attempt >= WRITE_RETRY_MAX_TRIES ||
+          bounds.signal?.aborted ||
+          Date.now() + delayMs >= bounds.deadlineAt()
+        ) {
+          throw err
+        }
+        this.log.warn(
+          {
+            err,
+            jobId: handle.id,
+            type: handle.type,
+            operation,
+            attempt,
+            retryInMs: delayMs,
+          },
+          'job lifecycle write failed; retrying',
+        )
+        await sleepUnlessAborted(delayMs, bounds.signal)
+        if (bounds.signal?.aborted) throw err
+        delayMs = Math.min(delayMs * 2, WRITE_RETRY_MAX_MS)
+      }
     }
   }
 
@@ -1141,9 +1243,6 @@ export class JobQueue {
       Math.max(1, Math.floor(this.visibilityTimeoutMs / 3))
     let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
     let deadlineTimer: ReturnType<typeof setTimeout> | null = null
-    let deadlineAt =
-      (run.handle.claimedAt?.getTime() ?? Date.now()) +
-      this.visibilityTimeoutMs
     let stopped = false
 
     const stop = (): void => {
@@ -1160,7 +1259,7 @@ export class JobQueue {
       if (deadlineTimer) clearTimeout(deadlineTimer)
       deadlineTimer = setTimeout(
         () => this.loseLease(run, 'heartbeat-deadline'),
-        Math.max(0, deadlineAt - Date.now()),
+        Math.max(0, run.leaseDeadlineAt - Date.now()),
       )
       deadlineTimer.unref?.()
     }
@@ -1174,14 +1273,24 @@ export class JobQueue {
     }
     const beat = async (): Promise<void> => {
       if (stopped || run.controller.signal.aborted) return
+      // A terminal write is in flight. A renewal now could race it and report
+      // a false lease loss for a job the write just finished.
+      if (run.writing) {
+        scheduleHeartbeat()
+        return
+      }
       try {
         const result = await run.handle.heartbeat()
         if (stopped || run.controller.signal.aborted) return
+        if (run.writing) {
+          scheduleHeartbeat()
+          return
+        }
         if (result === 'lease-lost') {
           this.loseLease(run, 'heartbeat')
           return
         }
-        deadlineAt = Date.now() + this.visibilityTimeoutMs
+        run.leaseDeadlineAt = Date.now() + this.visibilityTimeoutMs
         armDeadline()
       } catch (err) {
         this.log.warn(
@@ -1242,6 +1351,20 @@ export class JobQueue {
     }
     this.pendingSleeps.clear()
   }
+}
+
+/** Sleep that ends early, without leaving a timer, when the signal aborts. */
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve()
+    const done = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+  })
 }
 
 // Global Backend Management

@@ -19,7 +19,9 @@ import type {
   QueueStats,
 } from '../src/types'
 
+import type { Logger } from '../src/logger'
 import { silentLogger } from './testLogger'
+import { waitUntil } from './waitUntil'
 
 function deferred<T = void>(): {
   promise: Promise<T>
@@ -193,18 +195,26 @@ describe('JobQueue managed execution', () => {
   })
 
   it('does not turn a completion write error into a failure', async () => {
-    const queue = new JobQueue(makeBackend(), silentLogger)
-    const run = makeHandle({ n: 1 })
-    const writeError = new Error('completion write failed')
-    run.complete.mockRejectedValue(writeError)
+    vi.useFakeTimers()
+    try {
+      const queue = new JobQueue(makeBackend(), silentLogger)
+      const run = makeHandle({ n: 1 })
+      const writeError = new Error('completion write failed')
+      run.complete.mockRejectedValue(writeError)
 
-    await expect(
-      queue.runClaimed(run.handle, async () => undefined),
-    ).rejects.toBe(writeError)
+      const outcome = rejection(
+        queue.runClaimed(run.handle, async () => undefined),
+      )
+      await vi.runAllTimersAsync()
+      expect(await outcome).toBe(writeError)
 
-    expect(run.complete).toHaveBeenCalledTimes(1)
-    expect(run.fail).not.toHaveBeenCalled()
-    expect(run.failFatal).not.toHaveBeenCalled()
+      // The write is retried (du-81c) but a lost ack never becomes fail().
+      expect(run.complete.mock.calls.length).toBeGreaterThan(1)
+      expect(run.fail).not.toHaveBeenCalled()
+      expect(run.failFatal).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('preserves handler then failure-write errors in an AggregateError', async () => {
@@ -752,5 +762,313 @@ describe('ImmediateBackend queue.process parity', () => {
     } finally {
       await queue.shutdown(0)
     }
+  })
+})
+
+interface WarnRecord {
+  obj: Record<string, unknown>
+  msg: string | undefined
+}
+
+function warnRecorder(): { logger: Logger; warns: WarnRecord[] } {
+  const warns: WarnRecord[] = []
+  const logger: Logger = {
+    debug: () => undefined,
+    info: () => undefined,
+    warn: (obj: unknown, msg?: string) => {
+      warns.push({ obj: obj as Record<string, unknown>, msg })
+    },
+    error: () => undefined,
+    child: () => logger,
+  }
+  return { logger, warns }
+}
+
+// Regression (du-81c): the managed lifecycle writes were single-shot. A
+// transient failure of complete() (network blip, primary stepdown) went to
+// the processJob catch and was logged. The job stayed `active` until the
+// reaper reclaimed it, and a handler that had already succeeded ran again.
+describe('JobQueue managed lifecycle write retry (du-81c)', () => {
+  const transient = (): Error => new Error('MongoNetworkError: blip')
+
+  describe('with real timers', () => {
+    it('a transient complete() failure is retried so the handler runs once', async () => {
+      const backend = new DummyBackend()
+      const events: JobEvent[] = []
+      const queue = new JobQueue(backend, silentLogger, {
+        onJobEvent: (event) => events.push(event),
+      })
+      const realComplete = backend.complete.bind(backend)
+      const complete = vi
+        .spyOn(backend, 'complete')
+        .mockRejectedValueOnce(transient())
+        .mockImplementation(realComplete)
+      const handler = vi.fn(async () => undefined)
+      queue.process('t', handler, { pollInterval: 50 })
+
+      try {
+        const id = (await queue.enqueue('t', {})) as string
+        await waitUntil(
+          () => backend.jobs.find((j) => j.id === id)?.status === 'completed',
+        )
+        expect(handler).toHaveBeenCalledTimes(1)
+        expect(complete).toHaveBeenCalledTimes(2)
+        expect(events.filter((e) => e.kind === 'completed')).toHaveLength(1)
+      } finally {
+        await queue.shutdown(100)
+      }
+    })
+  })
+
+  describe('with fake timers', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('a transient fail() failure is retried so the failure is recorded', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger)
+      const run = makeHandle({ n: 1 })
+      run.fail
+        .mockRejectedValueOnce(transient())
+        .mockResolvedValue({ status: 'retry-scheduled' })
+      const handlerError = new Error('handler failed')
+
+      const outcome = rejection(
+        queue.runClaimed(run.handle, async () => {
+          throw handlerError
+        }),
+      )
+      await vi.runAllTimersAsync()
+
+      expect(await outcome).toBe(handlerError)
+      expect(run.fail).toHaveBeenCalledTimes(2)
+      expect(run.fail).toHaveBeenCalledWith('handler failed')
+    })
+
+    it('a transient failFatal() failure is retried so the failure is recorded', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger)
+      const run = makeHandle({ n: 1 })
+      run.failFatal
+        .mockRejectedValueOnce(transient())
+        .mockResolvedValue({ status: 'failed-terminal' })
+      const handlerError = new FatalJobError('poison payload')
+
+      const outcome = rejection(
+        queue.runClaimed(run.handle, async () => {
+          throw handlerError
+        }),
+      )
+      await vi.runAllTimersAsync()
+
+      expect(await outcome).toBe(handlerError)
+      expect(run.failFatal).toHaveBeenCalledTimes(2)
+    })
+
+    it('a transient release() failure during shutdown is retried', async () => {
+      const events: JobEvent[] = []
+      const release = vi
+        .fn()
+        .mockRejectedValueOnce(transient())
+        .mockResolvedValue({ status: 'released' })
+      const claimNext = vi
+        .fn()
+        .mockResolvedValueOnce(activeJob())
+        .mockResolvedValue(null)
+      const queue = new JobQueue(
+        makeBackend({ claimNext, release }),
+        silentLogger,
+        { onJobEvent: (event) => events.push(event) },
+      )
+      const started = deferred<void>()
+      queue.process('sync', async (_job, ctx) => {
+        started.resolve()
+        await new Promise<void>((resolve) => {
+          ctx.signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+      })
+      await queue.enqueue('sync', {})
+      await started.promise
+
+      const stopping = queue.shutdown(10)
+      await vi.runAllTimersAsync()
+      await stopping
+
+      expect(release).toHaveBeenCalledTimes(2)
+      expect(events).toContainEqual({
+        kind: 'shutdown-released',
+        type: 'sync',
+        jobId: 'j1',
+      })
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('does not retry a write that returns lease-lost', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger)
+      const run = makeHandle({ n: 1 })
+      run.complete.mockResolvedValue({ status: 'lease-lost' })
+      const failRun = makeHandle({ n: 2 })
+      failRun.fail.mockResolvedValue({ status: 'lease-lost' })
+
+      await queue.runClaimed(run.handle, async () => undefined)
+      await rejection(
+        queue.runClaimed(failRun.handle, async () => {
+          throw new Error('boom')
+        }),
+      )
+      await vi.runAllTimersAsync()
+
+      expect(run.complete).toHaveBeenCalledTimes(1)
+      expect(failRun.fail).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not retry a write that returns a non-throwing outcome', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger)
+      const run = makeHandle({ n: 1 })
+      run.complete.mockResolvedValue({
+        status: 'already-terminal',
+        terminalStatus: 'completed',
+      })
+
+      await queue.runClaimed(run.handle, async () => undefined)
+      await vi.runAllTimersAsync()
+
+      expect(run.complete).toHaveBeenCalledTimes(1)
+    })
+
+    it('backs off 200ms doubling and warns once per retry with jobId and type', async () => {
+      const { logger, warns } = warnRecorder()
+      const queue = new JobQueue(makeBackend(), logger)
+      const run = makeHandle({ n: 1 })
+      const callTimes: number[] = []
+      const start = Date.now()
+      run.complete.mockImplementation(() => {
+        callTimes.push(Date.now() - start)
+        return Promise.reject(transient())
+      })
+
+      const outcome = rejection(
+        queue.runClaimed(run.handle, async () => undefined),
+      )
+      await vi.runAllTimersAsync()
+      await outcome
+
+      expect(callTimes).toEqual([0, 200, 600, 1400, 3000, 6200])
+      const retryWarns = warns.filter((w) => w.obj.operation === 'complete')
+      expect(retryWarns).toHaveLength(5)
+      expect(retryWarns[0]?.obj).toMatchObject({ jobId: 'j1', type: 'sync' })
+    })
+
+    it('gives up after the max tries and rejects with the last error', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger)
+      const run = makeHandle({ n: 1 })
+      const writeError = transient()
+      run.complete.mockRejectedValue(writeError)
+
+      const outcome = rejection(
+        queue.runClaimed(run.handle, async () => undefined),
+      )
+      await vi.runAllTimersAsync()
+
+      expect(await outcome).toBe(writeError)
+      expect(run.complete).toHaveBeenCalledTimes(6)
+      expect(run.fail).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('stops retrying when the next attempt would pass the lease deadline', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger, {
+        visibilityTimeoutMs: 500,
+      })
+      const run = makeHandle({ n: 1 }, { claimedAt: new Date() })
+      // Renewal never confirms, so the deadline stays at claim + 500ms.
+      run.heartbeat.mockRejectedValue(new Error('heartbeat down'))
+      const writeError = transient()
+      run.complete.mockRejectedValue(writeError)
+
+      const outcome = rejection(
+        queue.runClaimed(run.handle, async () => undefined),
+      )
+      await vi.runAllTimersAsync()
+
+      expect(await outcome).toBe(writeError)
+      // t=0 and t=200 fit; the next delay (400ms) would land past 500ms.
+      expect(run.complete).toHaveBeenCalledTimes(2)
+    })
+
+    it('keeps heartbeating while the ack retries so the lease does not lapse', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger, {
+        visibilityTimeoutMs: 1200,
+      })
+      const run = makeHandle({ n: 1 })
+      let heartbeatsAtLastTry = -1
+      run.complete
+        .mockRejectedValueOnce(transient())
+        .mockRejectedValueOnce(transient())
+        .mockRejectedValueOnce(transient())
+        .mockImplementationOnce(() => {
+          heartbeatsAtLastTry = run.heartbeat.mock.calls.length
+          return Promise.resolve({ status: 'completed' })
+        })
+
+      const running = queue.runClaimed(run.handle, async () => undefined)
+      await vi.runAllTimersAsync()
+      await running
+
+      // The handler returned at t=0 and the 4th try runs at t=1400, past the
+      // original 1200ms lease. The 400ms heartbeat fired three times in
+      // between, which is also what lets the retries run that long.
+      expect(heartbeatsAtLastTry).toBe(3)
+      expect(run.complete).toHaveBeenCalledTimes(4)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('does not let a retrying ack block shutdown past its grace period', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger)
+      const run = makeHandle({ n: 1 })
+      const writeError = transient()
+      run.complete.mockRejectedValue(writeError)
+
+      const outcome = rejection(
+        queue.runClaimed(run.handle, async () => undefined),
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      expect(run.complete).toHaveBeenCalledTimes(1)
+
+      // The retry sleeps 200ms; the 50ms grace ends first and aborts the run.
+      let stopped = false
+      const stopping = queue.shutdown(50).then(() => {
+        stopped = true
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      await stopping
+
+      expect(stopped).toBe(true)
+      expect(await outcome).toBe(writeError)
+      expect(run.complete).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('lets an ack retry finish inside the shutdown grace period', async () => {
+      const queue = new JobQueue(makeBackend(), silentLogger)
+      const run = makeHandle({ n: 1 })
+      run.complete
+        .mockRejectedValueOnce(transient())
+        .mockResolvedValue({ status: 'completed' })
+
+      const running = queue.runClaimed(run.handle, async () => undefined)
+      await vi.advanceTimersByTimeAsync(0)
+
+      const stopping = queue.shutdown(1000)
+      await vi.advanceTimersByTimeAsync(200)
+      await stopping
+      await running
+
+      expect(run.complete).toHaveBeenCalledTimes(2)
+      expect(run.release).not.toHaveBeenCalled()
+    })
   })
 })
