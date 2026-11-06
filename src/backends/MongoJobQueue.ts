@@ -36,6 +36,7 @@ import type {
   LifecycleWriteResult,
   ListFailedOptions,
   ReleaseJobResult,
+  RetentionOptions,
   QueueStats,
   TerminalReceipt,
   TerminalWriteMissResult,
@@ -50,6 +51,7 @@ import {
 } from './IJobQueueBackend'
 import { MongoChangeStreamWatcher } from './MongoChangeStreamWatcher'
 import { createJobIndexes } from './mongoJobIndexes'
+import { DEFAULT_RETENTION_MS, resolveRetention } from './retention'
 import { ServerClock } from './serverClock'
 
 export interface MongoJobQueueOptions {
@@ -1537,19 +1539,49 @@ export class MongoJobQueue implements IJobQueueBackend {
     return handled
   }
 
-  /** Clean up old terminal jobs. Default: 7 days. Returns count removed. */
-  async cleanupOldJobs(maxAgeMs = 7 * 24 * 60 * 60 * 1000): Promise<number> {
-    const cutoff = new Date(this.clock.nowMs() - maxAgeMs)
-    const result = await this.collection.deleteMany({
-      $or: [
-        { status: 'completed', completedAt: { $lt: cutoff } },
-        {
-          status: { $in: ['failed', 'superseded'] },
-          failedAt: { $lt: cutoff },
-        },
-      ],
-    })
-    return result.deletedCount
+  /**
+   * Delete old terminal jobs in batches. Returns the number deleted.
+   *
+   * A number ages completed jobs and dead letters alike (the original
+   * behaviour). A {@link RetentionOptions} object gives completed jobs and dead
+   * letters separate ages, and keeps dead letters unless `deadLetterMaxAgeMs`
+   * is set. Each branch is served by its own partial index
+   * (`cleanup_completed_idx`, `cleanup_failed_v2_idx`).
+   */
+  async cleanupOldJobs(
+    retention: number | RetentionOptions = DEFAULT_RETENTION_MS,
+  ): Promise<number> {
+    const policy = resolveRetention(retention)
+    const nowMs = this.clock.nowMs()
+    const branches: Filter<JobDoc>[] = [
+      {
+        status: 'completed',
+        completedAt: { $lt: new Date(nowMs - policy.completedMaxAgeMs) },
+      },
+    ]
+    if (policy.deadLetterMaxAgeMs !== null) {
+      branches.push({
+        status: { $in: ['failed', 'superseded'] },
+        failedAt: { $lt: new Date(nowMs - policy.deadLetterMaxAgeMs) },
+      })
+    }
+    const filter: Filter<JobDoc> = { $or: branches }
+
+    let total = 0
+    for (;;) {
+      const batch = await this.collection
+        .find(filter, { projection: { _id: 1 }, limit: policy.batchSize })
+        .toArray()
+      if (batch.length === 0) break
+      // Re-apply the filter on delete: `retry()` can return a dead letter to
+      // `pending` between the find and the delete, and that job must survive.
+      const result = await this.collection.deleteMany({
+        $and: [{ _id: { $in: batch.map((doc) => doc._id) } }, filter],
+      })
+      total += result.deletedCount
+      if (batch.length < policy.batchSize) break
+    }
+    return total
   }
 
   getCollection(): Collection<JobDoc> {

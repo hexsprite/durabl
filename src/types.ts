@@ -33,6 +33,26 @@ export interface ListFailedOptions {
 }
 
 /**
+ * Retention policy for {@link IJobQueueBackend.cleanupOldJobs}.
+ *
+ * Pass this object to give completed jobs and dead letters different clocks.
+ * A dead letter is a terminal `failed` or `superseded` job.
+ */
+export interface RetentionOptions {
+  /** Delete `completed` jobs older than this many ms. Default: 7 days. */
+  completedMaxAgeMs?: number
+  /**
+   * Delete `failed` and `superseded` jobs older than this many ms. If omitted
+   * or `null`, dead letters are kept forever, so `listFailed` and `retry` can
+   * still reach them. Note the number form of `cleanupOldJobs` does the
+   * opposite: it deletes dead letters on the same age as completed jobs.
+   */
+  deadLetterMaxAgeMs?: number | null
+  /** Jobs deleted per round trip. Default: 1000. Must be a positive integer. */
+  batchSize?: number
+}
+
+/**
  * Thrown by `enqueue`/`claimOrEnqueue` when a dedupeKey already has a live
  * (pending or active) job under a DIFFERENT dedupeScope. A dedupeKey names a
  * logical resource; two scopes for one resource is almost certainly a call-site

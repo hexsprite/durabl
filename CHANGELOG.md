@@ -16,6 +16,8 @@ called out under **BREAKING** below.
   claim token, so a dead worker could extend the lease of the job's new owner.
   Nothing in durabl called it. Use the fenced `heartbeat()` on each claimed
   job, which `JobQueue` already does for managed runs.
+- `cleanupOldJobs()` now throws on a negative or non-finite age. Before,
+  `cleanupOldJobs(-1)` deleted every terminal job. Pass `0` for that.
 
 ### Fixed
 
@@ -45,6 +47,17 @@ called out under **BREAKING** below.
   already has `attempt >= maxAttempts` (a manual edit or a legacy document), the
   claim now fails it as `retries-exhausted` and moves to the next job. Before, a
   handler ran it beyond its budget. The failed job also frees its dedupe key.
+
+### Added
+
+- `cleanupOldJobs()` is now part of `IJobQueueBackend` (optional), and
+  `DummyBackend` and `ImmediateBackend` implement it. It accepts a number
+  (unchanged: completed, failed and superseded jobs older than that age) or a
+  new `RetentionOptions` object, exported as a type. With the object form,
+  `completedMaxAgeMs` ages completed jobs (default 7 days), and dead letters
+  (`failed`, `superseded`) are kept unless you set `deadLetterMaxAgeMs`, so
+  `listFailed` and `retry` can still reach them. `MongoJobQueue` now deletes in
+  batches (`batchSize`, default 1000) instead of one large `deleteMany`.
 
 ## [0.5.1] - 2026-09-18
 
