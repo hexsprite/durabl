@@ -8,7 +8,7 @@ export default defineConfig({
   dts: true,
   clean: true,
   sourcemap: true,
-  target: 'node18',
+  target: 'node22',
   // Peer / optional-peer deps — never bundle them.
   external: ['mongodb', 'eslint', '@typescript-eslint/utils'],
 })

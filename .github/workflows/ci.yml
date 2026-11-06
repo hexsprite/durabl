@@ -16,9 +16,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Matches the `engines.node: >=20` floor in package.json. 18 is EOL and
-        # was dropped rather than tested into retirement.
-        node: ['20', '22', '24']
+        # Matches the `engines.node: >=22` floor in package.json. 20 is EOL and
+        # was dropped rather than tested into retirement. 26 is the newest
+        # release line.
+        node: ['22', '24', '26']
 
     env:
       # Absolute, workspace-relative: GitHub Actions does not expand `~` in
