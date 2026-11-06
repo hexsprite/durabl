@@ -82,6 +82,10 @@ if (jobId === null) {
 The queue owns the claim lifecycle. It heartbeats the job while the handler runs.
 If renewal stays unconfirmed through the local lease deadline, it aborts `ctx.signal` and suppresses stale terminal writes.
 A successful return completes the job. Throw an `Error` to retry the job.
+If a terminal write (`complete`, `fail`, `failFatal`) throws, the queue retries it up to five more times, with delays of 200ms doubling each time.
+The heartbeat keeps running during the retries.
+Retries stop at the local lease deadline or when shutdown aborts the run. After that, the reaper reclaims the job.
+A write that returns a result, such as `lease-lost`, is never retried.
 Throw `FatalJobError` when another attempt cannot succeed.
 `JobContext` contains only `signal` and `log(message)`.
 
@@ -483,7 +487,7 @@ Shutdown waits for managed runs until the timeout. It then aborts each remaining
 It releases each remaining claim to the due pending queue without consuming an attempt: `release()` gives the claim's attempt back, so `attempt` returns to its value before the claim.
 A claim never starts a pending job with `attempt >= maxAttempts`. It fails that job as `retries-exhausted` and takes the next one.
 If a pending follower blocks release, shutdown marks the old claim `superseded` because the follower already preserves the work.
-Release writes have a separate one-second bound, so a broken backend cannot block shutdown.
+Release writes have a separate one-second bound, so a broken backend cannot block shutdown. A release that throws is retried inside that bound.
 
 The timeout must fit inside the platform kill deadline.
 If the platform sends `SIGKILL` after 30 seconds, use a timeout of less than 30 seconds.

@@ -12,6 +12,14 @@ called out under **BREAKING** below.
 
 ### Fixed
 
+- A lost acknowledgement no longer reruns a handler that already succeeded. When
+  a managed lifecycle write (`complete`, `fail`, `failFatal`, or the shutdown
+  `release`) throws, the queue now retries it with exponential backoff (200ms,
+  doubling, five retries at most). Before, one network blip or primary stepdown
+  left the job `active` until the reaper reclaimed and reran it. The heartbeat
+  keeps renewing the lease during the retries. Retries stop at the local lease
+  deadline or when shutdown aborts the run. A write that returns a result, such
+  as `lease-lost`, is never retried. Each retry logs a warning.
 - Graceful shutdown no longer spends a retry. `release()` now gives the claim's
   attempt back, so `attempt` returns to its value before the claim. Before, each
   rolling deploy during a long job used up one attempt, and three deploys left a
