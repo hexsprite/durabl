@@ -38,6 +38,14 @@ called out under **BREAKING** below.
   keeps renewing the lease during the retries. Retries stop at the local lease
   deadline or when shutdown aborts the run. A write that returns a result, such
   as `lease-lost`, is never retried. Each retry logs a warning.
+- A retried lifecycle write no longer reports `lease-lost` when its first
+  attempt already applied. Before, if the ack of `fail`, `failFatal`, `release`
+  or `complete` was lost, the retry missed the claim filter and `MongoJobQueue`
+  returned `lease-lost` (`complete` returned `already-terminal`). `JobQueue`
+  then logged a spurious lease-lost warning and never emitted the job's real
+  `failed`, `superseded` or `shutdown-released` event. A miss now returns the
+  result the first write got, if the job holds a receipt for the same claim
+  token and operation. A different token is still fenced out as `lease-lost`.
 - Graceful shutdown no longer spends a retry. `release()` now gives the claim's
   attempt back, so `attempt` returns to its value before the claim. Before, each
   rolling deploy during a long job used up one attempt, and three deploys left a

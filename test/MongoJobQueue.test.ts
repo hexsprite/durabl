@@ -232,7 +232,13 @@ describe('MongoJobQueue', () => {
 
       const stale = await backend.release(id!, first!.claimToken)
 
-      expect(stale).toEqual({ status: 'lease-lost' })
+      // Replay of the release that already applied (du-bw6): the stored
+      // receipt comes back and nothing is written. A token with no receipt
+      // is still lease-lost.
+      expect(stale).toEqual({ status: 'released' })
+      await expect(backend.release(id!, 'not-a-claim-token')).resolves.toEqual({
+        status: 'lease-lost',
+      })
       expect((await collection.findOne({ _id: id! }))!.attempt).toBe(1)
     })
   })

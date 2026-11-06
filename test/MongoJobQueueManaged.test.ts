@@ -162,8 +162,13 @@ describe('MongoJobQueue managed claims and release', () => {
     const replacementDoc = await collection.findOne({ _id: replacement!.id })
     expect(replacementDoc!.claimToken).not.toBe(first!.claimToken)
 
+    // A replay of the release that already applied (du-bw6) returns its stored
+    // receipt. A token with no receipt is still fenced out.
     await expect(
       backend.release(handle!.id, first!.claimToken),
+    ).resolves.toEqual({ status: 'released' })
+    await expect(
+      backend.release(handle!.id, 'not-a-claim-token'),
     ).resolves.toEqual({ status: 'lease-lost' })
 
     expect(await collection.findOne({ _id: handle!.id })).toMatchObject({
@@ -274,5 +279,178 @@ describe('MongoJobQueue managed claims and release', () => {
     await waitUntil(() => seen.length > 0)
     await second.shutdown(1000)
     expect(seen).toEqual([1])
+  })
+
+  // Symptom (du-bw6): JobQueue retries a lifecycle write that threw. When the
+  // first attempt had already applied, the retry missed the `status: 'active'`
+  // + claimToken filter and came back `lease-lost`. JobQueue then logged a
+  // spurious lease-lost warning and never emitted the real outcome event.
+  // A miss must return the stored receipt for this exact token and operation.
+  describe('retry of an already-applied terminal write (du-bw6)', () => {
+    const reclaim = async (type: string) => {
+      await collection.updateMany({}, { $set: { runAt: new Date(0) } })
+      return backend.claimNext(type)
+    }
+
+    it('complete() called again with the same token returns completed', async () => {
+      await backend.enqueue('rt-complete', {})
+      const claimed = (await backend.claimNext('rt-complete'))!
+      const first = await backend.complete(claimed.id, claimed.claimToken)
+      expect(first).toEqual({ status: 'completed' })
+      await expect(
+        backend.complete(claimed.id, claimed.claimToken),
+      ).resolves.toEqual(first)
+    })
+
+    it('fail() retry-scheduled: same token again returns retry-scheduled, not lease-lost', async () => {
+      await backend.enqueue('rt-fail', {}, { maxAttempts: 3 })
+      const claimed = (await backend.claimNext('rt-fail'))!
+      const first = await backend.fail(claimed.id, 'boom', claimed.claimToken)
+      expect(first).toEqual({ status: 'retry-scheduled' })
+      await expect(
+        backend.fail(claimed.id, 'boom', claimed.claimToken),
+      ).resolves.toEqual(first)
+    })
+
+    it('fail() failed-terminal: same token again returns failed-terminal', async () => {
+      await backend.enqueue('rt-fail-term', {}, { maxAttempts: 1 })
+      const claimed = (await backend.claimNext('rt-fail-term'))!
+      const first = await backend.fail(claimed.id, 'boom', claimed.claimToken)
+      expect(first).toEqual({ status: 'failed-terminal' })
+      await expect(
+        backend.fail(claimed.id, 'boom', claimed.claimToken),
+      ).resolves.toEqual(first)
+    })
+
+    it('fail() superseded: same token again returns superseded', async () => {
+      const active = (await backend.claimOrEnqueue('rt-fail-sup', {}, single('k')))!
+      await backend.enqueue('rt-fail-sup', {}, single('k'))
+      const first = await backend.fail(active.id, 'stale', active.claimToken)
+      expect(first).toEqual({ status: 'superseded' })
+      await expect(
+        backend.fail(active.id, 'stale', active.claimToken),
+      ).resolves.toEqual(first)
+    })
+
+    it('failFatal(): same token again returns failed-terminal', async () => {
+      await backend.enqueue('rt-fatal', {})
+      const claimed = (await backend.claimNext('rt-fatal'))!
+      const first = await backend.failFatal(claimed.id, 'poison', claimed.claimToken)
+      expect(first).toEqual({ status: 'failed-terminal' })
+      await expect(
+        backend.failFatal(claimed.id, 'poison', claimed.claimToken),
+      ).resolves.toEqual(first)
+    })
+
+    it('release(): same token again returns released (the release unset the token)', async () => {
+      await backend.enqueue('rt-release', {})
+      const claimed = (await backend.claimNext('rt-release'))!
+      const first = await backend.release(claimed.id, claimed.claimToken)
+      expect(first).toEqual({ status: 'released' })
+      await expect(
+        backend.release(claimed.id, claimed.claimToken),
+      ).resolves.toEqual(first)
+    })
+
+    it('release() superseded: same token again returns superseded', async () => {
+      const active = (await backend.claimOrEnqueue('rt-rel-sup', {}, single('k')))!
+      await backend.enqueue('rt-rel-sup', {}, single('k'))
+      const first = await backend.release(active.id, active.claimToken)
+      expect(first).toEqual({ status: 'superseded' })
+      await expect(
+        backend.release(active.id, active.claimToken),
+      ).resolves.toEqual(first)
+    })
+
+    it('a different claim token still gets lease-lost after reclaim (fencing)', async () => {
+      await backend.enqueue('rt-fence', {}, { maxAttempts: 5 })
+      const a = (await backend.claimNext('rt-fence'))!
+      await backend.release(a.id, a.claimToken)
+      const b = (await reclaim('rt-fence'))!
+      expect(b.claimToken).not.toBe(a.claimToken)
+
+      // Token A holds a release receipt only: fail and failFatal have none.
+      await expect(backend.fail(b.id, 'x', a.claimToken)).resolves.toEqual({
+        status: 'lease-lost',
+      })
+      await expect(
+        backend.failFatal(b.id, 'x', a.claimToken),
+      ).resolves.toEqual({ status: 'lease-lost' })
+      // A token that never existed is fenced for every operation.
+      for (const op of ['complete', 'release'] as const) {
+        await expect(backend[op](b.id, 'bogus-token')).resolves.toEqual({
+          status: 'lease-lost',
+        })
+      }
+      await expect(backend.fail(b.id, 'x', 'bogus-token')).resolves.toEqual({
+        status: 'lease-lost',
+      })
+      expect((await collection.findOne({ _id: b.id }))?.status).toBe('active')
+    })
+
+    it("an old claim's receipt never answers a new claim", async () => {
+      await backend.enqueue('rt-leak', {}, { maxAttempts: 5 })
+      const a = (await backend.claimNext('rt-leak'))!
+      await backend.fail(a.id, 'first', a.claimToken)
+      const b = (await reclaim('rt-leak'))!
+      await backend.complete(b.id, b.claimToken)
+
+      // B never wrote a fail receipt. A's retry-scheduled must not leak in.
+      await expect(backend.fail(b.id, 'late', b.claimToken)).resolves.toEqual({
+        status: 'already-terminal',
+        terminalStatus: 'completed',
+      })
+    })
+
+    // End to end: the first fail() applies, the ack is lost, JobQueue retries.
+    it('JobQueue emits failed once and no lease-lost when a fail() ack is lost', async () => {
+      const warns: string[] = []
+      const logger = {
+        ...silentLogger,
+        warn: (_obj: unknown, msg?: string) => {
+          warns.push(msg ?? '')
+        },
+        child: () => logger,
+      }
+      const events: { kind: string }[] = []
+      const queue = new JobQueue(backend, logger, {
+        onJobEvent: (event) => events.push(event),
+      })
+      const realFail = backend.fail.bind(backend)
+      const fail = vi
+        .spyOn(backend, 'fail')
+        .mockImplementationOnce(async (...args) => {
+          await realFail(...args)
+          throw new Error('network acknowledgement lost after commit')
+        })
+        .mockImplementation(realFail)
+      let runs = 0
+      queue.process(
+        'rt-e2e',
+        async () => {
+          runs++
+          throw new Error('handler failed')
+        },
+        { pollInterval: 20 },
+      )
+      try {
+        const id = await queue.enqueue(
+          'rt-e2e',
+          {},
+          { maxAttempts: 3, backoff: 'fixed', backoffDelay: 60_000 },
+        )
+        await waitUntil(() => fail.mock.calls.length >= 2)
+        await waitUntil(() =>
+          events.some((e) => e.kind === 'failed' || e.kind === 'lease-lost'),
+        )
+        expect(runs).toBe(1)
+        expect(events.filter((e) => e.kind === 'failed')).toHaveLength(1)
+        expect(events.filter((e) => e.kind === 'lease-lost')).toHaveLength(0)
+        expect(warns.filter((m) => m.includes('lease lost'))).toHaveLength(0)
+        expect((await collection.findOne({ _id: id! }))?.status).toBe('pending')
+      } finally {
+        await queue.shutdown(100)
+      }
+    })
   })
 })
