@@ -1139,24 +1139,6 @@ export class MongoJobQueue implements IJobQueueBackend {
     return claimToken && res.matchedCount !== 1 ? 'lease-lost' : 'applied'
   }
 
-  /**
-   * Extend the lease on many running jobs in a single write.
-   *
-   * Equivalent to calling {@link heartbeat} for each id, but collapses N
-   * `updateOne` calls into one `updateMany` so periodic keepalive write load
-   * is independent of per-instance concurrency. Only `active` jobs are
-   * touched — completed/failed/pending docs are left alone.
-   *
-   * @param jobIds Ids of jobs currently running on this instance.
-   */
-  async batchHeartbeat(jobIds: string[]): Promise<void> {
-    if (jobIds.length === 0) return
-    await this.collection.updateMany(
-      { _id: { $in: jobIds }, status: 'active' },
-      { $set: { claimedAt: this.clock.now() } },
-    )
-  }
-
   // --- Durable-orchestration journal capability (§3.6) ----------------------
 
   async readSteps(jobId: string): Promise<StepRecord[]> {
