@@ -35,6 +35,7 @@ import type {
   LifecycleWriteResult,
   ListFailedOptions,
   ReleaseJobResult,
+  RetentionOptions,
   TerminalWriteMissResult,
   QueueStats,
   StepRecord,
@@ -42,6 +43,11 @@ import type {
 
 import { backlogAge } from './backlogAge'
 import type { IJobQueueBackend } from './IJobQueueBackend'
+import {
+  DEFAULT_RETENTION_MS,
+  isExpired,
+  resolveRetention,
+} from './retention'
 
 /** Default page size for the dead-letter listing (`listFailed`). */
 const DEFAULT_LIST_FAILED_LIMIT = 100
@@ -64,6 +70,8 @@ interface RecordedJob<T = unknown> {
   logs: string[]
   claimToken?: string
   claimedAt?: Date
+  /** Set when the job completes; the retention sweep reads it. */
+  completedAt?: Date
   failedAt?: Date
   failReason?: string
   /** Why the job reached terminal `failed` (see {@link Job.failureKind}). */
@@ -442,6 +450,7 @@ export class DummyBackend implements IJobQueueBackend {
       job.claimToken === claimToken
     ) {
       job.status = 'completed'
+      job.completedAt = new Date()
       delete job.failedAt
       delete job.failReason
       delete job.failureKind
@@ -450,6 +459,7 @@ export class DummyBackend implements IJobQueueBackend {
     const miss = this.terminalTransitionMiss(job, claimToken)
     if (miss) return miss
     job.status = 'completed'
+    job.completedAt = new Date()
     return { status: 'completed' }
   }
 
@@ -619,7 +629,10 @@ export class DummyBackend implements IJobQueueBackend {
   ): Promise<CompleteClaimedResult> {
     const job = this.jobs.find((j) => j.id === jobId)
     return completeClaimedInMemory(job, claimToken, () => {
-      if (job) job.status = 'completed'
+      if (job) {
+        job.status = 'completed'
+        job.completedAt = new Date()
+      }
     })
   }
 
@@ -686,6 +699,17 @@ export class DummyBackend implements IJobQueueBackend {
     delete job.failureKind
     await this.log(jobId, 'Manual replay: returned to pending')
     return true
+  }
+
+  /** Mirrors MongoJobQueue.cleanupOldJobs; see {@link RetentionOptions}. */
+  async cleanupOldJobs(
+    retention: number | RetentionOptions = DEFAULT_RETENTION_MS,
+  ): Promise<number> {
+    const policy = resolveRetention(retention)
+    const nowMs = Date.now()
+    const before = this.jobs.length
+    this.jobs = this.jobs.filter((job) => !isExpired(job, policy, nowMs))
+    return before - this.jobs.length
   }
 
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {

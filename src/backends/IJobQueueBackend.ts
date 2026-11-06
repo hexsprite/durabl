@@ -20,6 +20,7 @@ import type {
   ListFailedOptions,
   QueueStats,
   ReleaseJobResult,
+  RetentionOptions,
   StepRecord,
 } from '../types'
 
@@ -179,6 +180,23 @@ export interface IJobQueueBackend {
    * to `pending` would collide with a live job under the same dedupeKey+scope.
    */
   retry(jobId: string): Promise<boolean>
+
+  /**
+   * Delete old terminal jobs. Returns the number deleted. Optional: callers
+   * check `typeof backend.cleanupOldJobs === 'function'` first.
+   *
+   * - No argument: `completed`, `failed` and `superseded` jobs older than
+   *   7 days.
+   * - A number: the same, with that age (ms) for all three.
+   * - A {@link RetentionOptions} object: `completed` jobs use
+   *   `completedMaxAgeMs` (default 7 days). Dead letters (`failed`,
+   *   `superseded`) use `deadLetterMaxAgeMs`. If that is omitted or `null`,
+   *   dead letters are kept.
+   *
+   * Pending and active jobs are never deleted. A non-finite or negative age
+   * throws before anything is deleted.
+   */
+  cleanupOldJobs?(retention?: number | RetentionOptions): Promise<number>
 
   /**
    * Find a job by query. Use for utilities like expiring stale jobs.

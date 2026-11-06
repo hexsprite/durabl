@@ -189,7 +189,9 @@ describe('job collection indexes', () => {
       )
       await superseded!.fail('stale')
 
-      const removed = await backend.cleanupOldJobs(-1)
+      // Age 0 means "older than now"; wait so every timestamp is strictly past.
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const removed = await backend.cleanupOldJobs(0)
       expect(removed).toBe(2)
       expect(await collection.findOne({ _id: keep! })).not.toBeNull()
       expect(await collection.findOne({ _id: completed! })).toBeNull()

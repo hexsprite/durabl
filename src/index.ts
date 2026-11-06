@@ -59,6 +59,7 @@ export type {
   LifecycleWriteResult,
   ListFailedOptions,
   ReleaseJobResult,
+  RetentionOptions,
   TerminalWriteMissResult,
   RunClaimedOptions,
   ProcessorConfig,

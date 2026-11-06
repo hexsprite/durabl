@@ -43,6 +43,7 @@ import type {
   LifecycleWriteResult,
   ListFailedOptions,
   ReleaseJobResult,
+  RetentionOptions,
   TerminalWriteMissResult,
   QueueStats,
   StepRecord,
@@ -54,6 +55,11 @@ import {
   type IJobQueueBackend,
   type InlineProcessor,
 } from './IJobQueueBackend'
+import {
+  DEFAULT_RETENTION_MS,
+  isExpired,
+  resolveRetention,
+} from './retention'
 
 /** Default page size for the dead-letter listing (`listFailed`). */
 const DEFAULT_LIST_FAILED_LIMIT = 100
@@ -667,6 +673,21 @@ export class ImmediateBackend implements IJobQueueBackend {
     delete job.failedAt
     delete job.failureKind
     return true
+  }
+
+  /** Mirrors MongoJobQueue.cleanupOldJobs; see {@link RetentionOptions}. */
+  async cleanupOldJobs(
+    retention: number | RetentionOptions = DEFAULT_RETENTION_MS,
+  ): Promise<number> {
+    const policy = resolveRetention(retention)
+    const nowMs = Date.now()
+    let removed = 0
+    for (const [id, job] of this.jobs) {
+      if (!isExpired(job, policy, nowMs)) continue
+      this.jobs.delete(id)
+      removed++
+    }
+    return removed
   }
 
   async findOne<T>(query: Record<string, unknown>): Promise<Job<T> | null> {

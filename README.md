@@ -127,6 +127,34 @@ So a worker whose clock runs behind the reaper's does not look stale while it he
 If a measurement fails, the queue logs a warning and keeps the last offset. Before the first measurement, the offset is zero.
 The local lease deadline that aborts `ctx.signal` uses only the worker's own clock, so clock skew does not move it either.
 
+### Retention
+
+Terminal jobs pile up. `backend.cleanupOldJobs()` deletes them in batches and returns the number deleted.
+It never touches `pending` or `active` jobs. It is optional on `IJobQueueBackend`, so check for it first.
+`MongoJobQueue`, `DummyBackend` and `ImmediateBackend` all implement it.
+
+```typescript
+const DAY = 24 * 60 * 60 * 1000
+
+// Number form: completed, failed and superseded jobs older than 7 days.
+await backend.cleanupOldJobs(7 * DAY)
+
+// Object form: completed jobs expire; dead letters (failed, superseded) stay.
+await backend.cleanupOldJobs({ completedMaxAgeMs: 7 * DAY })
+
+// Object form, with a longer clock for dead letters.
+await backend.cleanupOldJobs({ completedMaxAgeMs: 7 * DAY, deadLetterMaxAgeMs: 90 * DAY })
+```
+
+With a number, dead letters expire on the same age as completed jobs.
+With an object, dead letters are kept unless you set `deadLetterMaxAgeMs` (`null` or omitted keeps them).
+`listFailed` and `retry` only see dead letters that still exist.
+`batchSize` (default 1000) caps the jobs deleted per round trip.
+A negative or non-finite age throws before anything is deleted.
+
+Call it from one process on a timer, for example once an hour.
+`MongoJobQueue` ages jobs on the Mongo server clock and serves both filters from partial indexes.
+
 ### Inline execution with coalescing
 
 Use `claimOrEnqueue` when a request must run now and only one run can own a key.
