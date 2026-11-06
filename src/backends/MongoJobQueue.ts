@@ -490,29 +490,15 @@ export class MongoJobQueue implements IJobQueueBackend {
       }
 
       try {
-        const doc = await this.collection.findOneAndUpdate(
-          filter,
-          {
-            // Mint a fresh per-claim lease nonce. All orchestration fencing keys
-            // on this, not on `attempt` (R8) — an admin/manual re-activation
-            // that does not bump `attempt` would otherwise silently break the
-            // fence.
-            $set: {
-              status: 'active' as JobStatus,
-              claimedAt: now,
-              claimToken: randomUUID(),
-            },
-            $inc: { attempt: 1 },
-          },
-          {
-            sort: { priority: 1, runAt: 1 },
-            returnDocument: 'after',
-            projection: CLAIMED_JOB_PROJECTION,
-          },
-        )
+        const doc = await this.claimOne<T>(filter, now)
+        if (doc?.status === 'failed') {
+          // Spent job: failed in the claim write itself. Look at the next one.
+          this.warnSpentClaim(doc._id, type)
+          continue
+        }
         // includeClaimToken: the claim path is the one reader allowed to see the
         // live fencing token (processJob fences lifecycle writes with it).
-        return doc ? jobDocToJob(doc as JobDoc<T>, true) : null
+        return doc ? jobDocToJob(doc, true) : null
       } catch (err) {
         // A dedupe index rejected the pending -> active transition: another job
         // with this dedupeKey is already active. That is the `pending` scope
@@ -546,35 +532,108 @@ export class MongoJobQueue implements IJobQueueBackend {
     dedupeKey: string,
   ): Promise<JobHandle<T> | null> {
     const now = new Date()
-    try {
-      const doc = await this.collection.findOneAndUpdate(
-        {
-          type,
-          dedupeKey,
-          status: 'pending',
-          runAt: { $lte: now },
-        },
+    // Each spent job takes one pass. The loop is bounded like `claimNext`.
+    for (let pass = 0; pass <= MAX_DEDUPE_SKIPS; pass++) {
+      try {
+        const doc = await this.claimOne<T>(
+          { type, dedupeKey, status: 'pending', runAt: { $lte: now } },
+          now,
+        )
+        if (doc?.status === 'failed') {
+          this.warnSpentClaim(doc._id, type)
+          continue
+        }
+        return doc ? this.createHandle(jobDocToJob(doc, true)) : null
+      } catch (err) {
+        if (this.isDuplicateKeyError(err)) return null
+        throw err
+      }
+    }
+    return null
+  }
+
+  /**
+   * Claim the best due pending job matching `filter`, in one atomic write.
+   *
+   * The write decides on the stored values, so a worker never needs a read
+   * first:
+   *
+   * - Attempts left (`attempt < maxAttempts`): the job turns `active` with a
+   *   fresh lease nonce, and `attempt` goes up by one.
+   * - No attempts left: the same write fails the job as `retries-exhausted`.
+   *   The returned document then has `status: 'failed'` and the caller moves on
+   *   to the next candidate. A manual edit or a legacy document can leave a
+   *   pending job in this state. Failing it here frees its dedupe slot. A
+   *   filter-only guard would skip the job on every claim and leave it pending
+   *   forever.
+   *
+   * The filter and sort are unchanged, so the `claim_next_v2_idx` plan is too.
+   * The budget check runs on the one document the index already picked.
+   *
+   * Returns `null` when nothing is due.
+   */
+  private async claimOne<T>(
+    filter: Filter<JobDoc>,
+    now: Date,
+  ): Promise<JobDoc<T> | null> {
+    // A missing `maxAttempts` (legacy document) means no cap, like `fail()`.
+    const hasBudget = {
+      $lt: [
+        { $ifNull: ['$attempt', 0] },
+        { $ifNull: ['$maxAttempts', Number.MAX_SAFE_INTEGER] },
+      ],
+    }
+    const keep = (claimed: unknown, spent: unknown) => ({
+      $cond: [hasBudget, claimed, spent],
+    })
+    const reason = 'Retries exhausted before claim'
+    const doc = await this.collection.findOneAndUpdate(
+      filter,
+      [
         {
           $set: {
-            status: 'active' as JobStatus,
-            claimedAt: now,
-            claimToken: randomUUID(),
+            status: keep('active', 'failed'),
+            attempt: keep(
+              { $add: [{ $ifNull: ['$attempt', 0] }, 1] },
+              { $ifNull: ['$attempt', 0] },
+            ),
+            // Mint a fresh per-claim lease nonce. All orchestration fencing keys
+            // on this, not on `attempt` (R8) — an admin/manual re-activation
+            // that does not bump `attempt` would otherwise silently break the
+            // fence.
+            claimedAt: keep(now, '$$REMOVE'),
+            claimToken: keep(randomUUID(), '$$REMOVE'),
+            failReason: keep('$failReason', reason),
+            failureKind: keep('$failureKind', 'retries-exhausted'),
+            failedAt: keep('$failedAt', now),
+            logs: keep('$logs', {
+              $slice: [
+                {
+                  $concatArrays: [
+                    { $ifNull: ['$logs', []] },
+                    [{ timestamp: now, message: reason }],
+                  ],
+                },
+                -this.maxLogEntries,
+              ],
+            }),
           },
-          $inc: { attempt: 1 },
         },
-        {
-          sort: { priority: 1, runAt: 1 },
-          returnDocument: 'after',
-          projection: CLAIMED_JOB_PROJECTION,
-        },
-      )
-      return doc
-        ? this.createHandle(jobDocToJob(doc as JobDoc<T>, true))
-        : null
-    } catch (err) {
-      if (this.isDuplicateKeyError(err)) return null
-      throw err
-    }
+      ],
+      {
+        sort: { priority: 1, runAt: 1 },
+        returnDocument: 'after',
+        projection: { ...CLAIMED_JOB_PROJECTION },
+      },
+    )
+    return doc as JobDoc<T> | null
+  }
+
+  private warnSpentClaim(jobId: string, type: string): void {
+    this.logger.warn(
+      { jobId, type },
+      'pending job had no attempts left; failed it instead of claiming',
+    )
   }
 
   /**
@@ -960,18 +1019,24 @@ export class MongoJobQueue implements IJobQueueBackend {
     const released = { status: 'released' } as const
     let matchedCount: number
     try {
-      const write = await this.collection.updateOne(filter, {
-        $set: {
-          status: 'pending' as JobStatus,
-          runAt: new Date(),
-          ...this.terminalReceiptWrite({
-            claimToken: claimToken ?? null,
-            operation: 'release',
-            result: released,
-          }),
+      // Pipeline update, so the attempt give-back is atomic with the release
+      // and clamps at zero. The claim counted this attempt; the handler did not
+      // fail, so a deploy must not spend a retry.
+      const write = await this.collection.updateOne(filter, [
+        {
+          $set: {
+            status: 'pending' as JobStatus,
+            runAt: new Date(),
+            attempt: { $max: [0, { $subtract: [{ $ifNull: ['$attempt', 0] }, 1] }] },
+            ...this.terminalReceiptWrite({
+              claimToken: claimToken ?? null,
+              operation: 'release',
+              result: released,
+            }),
+          },
         },
-        $unset: { claimedAt: '', claimToken: '' },
-      })
+        { $unset: ['claimedAt', 'claimToken'] },
+      ])
       matchedCount = write.matchedCount
     } catch (err) {
       const reconciled =

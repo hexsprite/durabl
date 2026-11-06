@@ -10,6 +10,18 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+### Fixed
+
+- Graceful shutdown no longer spends a retry. `release()` now gives the claim's
+  attempt back, so `attempt` returns to its value before the claim. Before, each
+  rolling deploy during a long job used up one attempt, and three deploys left a
+  `maxAttempts: 3` job with one real try. `MongoJobQueue`, `DummyBackend` and
+  `ImmediateBackend` all follow this rule.
+- A claim never hands a handler a job with no attempts left. If a pending job
+  already has `attempt >= maxAttempts` (a manual edit or a legacy document), the
+  claim now fails it as `retries-exhausted` and moves to the next job. Before, a
+  handler ran it beyond its budget. The failed job also frees its dedupe key.
+
 ## [0.5.1] - 2026-09-18
 
 ### Added

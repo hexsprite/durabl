@@ -119,6 +119,24 @@ export class ImmediateBackend implements IJobQueueBackend {
     }
   }
 
+  /**
+   * Mirror of MongoJobQueue's claim write. A pending job with no attempts left
+   * is failed as `retries-exhausted` instead of claimed. Returns `true` when
+   * the job was claimed, `false` when it was failed.
+   */
+  private tryClaim(job: ImmediateJob): boolean {
+    if (job.attempt >= job.maxAttempts) {
+      job.status = 'failed'
+      job.failedAt = new Date()
+      job.failureKind = 'retries-exhausted'
+      job.failedByLifecycleWrite = true
+      this.releaseDedupeKey(job)
+      return false
+    }
+    this.markClaimed(job)
+    return true
+  }
+
   private markClaimed(job: ImmediateJob): void {
     job.status = 'active'
     job.attempt++
@@ -293,30 +311,32 @@ export class ImmediateBackend implements IJobQueueBackend {
         activeSlots.add(this.getDedupeSetKey(job.dedupeKey, job.dedupeScope))
       }
     }
-    const job = [...this.jobs.values()]
-      .filter(
-        (candidate) =>
-          candidate.type === type &&
-          candidate.status === 'pending' &&
-          candidate.runAt.getTime() <= Date.now() &&
-          !(
-            candidate.dedupeKey &&
-            candidate.dedupeScope &&
-            activeSlots.has(
-              this.getDedupeSetKey(
-                candidate.dedupeKey,
-                candidate.dedupeScope,
-              ),
-            )
-          ),
-      )
-      .sort(
-        (a, b) =>
-          a.priority - b.priority || a.runAt.getTime() - b.runAt.getTime(),
-      )[0] as ImmediateJob<T> | undefined
-    if (!job) return null
-    this.markClaimed(job)
-    return this.toJob(job, true)
+    for (;;) {
+      const job = [...this.jobs.values()]
+        .filter(
+          (candidate) =>
+            candidate.type === type &&
+            candidate.status === 'pending' &&
+            candidate.runAt.getTime() <= Date.now() &&
+            !(
+              candidate.dedupeKey &&
+              candidate.dedupeScope &&
+              activeSlots.has(
+                this.getDedupeSetKey(
+                  candidate.dedupeKey,
+                  candidate.dedupeScope,
+                ),
+              )
+            ),
+        )
+        .sort(
+          (a, b) =>
+            a.priority - b.priority || a.runAt.getTime() - b.runAt.getTime(),
+        )[0] as ImmediateJob<T> | undefined
+      if (!job) return null
+      // A spent job fails here, so look at the next candidate.
+      if (this.tryClaim(job)) return this.toJob(job, true)
+    }
   }
 
   async claimNextByKey<T>(
@@ -344,7 +364,8 @@ export class ImmediateBackend implements IJobQueueBackend {
         candidate.dedupeScope === job.dedupeScope,
     )
     if (blocked) return null
-    this.markClaimed(job)
+    // A spent job fails here, so look at the next due job for this key.
+    if (!this.tryClaim(job)) return this.claimNextByKey<T>(type, dedupeKey)
     return this.createHandle(job)
   }
 
@@ -503,6 +524,9 @@ export class ImmediateBackend implements IJobQueueBackend {
     }
 
     job.status = 'pending'
+    // Give the claim's attempt back, like MongoJobQueue: a release is not a
+    // failure, so it must not spend a retry. Clamp at zero.
+    job.attempt = Math.max(0, job.attempt - 1)
     job.runAt = new Date()
     delete job.claimedAt
     delete job.claimToken
