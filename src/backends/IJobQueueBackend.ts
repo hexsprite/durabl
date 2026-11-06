@@ -26,6 +26,19 @@ import type {
 /** @internal Queue-to-inline-backend processor registration capability. */
 export const registerInlineProcessor = Symbol('durabl.registerInlineProcessor')
 
+/**
+ * @internal Local epoch ms at which the claim request was sent, stamped on a
+ * claimed job by a backend whose `claimedAt` is not this process's clock
+ * (`MongoJobQueue` uses the server clock). `JobQueue` starts its local lease
+ * deadline from it, because comparing a server `claimedAt` with `Date.now()`
+ * carries the host's clock skew. Without it, `JobQueue` falls back to
+ * `claimedAt`, which is correct for single-process backends.
+ */
+export const localClaimedAt = Symbol('durabl.localClaimedAt')
+
+/** @internal A claimed job that may carry a {@link localClaimedAt} stamp. */
+export type LocalClaimStamp = { [localClaimedAt]?: number }
+
 /** @internal Managed callback installed by {@link JobQueue.process}. */
 export type InlineProcessor = (job: JobHandle<unknown>) => Promise<void>
 

@@ -12,6 +12,15 @@ called out under **BREAKING** below.
 
 ### Fixed
 
+- Clock skew between hosts no longer runs a job twice. `MongoJobQueue` now
+  takes lease and schedule times (`claimedAt`, `runAt`, `completedAt`,
+  `failedAt`, the reaper cutoff and the cleanup cutoff) from the Mongo server
+  clock. Each host measures its offset with `hello` in `startup()` and every
+  five minutes after. Before, each host used its own clock: if a worker ran
+  behind the reaper by more than about 2/3 of `visibilityTimeoutMs`, the reaper
+  reclaimed the worker's live job and a second worker ran it. A delayed job also
+  fired early or late by the enqueuing host's skew. The local lease deadline in
+  `JobQueue` now times from the local claim, so it does not move with skew.
 - A lost acknowledgement no longer reruns a handler that already succeeded. When
   a managed lifecycle write (`complete`, `fail`, `failFatal`, or the shutdown
   `release`) throws, the queue now retries it with exponential backoff (200ms,
