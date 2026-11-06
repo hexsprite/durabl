@@ -800,6 +800,39 @@ export class MongoJobQueue implements IJobQueueBackend {
     return (result as R | undefined) ?? null
   }
 
+  /**
+   * A fenced terminal write missed its filter. If the first attempt already
+   * applied and only its ack was lost, the document holds a receipt for this
+   * exact claim token and operation: return that stored result. Otherwise
+   * classify the miss.
+   *
+   * Receipts are keyed by claim token, and every claim mints a fresh UUID, so
+   * a receipt from an earlier claim can never answer a later one. Unfenced
+   * calls (no token) skip the receipt: its `unfenced` slot is shared by every
+   * unfenced call on the job and could return a stale result.
+   */
+  private async resolveTerminalMiss<
+    R extends
+      | CompleteJobResult
+      | FailJobResult
+      | FailFatalJobResult
+      | ReleaseJobResult,
+  >(
+    jobId: string,
+    claimToken: string | undefined,
+    operation: TerminalReceipt['operation'],
+  ): Promise<R | TerminalWriteMissResult> {
+    if (claimToken !== undefined) {
+      const receipt = await this.reconcileTerminalReceipt<R>(
+        jobId,
+        claimToken,
+        operation,
+      )
+      if (receipt) return receipt
+    }
+    return this.classifyTerminalMiss(jobId)
+  }
+
   async complete(
     jobId: string,
     claimToken?: string,
@@ -849,7 +882,9 @@ export class MongoJobQueue implements IJobQueueBackend {
       if (reconciled) return reconciled
       throw err
     }
-    return matchedCount === 1 ? result : this.classifyTerminalMiss(jobId)
+    return matchedCount === 1
+      ? result
+      : this.resolveTerminalMiss(jobId, claimToken, 'complete')
   }
 
   async fail(
@@ -861,7 +896,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     const job = await this.collection.findOne(filter, {
       projection: RETRY_JOB_PROJECTION,
     })
-    if (!job) return this.classifyTerminalMiss(jobId)
+    if (!job) return this.resolveTerminalMiss(jobId, claimToken, 'fail')
 
     const now = this.clock.now()
     if (job.dedupeKey && job.dedupeScope === 'pending') {
@@ -911,7 +946,9 @@ export class MongoJobQueue implements IJobQueueBackend {
         if (reconciled) return reconciled
         throw err
       }
-      return matchedCount === 1 ? result : this.classifyTerminalMiss(jobId)
+      return matchedCount === 1
+        ? result
+        : this.resolveTerminalMiss(jobId, claimToken, 'fail')
     }
 
     // Space the retry: push runAt into the future by a jittered backoff so
@@ -953,7 +990,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     }
     return matchedCount === 1
       ? retryResult
-      : this.classifyTerminalMiss(jobId)
+      : this.resolveTerminalMiss(jobId, claimToken, 'fail')
   }
 
   /**
@@ -1007,7 +1044,9 @@ export class MongoJobQueue implements IJobQueueBackend {
       if (reconciled) return reconciled
       throw err
     }
-    return matchedCount === 1 ? result : this.classifyTerminalMiss(jobId)
+    return matchedCount === 1
+      ? result
+      : this.resolveTerminalMiss(jobId, claimToken, 'fail')
   }
 
   async failFatal(
@@ -1047,7 +1086,9 @@ export class MongoJobQueue implements IJobQueueBackend {
       if (reconciled) return reconciled
       throw err
     }
-    return matchedCount === 1 ? result : this.classifyTerminalMiss(jobId)
+    return matchedCount === 1
+      ? result
+      : this.resolveTerminalMiss(jobId, claimToken, 'failFatal')
   }
 
   async release(
@@ -1115,11 +1156,11 @@ export class MongoJobQueue implements IJobQueueBackend {
       }
       return retired === 1
         ? superseded
-        : this.classifyTerminalMiss(jobId)
+        : this.resolveTerminalMiss(jobId, claimToken, 'release')
     }
     if (matchedCount === 1) return released
 
-    return this.classifyTerminalMiss(jobId)
+    return this.resolveTerminalMiss(jobId, claimToken, 'release')
   }
 
   async log(jobId: string, message: string): Promise<void> {
