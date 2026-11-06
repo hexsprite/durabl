@@ -2,8 +2,10 @@
 import { defaultLogger, type Logger } from './logger'
 
 import {
+  localClaimedAt,
   registerInlineProcessor,
   type IJobQueueBackend,
+  type LocalClaimStamp,
 } from './backends/IJobQueueBackend'
 import {
   LeaseLostError,
@@ -58,7 +60,11 @@ interface ManagedRun {
   stopHeartbeat: () => void
   settled: Promise<void>
   resolveSettled: () => void
-  /** Local lease deadline (epoch ms): claim time or last confirmed renewal + visibility timeout. */
+  /**
+   * Local lease deadline (epoch ms on this process's clock): local claim time
+   * or last confirmed renewal + visibility timeout. Never mixed with backend
+   * timestamps, which may come from another clock.
+   */
   leaseDeadlineAt: number
   /** True while a terminal write is in flight; the heartbeat stays out of its way. */
   writing: boolean
@@ -97,6 +103,22 @@ const SHUTDOWN_RELEASE_WAIT_MS = 1000
 const WRITE_RETRY_MAX_TRIES = 6
 const WRITE_RETRY_BASE_MS = 200
 const WRITE_RETRY_MAX_MS = 5000
+
+/**
+ * When this process claimed `job`, on this process's clock.
+ *
+ * A server-clock backend stamps {@link localClaimedAt}; its `claimedAt` is
+ * server time, and comparing that with `Date.now()` would move the lease
+ * deadline by the host's clock skew. Single-process backends stamp
+ * `claimedAt` with this process's clock, so it is safe as the fallback.
+ */
+function localClaimTime(job: Job<unknown>): number {
+  return (
+    (job as Job<unknown> & LocalClaimStamp)[localClaimedAt] ??
+    job.claimedAt?.getTime() ??
+    Date.now()
+  )
+}
 /**
  * Recovered-count at which a sweep is assumed to have hit the backend's batch
  * cap. Mirrors `DEFAULT_REAPER_BATCH_SIZE` in MongoJobQueue; a full batch means
@@ -791,7 +813,7 @@ export class JobQueue {
         jobId: handle.id,
         durationMs: Math.max(
           0,
-          Date.now() - (handle.claimedAt?.getTime() ?? Date.now()),
+          Date.now() - localClaimTime(handle),
         ),
         reason: 'queued follow-up already covers this work',
       })
@@ -1025,9 +1047,7 @@ export class JobQueue {
       stopHeartbeat: () => undefined,
       settled,
       resolveSettled,
-      leaseDeadlineAt:
-        (handle.claimedAt?.getTime() ?? Date.now()) +
-        this.visibilityTimeoutMs,
+      leaseDeadlineAt: localClaimTime(handle) + this.visibilityTimeoutMs,
       writing: false,
     }
     this.managedRuns.add(run)
@@ -1279,6 +1299,9 @@ export class JobQueue {
         scheduleHeartbeat()
         return
       }
+      // Time the renewal from before the request: the backend stamps the
+      // lease while the request is in flight, so this never runs late.
+      const sentAt = Date.now()
       try {
         const result = await run.handle.heartbeat()
         if (stopped || run.controller.signal.aborted) return
@@ -1290,7 +1313,7 @@ export class JobQueue {
           this.loseLease(run, 'heartbeat')
           return
         }
-        run.leaseDeadlineAt = Date.now() + this.visibilityTimeoutMs
+        run.leaseDeadlineAt = sentAt + this.visibilityTimeoutMs
         armDeadline()
       } catch (err) {
         this.log.warn(

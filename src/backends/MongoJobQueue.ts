@@ -43,9 +43,14 @@ import type {
 } from '../types'
 
 import { retryBackoffMs } from './backoff'
-import type { IJobQueueBackend } from './IJobQueueBackend'
+import {
+  localClaimedAt,
+  type IJobQueueBackend,
+  type LocalClaimStamp,
+} from './IJobQueueBackend'
 import { MongoChangeStreamWatcher } from './MongoChangeStreamWatcher'
 import { createJobIndexes } from './mongoJobIndexes'
+import { ServerClock } from './serverClock'
 
 export interface MongoJobQueueOptions {
   /** Database handle from a connected `MongoClient`. */
@@ -192,6 +197,11 @@ export class MongoJobQueue implements IJobQueueBackend {
   private pendingListeners: Set<JobAvailableListener> = new Set()
   /** Prevents startup() from assigning a watcher after shutdown() has run. */
   private shuttingDown = false
+  /**
+   * Source of every lease, schedule and retention time. Hosts compare each
+   * other's timestamps, so they must share one clock: the server's.
+   */
+  private clock: ServerClock
 
   constructor(options: MongoJobQueueOptions) {
     this.db = options.db
@@ -207,9 +217,17 @@ export class MongoJobQueue implements IJobQueueBackend {
     this.logger = (options.logger ?? defaultLogger).child({
       category: 'MongoJobQueue',
     })
+    this.clock = new ServerClock({
+      hello: () => options.db.command({ hello: 1 }),
+      logger: this.logger,
+    })
   }
 
   async startup(): Promise<void> {
+    // Measure the server-clock offset before any lease or schedule write.
+    // Until then (or if it fails) the offset is zero: the local clock.
+    await this.clock.start()
+    if (this.shuttingDown) this.clock.stop()
     await createJobIndexes(this.collection)
     if (!this.useChangeStreams) return
     const watcher = new MongoChangeStreamWatcher(
@@ -253,6 +271,7 @@ export class MongoJobQueue implements IJobQueueBackend {
 
   async shutdown(_timeoutMs?: number): Promise<void> {
     this.shuttingDown = true
+    this.clock.stop()
     if (this.watcher) {
       await this.watcher.stop()
       this.watcher = null
@@ -295,7 +314,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     data: unknown,
     options: EnqueueOptions = {},
   ): Promise<string | null> {
-    const now = new Date()
+    const now = this.clock.now()
     const dedupeScope: DedupeScope = options.dedupeScope ?? 'pending+active'
     if (options.dedupeKey) {
       await this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
@@ -350,7 +369,8 @@ export class MongoJobQueue implements IJobQueueBackend {
     options: EnqueueOptions = {},
   ): Promise<JobHandle<T> | null> {
     assertValidLatestCoalescing(options)
-    const now = new Date()
+    const claimLocalMs = this.clock.localMs()
+    const now = this.clock.fromLocal(claimLocalMs)
     const dedupeScope: DedupeScope = options.dedupeScope ?? 'pending+active'
     if (options.dedupeKey) {
       await this.assertNoScopeConflict(options.dedupeKey, dedupeScope)
@@ -398,7 +418,9 @@ export class MongoJobQueue implements IJobQueueBackend {
 
     try {
       await this.collection.insertOne(doc as JobDoc)
-      return this.createHandle(jobDocToJob(doc, true))
+      return this.createHandle(
+        this.stampLocalClaim(jobDocToJob(doc, true), claimLocalMs),
+      )
     } catch (err) {
       const duplicateKey = dedupeKeyFromDuplicateError(err)
       if (!options.dedupeKey || duplicateKey !== options.dedupeKey) throw err
@@ -424,7 +446,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     dedupeKey: string,
     options: EnqueueOptions,
   ): Promise<void> {
-    const createdAt = new Date()
+    const createdAt = this.clock.now()
     const runAt = options.delay
       ? new Date(createdAt.getTime() + options.delay)
       : createdAt
@@ -474,7 +496,8 @@ export class MongoJobQueue implements IJobQueueBackend {
   }
 
   async claimNext<T>(type: string): Promise<Job<T> | null> {
-    const now = new Date()
+    const claimLocalMs = this.clock.localMs()
+    const now = this.clock.fromLocal(claimLocalMs)
     // dedupeKeys whose active slot is already taken, discovered as we go. The
     // sort picks the best candidate; if that candidate's key is held, it would
     // win the sort again on every retry, so it has to be excluded explicitly or
@@ -498,7 +521,9 @@ export class MongoJobQueue implements IJobQueueBackend {
         }
         // includeClaimToken: the claim path is the one reader allowed to see the
         // live fencing token (processJob fences lifecycle writes with it).
-        return doc ? jobDocToJob(doc, true) : null
+        return doc
+          ? this.stampLocalClaim(jobDocToJob(doc, true), claimLocalMs)
+          : null
       } catch (err) {
         // A dedupe index rejected the pending -> active transition: another job
         // with this dedupeKey is already active. That is the `pending` scope
@@ -531,7 +556,8 @@ export class MongoJobQueue implements IJobQueueBackend {
     type: string,
     dedupeKey: string,
   ): Promise<JobHandle<T> | null> {
-    const now = new Date()
+    const claimLocalMs = this.clock.localMs()
+    const now = this.clock.fromLocal(claimLocalMs)
     // Each spent job takes one pass. The loop is bounded like `claimNext`.
     for (let pass = 0; pass <= MAX_DEDUPE_SKIPS; pass++) {
       try {
@@ -543,7 +569,11 @@ export class MongoJobQueue implements IJobQueueBackend {
           this.warnSpentClaim(doc._id, type)
           continue
         }
-        return doc ? this.createHandle(jobDocToJob(doc, true)) : null
+        return doc
+          ? this.createHandle(
+              this.stampLocalClaim(jobDocToJob(doc, true), claimLocalMs),
+            )
+          : null
       } catch (err) {
         if (this.isDuplicateKeyError(err)) return null
         throw err
@@ -629,6 +659,16 @@ export class MongoJobQueue implements IJobQueueBackend {
     return doc as JobDoc<T> | null
   }
 
+  /**
+   * Record the local clock reading behind `claimedAt`. `claimedAt` is server
+   * time, so `JobQueue` must not compare it with its own clock; it times the
+   * local lease deadline from this stamp instead.
+   */
+  private stampLocalClaim<T>(job: Job<T>, claimLocalMs: number): Job<T> {
+    ;(job as Job<T> & LocalClaimStamp)[localClaimedAt] = claimLocalMs
+    return job
+  }
+
   private warnSpentClaim(jobId: string, type: string): void {
     this.logger.warn(
       { jobId, type },
@@ -652,7 +692,7 @@ export class MongoJobQueue implements IJobQueueBackend {
    */
   private logWrite(
     message: string,
-    timestamp = new Date(),
+    timestamp = this.clock.now(),
   ): Record<string, unknown> {
     const entry = {
       timestamp,
@@ -786,7 +826,7 @@ export class MongoJobQueue implements IJobQueueBackend {
         {
           $set: {
             status: 'completed' as JobStatus,
-            completedAt: new Date(),
+            completedAt: this.clock.now(),
             ...this.terminalReceiptWrite({
               claimToken: claimToken ?? null,
               operation: 'complete',
@@ -821,7 +861,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     })
     if (!job) return this.classifyTerminalMiss(jobId)
 
-    const now = new Date()
+    const now = this.clock.now()
     if (job.dedupeKey && job.dedupeScope === 'pending') {
       const follower = await this.collection.findOne(
         {
@@ -974,7 +1014,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     claimToken?: string,
   ): Promise<FailFatalJobResult> {
     const result = { status: 'failed-terminal' } as const
-    const now = new Date()
+    const now = this.clock.now()
     let matchedCount: number
     try {
       const write = await this.collection.updateOne(
@@ -1026,7 +1066,7 @@ export class MongoJobQueue implements IJobQueueBackend {
         {
           $set: {
             status: 'pending' as JobStatus,
-            runAt: new Date(),
+            runAt: this.clock.now(),
             attempt: { $max: [0, { $subtract: [{ $ifNull: ['$attempt', 0] }, 1] }] },
             ...this.terminalReceiptWrite({
               claimToken: claimToken ?? null,
@@ -1054,7 +1094,7 @@ export class MongoJobQueue implements IJobQueueBackend {
         retired = await this.retireCoalesced(
           filter,
           'Released',
-          new Date(),
+          this.clock.now(),
           {
             claimToken: claimToken ?? null,
             operation: 'release',
@@ -1091,7 +1131,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     const res = await this.collection.updateOne(
       this.lifecycleFilter(jobId, claimToken),
       {
-        $set: { claimedAt: new Date() },
+        $set: { claimedAt: this.clock.now() },
       },
     )
     // matchedCount, not modifiedCount: a same-millisecond claimedAt write is a
@@ -1113,7 +1153,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     if (jobIds.length === 0) return
     await this.collection.updateMany(
       { _id: { $in: jobIds }, status: 'active' },
-      { $set: { claimedAt: new Date() } },
+      { $set: { claimedAt: this.clock.now() } },
     )
   }
 
@@ -1179,7 +1219,7 @@ export class MongoJobQueue implements IJobQueueBackend {
         },
         {
           $push: { steps: record },
-          $set: { claimedAt: new Date() },
+          $set: { claimedAt: this.clock.now() },
           $inc: { journalBytes: incomingBytes },
         },
       )
@@ -1245,7 +1285,7 @@ export class MongoJobQueue implements IJobQueueBackend {
         status: { $in: ['active', 'failed'] satisfies JobStatus[] },
       },
       {
-        $set: { status: 'completed' as JobStatus, completedAt: new Date() },
+        $set: { status: 'completed' as JobStatus, completedAt: this.clock.now() },
         $unset: { failReason: '', failedAt: '', failureKind: '' },
       },
     )
@@ -1258,7 +1298,7 @@ export class MongoJobQueue implements IJobQueueBackend {
   ): Promise<HeartbeatClaimedResult> {
     const res = await this.collection.updateOne(
       { _id: jobId, status: 'active', claimToken },
-      { $set: { claimedAt: new Date() } },
+      { $set: { claimedAt: this.clock.now() } },
     )
     // matchedCount, not modifiedCount: a same-millisecond claimedAt write is a
     // no-op modification but the lease is still held.
@@ -1305,7 +1345,7 @@ export class MongoJobQueue implements IJobQueueBackend {
           $set: {
             status: 'pending' as JobStatus,
             attempt: 0,
-            runAt: new Date(),
+            runAt: this.clock.now(),
           },
           $unset: {
             failReason: '',
@@ -1314,7 +1354,7 @@ export class MongoJobQueue implements IJobQueueBackend {
             claimToken: '',
             claimedAt: '',
           },
-          ...this.logWrite('Manual replay: returned to pending', new Date()),
+          ...this.logWrite('Manual replay: returned to pending', this.clock.now()),
         },
       )
       return res.matchedCount === 1
@@ -1334,7 +1374,7 @@ export class MongoJobQueue implements IJobQueueBackend {
   }
 
   async getStats(type?: string): Promise<QueueStats> {
-    const now = new Date()
+    const now = this.clock.now()
     const q = type ? { type } : {}
     const count = (s: JobStatus) =>
       this.collection.countDocuments({ ...q, status: s })
@@ -1426,7 +1466,7 @@ export class MongoJobQueue implements IJobQueueBackend {
     visibilityTimeoutMs = 300000,
     maxPerSweep = DEFAULT_REAPER_BATCH_SIZE,
   ): Promise<number> {
-    const cutoff = new Date(Date.now() - visibilityTimeoutMs)
+    const cutoff = new Date(this.clock.nowMs() - visibilityTimeoutMs)
     const cursor = this.collection
       .find({
         status: 'active',
@@ -1440,7 +1480,7 @@ export class MongoJobQueue implements IJobQueueBackend {
 
     let handled = 0
     for await (const job of cursor) {
-      const now = new Date()
+      const now = this.clock.now()
       const exhausted = job.attempt >= job.maxAttempts
       const hasPendingFollower =
         exhausted &&
@@ -1517,7 +1557,7 @@ export class MongoJobQueue implements IJobQueueBackend {
 
   /** Clean up old terminal jobs. Default: 7 days. Returns count removed. */
   async cleanupOldJobs(maxAgeMs = 7 * 24 * 60 * 60 * 1000): Promise<number> {
-    const cutoff = new Date(Date.now() - maxAgeMs)
+    const cutoff = new Date(this.clock.nowMs() - maxAgeMs)
     const result = await this.collection.deleteMany({
       $or: [
         { status: 'completed', completedAt: { $lt: cutoff } },

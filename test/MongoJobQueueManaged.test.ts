@@ -88,8 +88,9 @@ describe('MongoJobQueue managed claims and release', () => {
       status: 'pending',
       attempt: 0,
     })
-    expect(released!.runAt.getTime()).toBeGreaterThanOrEqual(beforeRelease)
-    expect(released!.runAt.getTime()).toBeLessThanOrEqual(Date.now())
+    // runAt is server time: allow the offset's half-round-trip error.
+    expect(released!.runAt.getTime()).toBeGreaterThanOrEqual(beforeRelease - 50)
+    expect(released!.runAt.getTime()).toBeLessThanOrEqual(Date.now() + 50)
     expect(released!.failReason).toBeUndefined()
     expect(released!.failedAt).toBeUndefined()
   })

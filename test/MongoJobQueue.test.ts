@@ -65,9 +65,13 @@ describe('MongoJobQueue', () => {
     it('applies delay to runAt', async () => {
       const before = Date.now()
       const jobId = await backend.enqueue('job', {}, { delay: 5000 })
+      const after = Date.now()
 
+      // runAt is server time. The measured server-clock offset is accurate
+      // to half a round trip, so allow a small margin against the local clock.
       const job = await collection.findOne({ _id: jobId! })
-      expect(job!.runAt.getTime()).toBeGreaterThanOrEqual(before + 5000)
+      expect(job!.runAt.getTime()).toBeGreaterThanOrEqual(before + 5000 - 50)
+      expect(job!.runAt.getTime()).toBeLessThanOrEqual(after + 5000 + 50)
     })
 
     it('returns null for duplicate dedupeKey', async () => {
@@ -673,7 +677,8 @@ describe('MongoJobQueue', () => {
 
       for (const id of ids) {
         const doc = await collection.findOne({ _id: id })
-        expect(doc!.claimedAt!.getTime()).toBeGreaterThanOrEqual(before)
+        // claimedAt is server time: allow the offset's half-round-trip error.
+        expect(doc!.claimedAt!.getTime()).toBeGreaterThanOrEqual(before - 50)
       }
     })
 

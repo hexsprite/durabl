@@ -121,6 +121,12 @@ The timer does not keep the process alive. `stopReaper()` and `shutdown()` stop 
 `backend.recoverStuckJobs(visibilityTimeoutMs)` remains a low-level API for tests and one-off operations.
 Do not schedule it with another timeout value.
 
+`MongoJobQueue` takes every lease, schedule and retention time from the Mongo server clock, not the host clock.
+Each host measures its offset from the server with a `hello` command in `startup()`, and again every five minutes.
+So a worker whose clock runs behind the reaper's does not look stale while it heartbeats, and a delayed job runs on time whichever host enqueued it.
+If a measurement fails, the queue logs a warning and keeps the last offset. Before the first measurement, the offset is zero.
+The local lease deadline that aborts `ctx.signal` uses only the worker's own clock, so clock skew does not move it either.
+
 ### Inline execution with coalescing
 
 Use `claimOrEnqueue` when a request must run now and only one run can own a key.
