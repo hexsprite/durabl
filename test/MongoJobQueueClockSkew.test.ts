@@ -38,7 +38,12 @@ describe('MongoJobQueue under clock skew', () => {
   /** Start a backend as a host whose clock is off by `skewMs`. */
   async function host(skewMs: number): Promise<MongoJobQueue> {
     setClockSkew(skewMs)
-    const backend = new MongoJobQueue({ db, collectionName, logger: silentLogger })
+    const backend = new MongoJobQueue({
+      db,
+      collectionName,
+      logger: silentLogger,
+      clock: 'server',
+    })
     await backend.startup()
     started.push(backend)
     return backend

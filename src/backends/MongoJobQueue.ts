@@ -80,6 +80,18 @@ export interface MongoJobQueueOptions {
   maxLogEntries?: number
   /** Ceiling on one log message; longer messages are clipped. Default: 4000. */
   maxLogMessageBytes?: number
+  /**
+   * Which clock stamps leases, schedules and retention times.
+   *
+   * - `'local'` (default): the host clock, as in 0.5.x. Fake timers and
+   *   consumer code that writes `runAt` or `claimedAt` with local `Date` work.
+   * - `'server'`: the Mongo server clock, measured with `hello` in
+   *   `startup()` and every five minutes. Use it when host clocks may differ
+   *   by more than about 2/3 of the visibility timeout. Consumer code must
+   *   then not write lease or schedule fields with local time, and a faked
+   *   `Date` is not followed.
+   */
+  clock?: 'local' | 'server'
 }
 
 type JobAvailableListener = (type: string) => void
@@ -200,8 +212,9 @@ export class MongoJobQueue implements IJobQueueBackend {
   /** Prevents startup() from assigning a watcher after shutdown() has run. */
   private shuttingDown = false
   /**
-   * Source of every lease, schedule and retention time. Hosts compare each
-   * other's timestamps, so they must share one clock: the server's.
+   * Source of every lease, schedule and retention time. In `'server'` mode
+   * hosts share one clock: the server's. In `'local'` mode (default) the
+   * offset stays zero and no measurement runs.
    */
   private clock: ServerClock
 
@@ -222,12 +235,14 @@ export class MongoJobQueue implements IJobQueueBackend {
     this.clock = new ServerClock({
       hello: () => options.db.command({ hello: 1 }),
       logger: this.logger,
+      measure: options.clock === 'server',
     })
   }
 
   async startup(): Promise<void> {
-    // Measure the server-clock offset before any lease or schedule write.
+    // 'server' mode: measure the offset before any lease or schedule write.
     // Until then (or if it fails) the offset is zero: the local clock.
+    // 'local' mode: this is a no-op.
     await this.clock.start()
     if (this.shuttingDown) this.clock.stop()
     await createJobIndexes(this.collection)

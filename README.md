@@ -121,11 +121,24 @@ The timer does not keep the process alive. `stopReaper()` and `shutdown()` stop 
 `backend.recoverStuckJobs(visibilityTimeoutMs)` remains a low-level API for tests and one-off operations.
 Do not schedule it with another timeout value.
 
-`MongoJobQueue` takes every lease, schedule and retention time from the Mongo server clock, not the host clock.
-Each host measures its offset from the server with a `hello` command in `startup()`, and again every five minutes.
+By default `MongoJobQueue` stamps every lease, schedule and retention time with the host clock (`Date.now()`), as in 0.5.x.
+So fake timers work, and code that writes `runAt` or `claimedAt` with local `Date` agrees with the queue.
+
+If host clocks may differ by more than about 2/3 of `visibilityTimeoutMs`, opt in to the server clock:
+
+```ts
+new MongoJobQueue({ db, clock: 'server' })
+```
+
+With `clock: 'server'`, each host measures its offset from the Mongo server with a `hello` command in `startup()`, and again every five minutes.
 So a worker whose clock runs behind the reaper's does not look stale while it heartbeats, and a delayed job runs on time whichever host enqueued it.
 If a measurement fails, the queue logs a warning and keeps the last offset. Before the first measurement, the offset is zero.
 The local lease deadline that aborts `ctx.signal` uses only the worker's own clock, so clock skew does not move it either.
+
+Two warnings for `clock: 'server'`:
+
+- Consumer code must not write lease or schedule fields (`runAt`, `claimedAt`, `completedAt`, `failedAt`) with local time. The queue compares them with server time.
+- A faked `Date` in tests is not followed. The queue keeps stamping real server time, so a frozen test clock and the queue disagree.
 
 ### Retention
 
@@ -153,7 +166,7 @@ With an object, dead letters are kept unless you set `deadLetterMaxAgeMs` (`null
 A negative or non-finite age throws before anything is deleted.
 
 Call it from one process on a timer, for example once an hour.
-`MongoJobQueue` ages jobs on the Mongo server clock and serves both filters from partial indexes.
+`MongoJobQueue` ages jobs on its clock (host clock by default, server clock with `clock: 'server'`) and serves both filters from partial indexes.
 
 ### Inline execution with coalescing
 
