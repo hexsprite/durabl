@@ -10,6 +10,16 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+### Fixed
+
+- 0.6.0 made the Mongo server clock unconditional. That broke processes that
+  fake `Date` (for example sinon fake timers in tests) or write job times
+  themselves: the queue's times no longer followed the process clock, so a
+  timed-out job was reclaimed at once. The server clock is now opt-in with
+  `new MongoJobQueue({ db, clock: 'server' })`. The default is the host clock,
+  as in 0.5.x. Use `'server'` if host clocks may differ by more than about 2/3
+  of `visibilityTimeoutMs`.
+
 ## [0.6.0] - 2026-11-06
 
 ### BREAKING

@@ -27,6 +27,11 @@ export interface ServerClockOptions {
   localNow?: () => number
   /** Re-measure interval. Default: {@link SERVER_CLOCK_REFRESH_MS}. */
   refreshIntervalMs?: number
+  /**
+   * Measure the server offset at all. Default: `true`. When `false` the clock
+   * is the local clock: offset fixed at zero, no `hello`, no timer.
+   */
+  measure?: boolean
 }
 
 export class ServerClock {
@@ -36,12 +41,14 @@ export class ServerClock {
   private readonly logger: Logger
   private readonly localNow: () => number
   private readonly refreshIntervalMs: number
+  private readonly measure: boolean
 
   constructor(options: ServerClockOptions) {
     this.hello = options.hello
     this.logger = options.logger
     this.localNow = options.localNow ?? (() => Date.now())
     this.refreshIntervalMs = options.refreshIntervalMs ?? SERVER_CLOCK_REFRESH_MS
+    this.measure = options.measure ?? true
   }
 
   /** Server time minus local time, in ms. Zero until the first measurement. */
@@ -75,6 +82,7 @@ export class ServerClock {
    * most half the round trip. On failure the last offset stays in force.
    */
   async refresh(): Promise<void> {
+    if (!this.measure) return
     const sentAt = this.localNow()
     let reply: HelloReply
     try {
@@ -99,6 +107,7 @@ export class ServerClock {
 
   /** Measure now, then again on a timer that does not hold the process open. */
   async start(): Promise<void> {
+    if (!this.measure) return
     await this.refresh()
     if (this.timer) return
     this.timer = setInterval(() => void this.refresh(), this.refreshIntervalMs)
