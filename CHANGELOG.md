@@ -10,6 +10,8 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-17
+
 ### Added
 
 - `LeaseLostError` is exported from the package root. `ctx.step` throws it
@@ -349,7 +351,8 @@ Upgrade steps: [`docs/migrating.md`](docs/migrating.md).
   `pending` / `pending+active` scopes, and change-stream push with a poll-loop
   safety net.
 
-[unreleased]: https://github.com/hexsprite/durabl/compare/v0.6.1...HEAD
+[unreleased]: https://github.com/hexsprite/durabl/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/hexsprite/durabl/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/hexsprite/durabl/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/hexsprite/durabl/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/hexsprite/durabl/compare/v0.5.0...v0.5.1
