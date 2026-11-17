@@ -83,6 +83,7 @@ export {
   InvalidStepTimeout,
   isFatalOrchestrationError,
   JournalTooLarge,
+  LeaseLostError,
   MaxDurationExceeded,
   NondeterminismError,
   NonRetryable,

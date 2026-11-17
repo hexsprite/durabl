@@ -10,6 +10,12 @@ called out under **BREAKING** below.
 
 ## [Unreleased]
 
+### Added
+
+- `LeaseLostError` is exported from the package root. `ctx.step` throws it
+  when another worker has reclaimed the job, so consumers can match it with
+  `instanceof` instead of comparing `err.name`.
+
 ### Fixed
 
 - In-memory backends match production retry spacing and journal lease renewal.

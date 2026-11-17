@@ -10,8 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DummyBackend } from '../src/backends/DummyBackend'
 import { ImmediateBackend } from '../src/backends/ImmediateBackend'
 import { JobQueue } from '../src/JobQueue'
+import { LeaseLostError } from '../src'
 import {
-  LeaseLostError,
   MaxDurationExceeded,
   OrchestrationUnsupportedError,
 } from '../src/journal/errors'
