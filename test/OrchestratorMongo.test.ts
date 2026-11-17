@@ -335,8 +335,10 @@ describe('Orchestrator durability (Mongo)', () => {
 
   it('a long step holds the lease against the reaper via heartbeat', async () => {
     // visibilityTimeout shorter than the step; the heartbeat must keep the job
-    // from being recovered mid-run.
-    const vis = 300
+    // from being recovered mid-run. GOTCHA: the heartbeat runs at vis / 3, so
+    // a stall of about 2 beats lets the reaper win. Keep vis large enough
+    // that a slow CI runner cannot stall that long (1200 needs ~800ms).
+    const vis = 1200
     queue = new JobQueue(backend, silentLogger, { visibilityTimeoutMs: vis })
     orch = new Orchestrator(queue, silentLogger)
 
@@ -347,7 +349,7 @@ describe('Orchestrator durability (Mongo)', () => {
         await octx.step('long', async () => {
           // Run well past the visibility timeout while the reaper sweeps.
           for (let i = 0; i < 6; i++) {
-            await new Promise((r) => setTimeout(r, 100))
+            await new Promise((r) => setTimeout(r, 300))
             const handled = await backend.recoverStuckJobs(vis)
             if (handled > 0) reaped = true
           }
@@ -356,7 +358,7 @@ describe('Orchestrator durability (Mongo)', () => {
       },
       // stepTimeoutMs must exceed the step's real duration — the lease is held
       // by the heartbeat, not by the (short) visibility window.
-      { ...fast, visibilityTimeoutMs: vis, stepTimeoutMs: 3000 },
+      { ...fast, visibilityTimeoutMs: vis, stepTimeoutMs: 6000 },
     )
 
     const id = (await queue.enqueue('slow', {}, fastEnqueue)) as string
